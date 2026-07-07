@@ -714,6 +714,68 @@ fn preview_flow_routes_without_latest_lock_returns_tool_error() {
 }
 
 #[test]
+fn preview_flow_routes_missing_run_returns_start_run_guidance() {
+    let mut server = McpServer::new();
+
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+
+    let preview = call_tool(
+        &mut server,
+        2,
+        "preview_flow_routes",
+        json!({
+            "run_id": "run-preview-missing",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+
+    assert_tool_error(&preview);
+    assert!(preview.get("error").is_none());
+    assert_eq!(structured(&preview)["run_id"], "run-preview-missing");
+    assert_eq!(structured(&preview)["error"], "run not found");
+    assert_eq!(structured(&preview)["next_tool"], "start_run");
+    assert_eq!(
+        structured(&preview)["next_arguments"],
+        json!({
+            "run_id": "run-preview-missing",
+            "nodes": ["root"]
+        })
+    );
+}
+
+#[test]
+fn preview_flow_routes_missing_run_without_explicit_lock_requires_lock_binding() {
+    let mut server = McpServer::new();
+
+    let preview = call_tool(
+        &mut server,
+        1,
+        "preview_flow_routes",
+        json!({
+            "run_id": "run-preview-missing-no-lock"
+        }),
+    );
+
+    assert_tool_error(&preview);
+    assert!(preview.get("error").is_none());
+    assert_eq!(
+        structured(&preview)["run_id"],
+        "run-preview-missing-no-lock"
+    );
+    assert_eq!(structured(&preview)["error"], "flow_lock_id is required");
+    assert_eq!(structured(&preview)["next_tool"], "start_run");
+    assert_eq!(
+        structured(&preview)["next_arguments"],
+        json!({
+            "run_id": "run-preview-missing-no-lock",
+            "nodes": ["root"]
+        })
+    );
+    assert_eq!(structured(&preview)["after_next_tool"], "apply_flow_lock");
+}
+
+#[test]
 fn preview_flow_routes_rejects_content_hash_mismatch() {
     let mut server = McpServer::new();
 

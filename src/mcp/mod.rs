@@ -419,6 +419,16 @@ impl<R: CommandRunner> McpServer<R> {
                 "error": "flow lock content hash mismatch"
             })));
         }
+        if !self.state.runtime.has_run(run_id) {
+            let mut structured = run_not_found_guidance(run_id);
+            if let Some(object) = structured.as_object_mut() {
+                object.insert("mode".to_string(), json!(flow_lock_mode_name(mode)));
+                object.insert("lock_id".to_string(), json!(lock_id));
+                object.insert("flow_lock_id".to_string(), json!(lock_id));
+                object.insert("content_hash".to_string(), json!(provided_content_hash));
+            }
+            return Ok(ToolCallResult::error(structured));
+        }
 
         self.state
             .runtime
@@ -732,6 +742,19 @@ impl ToolCallResult {
             "isError": self.is_error
         })
     }
+}
+
+fn run_not_found_guidance(run_id: &str) -> Value {
+    json!({
+        "ok": false,
+        "run_id": run_id,
+        "error": "run not found",
+        "next_tool": "start_run",
+        "next_arguments": {
+            "run_id": run_id,
+            "nodes": ["root"]
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

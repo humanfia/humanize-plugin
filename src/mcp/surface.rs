@@ -91,7 +91,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
     match name {
         "start_run" => descriptor(
             "start_run",
-            "Start a local workflow run and create initial node activations.",
+            "Call start_run to create a runtime run before using runtime tools; omit nodes to create root.",
             object_schema(
                 json!({
                     "run_id": { "type": "string" },
@@ -254,7 +254,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
         ),
         "apply_flow_lock" => descriptor(
             "apply_flow_lock",
-            "Apply a flow lock to runtime policy with lock provenance.",
+            "Apply a flow lock to an existing runtime run; if the run is missing, call start_run first.",
             object_schema(
                 json!({
                     "run_id": { "type": "string" },
@@ -270,7 +270,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
         ),
         "preview_flow_routes" => descriptor(
             "preview_flow_routes",
-            "Preview typed flow lock route activations from current runtime facts.",
+            "Preview typed flow lock route activations for an existing runtime run; if the run is missing, call start_run first.",
             object_schema(
                 json!({
                     "run_id": { "type": "string" },

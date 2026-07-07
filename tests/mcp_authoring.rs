@@ -831,6 +831,105 @@ fn apply_flow_lock_rejects_hash_mismatch_without_runtime_apply() {
         json!({})
     );
 }
+
+#[test]
+fn apply_flow_lock_missing_run_returns_start_run_guidance() {
+    let mut server = McpServer::new();
+
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+
+    let response = call_tool(
+        &mut server,
+        2,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-apply-missing",
+            "mode": "future_activations",
+            "lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert!(response.get("error").is_none());
+    assert_eq!(structured(&response)["run_id"], "run-apply-missing");
+    assert_eq!(structured(&response)["mode"], "future_activations");
+    assert_eq!(structured(&response)["lock_id"], lock_id);
+    assert_eq!(structured(&response)["flow_lock_id"], lock_id);
+    assert_eq!(structured(&response)["content_hash"], content_hash);
+    assert_eq!(structured(&response)["error"], "run not found");
+    assert_eq!(structured(&response)["next_tool"], "start_run");
+    assert_eq!(
+        structured(&response)["next_arguments"],
+        json!({
+            "run_id": "run-apply-missing",
+            "nodes": ["root"]
+        })
+    );
+}
+
+#[test]
+fn apply_flow_lock_unknown_lock_takes_precedence_over_missing_run() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-missing-unknown-lock",
+            "mode": "future_activations",
+            "lock_id": "lock-missing",
+            "content_hash": "fnv1a64:0000000000000000"
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert!(response.get("error").is_none());
+    assert_eq!(structured(&response)["run_id"], "run-missing-unknown-lock");
+    assert_eq!(structured(&response)["lock_id"], "lock-missing");
+    assert_eq!(structured(&response)["flow_lock_id"], "lock-missing");
+    assert_eq!(structured(&response)["error"], "flow lock not found");
+    assert!(structured(&response)["next_tool"].is_null());
+    assert!(structured(&response)["next_arguments"].is_null());
+}
+
+#[test]
+fn apply_flow_lock_hash_mismatch_takes_precedence_over_missing_run() {
+    let mut server = McpServer::new();
+
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+
+    let response = call_tool(
+        &mut server,
+        2,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-missing-hash-mismatch",
+            "mode": "future_activations",
+            "flow_lock_id": lock_id,
+            "content_hash": "fnv1a64:0000000000000000"
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert!(response.get("error").is_none());
+    assert_eq!(structured(&response)["run_id"], "run-missing-hash-mismatch");
+    assert_eq!(structured(&response)["mode"], "future_activations");
+    assert_eq!(structured(&response)["lock_id"], lock_id);
+    assert_eq!(structured(&response)["flow_lock_id"], lock_id);
+    assert_eq!(
+        structured(&response)["content_hash"],
+        "fnv1a64:0000000000000000"
+    );
+    assert_eq!(structured(&response)["expected_content_hash"], content_hash);
+    assert_eq!(
+        structured(&response)["error"],
+        "flow lock content hash mismatch"
+    );
+    assert!(structured(&response)["next_tool"].is_null());
+    assert!(structured(&response)["next_arguments"].is_null());
+}
 #[test]
 fn apply_flow_lock_accepts_flow_lock_id_alias_for_stored_lock() {
     let mut server = McpServer::new();

@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 
 use super::{
     McpServerState, ToolCallResult, ToolError, content_hash, optional_string, require_string,
+    run_not_found_guidance,
 };
 
 pub(super) fn preview_flow_routes(
@@ -10,20 +11,29 @@ pub(super) fn preview_flow_routes(
     arguments: &Value,
 ) -> Result<ToolCallResult, ToolError> {
     let run_id = require_string(arguments, &["run_id", "runId"])?;
-    if !state.runtime.has_run(run_id) {
-        return Err(ToolError::from_runtime(
-            runtime::RuntimeError::RunNotFound {
-                run_id: run_id.to_owned(),
-            },
-        ));
-    }
-
     let requested_lock_id = optional_string(
         arguments,
         &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
     )?;
     let provided_content_hash =
         optional_string(arguments, &["content_hash", "contentHash"])?.map(str::to_string);
+    if !state.runtime.has_run(run_id) {
+        if requested_lock_id.is_some() {
+            return Ok(ToolCallResult::error(run_not_found_guidance(run_id)));
+        }
+        return Ok(ToolCallResult::error(json!({
+            "ok": false,
+            "run_id": run_id,
+            "error": "flow_lock_id is required",
+            "next_tool": "start_run",
+            "next_arguments": {
+                "run_id": run_id,
+                "nodes": ["root"]
+            },
+            "after_next_tool": "apply_flow_lock"
+        })));
+    }
+
     let (lock_id, source, applied_content_hash) = match requested_lock_id {
         Some(lock_id) => (lock_id.to_string(), "explicit", None),
         None => {

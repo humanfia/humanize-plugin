@@ -81,6 +81,20 @@ fn preview_flow_routes_schema_requires_only_run_id() {
     assert_eq!(schema["properties"]["content_hash"]["type"], "string");
     assert_eq!(schema["properties"]["contentHash"]["type"], "string");
 }
+
+#[test]
+fn runtime_flow_descriptions_surface_start_run_recovery() {
+    let surface = McpSurface;
+
+    for name in ["start_run", "apply_flow_lock", "preview_flow_routes"] {
+        let descriptor = surface.lookup(name).expect("tool should be present");
+        assert!(
+            descriptor.description().contains("start_run"),
+            "{name} description should mention start_run"
+        );
+    }
+}
+
 #[test]
 fn runtime_tool_names_include_preview_flow_routes() {
     let surface = McpSurface;
