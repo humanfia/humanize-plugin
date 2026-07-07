@@ -1,0 +1,543 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use humanize_plugin::mcp::{AUTHORING_TOOL_NAMES, McpServer, McpSurface, RUNTIME_TOOL_NAMES};
+use serde_json::{Value, json};
+
+fn expected_tool_names() -> Vec<&'static str> {
+    RUNTIME_TOOL_NAMES
+        .iter()
+        .chain(AUTHORING_TOOL_NAMES.iter())
+        .copied()
+        .collect()
+}
+
+fn call_tool(server: &mut McpServer, id: u64, name: &str, arguments: Value) -> Value {
+    server
+        .handle_json_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments
+            }
+        }))
+        .expect("tool call should produce a response")
+}
+
+fn structured(response: &Value) -> &Value {
+    &response["result"]["structuredContent"]
+}
+
+fn diagnostic_codes(response: &Value) -> Vec<&str> {
+    structured(response)["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array")
+        .iter()
+        .map(|diagnostic| {
+            diagnostic["code"]
+                .as_str()
+                .expect("diagnostic should include a code")
+        })
+        .collect()
+}
+
+#[test]
+fn mcp_surface_exposes_exact_tool_names_and_lookup() {
+    let surface = McpSurface;
+    let names: Vec<_> = surface.tools().iter().map(|tool| tool.name()).collect();
+
+    assert_eq!(names, expected_tool_names());
+    for name in expected_tool_names() {
+        let descriptor = surface.lookup(name).expect("tool should be present");
+        assert_eq!(descriptor.name(), name);
+    }
+    assert!(surface.lookup("unknown_tool").is_none());
+}
+
+#[test]
+fn tools_call_rejects_non_object_arguments() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(&mut server, 1, "deliver_artifact", json!("not-object"));
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("arguments")
+    );
+}
+
+#[test]
+fn deliver_artifact_rejects_missing_required_arguments() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(&mut server, 1, "deliver_artifact", json!({}));
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("artifact_key")
+    );
+}
+
+#[test]
+fn flow_check_reports_effectful_predicate_diagnostics() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "mode": "core",
+            "flow": {
+                "nodes": [
+                    { "id": "start" },
+                    { "id": "finish" }
+                ],
+                "routes": [
+                    {
+                        "predicate": "shell('cargo test')",
+                        "activate": "finish"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert_eq!(structured(&response)["ok"], true);
+    assert_eq!(
+        diagnostic_codes(&response),
+        vec!["FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN"]
+    );
+}
+
+#[test]
+fn flow_apply_rejects_empty_and_non_object_flows() {
+    let mut server = McpServer::new();
+
+    let empty = call_tool(
+        &mut server,
+        1,
+        "flow_apply",
+        json!({
+            "flow": {}
+        }),
+    );
+    assert_eq!(empty["error"]["code"], -32602);
+    assert!(
+        empty["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("flow")
+    );
+
+    let non_object = call_tool(
+        &mut server,
+        2,
+        "flow_apply",
+        json!({
+            "flow": []
+        }),
+    );
+    assert_eq!(non_object["error"]["code"], -32602);
+    assert!(
+        non_object["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("flow")
+    );
+}
+
+#[test]
+fn flow_apply_rejects_effectful_predicate_with_diagnostics() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_apply",
+        json!({
+            "flow": {
+                "nodes": [
+                    { "id": "start" },
+                    { "id": "finish" }
+                ],
+                "routes": [
+                    {
+                        "predicate": "shell('cargo test')",
+                        "activate": "finish"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(structured(&response)["ok"], false);
+    assert_eq!(
+        diagnostic_codes(&response),
+        vec!["FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN"]
+    );
+}
+
+#[test]
+fn flow_apply_records_valid_flow_lock_for_export() {
+    let mut server = McpServer::new();
+
+    let applied = call_tool(
+        &mut server,
+        1,
+        "flow_apply",
+        json!({
+            "flow": {
+                "nodes": [
+                    { "id": "start" },
+                    { "id": "finish" }
+                ],
+                "routes": [
+                    {
+                        "predicate": "exists(artifact.ready)",
+                        "activate": "finish"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert_eq!(structured(&applied)["ok"], true);
+    assert_eq!(structured(&applied)["mode"], "core");
+    let lock_id = structured(&applied)["flow_lock_id"]
+        .as_str()
+        .expect("flow_apply should return a flow lock id");
+    assert!(lock_id.starts_with("flk_"));
+    assert!(
+        structured(&applied)["content_hash"]
+            .as_str()
+            .expect("flow_apply should return content hash")
+            .starts_with("fnv1a64:")
+    );
+
+    let exported = call_tool(
+        &mut server,
+        2,
+        "flow_export",
+        json!({
+            "flow_lock_id": lock_id,
+            "format": "json"
+        }),
+    );
+    assert_eq!(structured(&exported)["ok"], true);
+    assert!(
+        structured(&exported)["document"]
+            .as_str()
+            .expect("export should include a document")
+            .contains(lock_id)
+    );
+}
+
+#[test]
+fn start_run_reports_tmux_disabled_without_static_creation_claim() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-tmux",
+            "nodes": ["root"]
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(structured(&started)["tmux"]["enabled"], false);
+    assert_eq!(structured(&started)["tmux"]["created"], false);
+    assert!(structured(&started).get("tmux_mapping").is_none());
+}
+
+#[test]
+fn mcp_rejects_cross_run_deliver_and_validate_stop() {
+    let mut server = McpServer::new();
+
+    let run_a = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-a",
+            "nodes": [
+                {
+                    "id": "only-a",
+                    "required_artifacts": ["brief"]
+                }
+            ]
+        }),
+    );
+    assert_eq!(structured(&run_a)["activation_ids"], json!(["only-a"]));
+
+    let run_b = call_tool(
+        &mut server,
+        2,
+        "start_run",
+        json!({
+            "run_id": "run-b",
+            "nodes": ["only-b"]
+        }),
+    );
+    assert_eq!(structured(&run_b)["activation_ids"], json!(["only-b"]));
+
+    let delivered = call_tool(
+        &mut server,
+        3,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-b",
+            "activation_id": "only-a",
+            "artifact_key": "brief",
+            "payload": "wrong run"
+        }),
+    );
+    assert_eq!(delivered["error"]["code"], -32602);
+    assert!(
+        delivered["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("run-b")
+    );
+
+    let validated = call_tool(
+        &mut server,
+        4,
+        "validate_stop",
+        json!({
+            "run_id": "run-b",
+            "activation_id": "only-a"
+        }),
+    );
+    assert_eq!(validated["result"]["isError"], true);
+    assert_eq!(structured(&validated)["missing"], json!(["activation"]));
+    assert!(
+        structured(&validated)["error"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("run-b")
+    );
+}
+
+#[test]
+fn validate_stop_uses_activation_contract_before_and_after_artifact_delivery() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-stop",
+            "nodes": [
+                {
+                    "id": "root",
+                    "required_artifacts": ["brief"]
+                }
+            ]
+        }),
+    );
+    assert_eq!(structured(&started)["activation_ids"], json!(["root"]));
+
+    let blocked = call_tool(
+        &mut server,
+        2,
+        "validate_stop",
+        json!({
+            "run_id": "run-stop",
+            "activation_id": "root"
+        }),
+    );
+    assert_eq!(blocked["result"]["isError"], true);
+    assert_eq!(structured(&blocked)["valid"], false);
+    assert_eq!(structured(&blocked)["missing"], json!(["artifact:brief"]));
+
+    let delivered = call_tool(
+        &mut server,
+        3,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-stop",
+            "activation_id": "root",
+            "artifact_key": "brief",
+            "payload": "ready"
+        }),
+    );
+    assert_eq!(structured(&delivered)["ok"], true);
+
+    let allowed = call_tool(
+        &mut server,
+        4,
+        "validate_stop",
+        json!({
+            "run_id": "run-stop",
+            "activation_id": "root"
+        }),
+    );
+    assert_eq!(structured(&allowed)["valid"], true);
+    assert_eq!(structured(&allowed)["missing"], json!([]));
+}
+
+#[test]
+fn apply_flow_lock_requires_and_records_lock_provenance() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-lock",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let missing_provenance = call_tool(
+        &mut server,
+        2,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-lock",
+            "mode": "future_activations",
+            "content_hash": "sha256:first"
+        }),
+    );
+    assert_eq!(missing_provenance["error"]["code"], -32602);
+    assert!(
+        missing_provenance["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("lock_id")
+    );
+
+    let applied = call_tool(
+        &mut server,
+        3,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-lock",
+            "mode": "future_activations",
+            "lock_id": "lock-a",
+            "content_hash": "sha256:first"
+        }),
+    );
+    assert_eq!(structured(&applied)["ok"], true);
+    assert_eq!(structured(&applied)["lock_id"], "lock-a");
+    assert_eq!(structured(&applied)["content_hash"], "sha256:first");
+
+    let context = call_tool(
+        &mut server,
+        4,
+        "get_context",
+        json!({
+            "run_id": "run-lock"
+        }),
+    );
+    let applications = structured(&context)["context"]["flow_lock_applications"]
+        .as_object()
+        .expect("flow lock applications should be exported from runtime state");
+    let latest = applications
+        .values()
+        .next()
+        .expect("one flow lock application should be recorded");
+    assert_eq!(latest["lock_id"], "lock-a");
+    assert_eq!(latest["content_hash"], "sha256:first");
+}
+
+#[test]
+fn tools_list_notification_has_no_response() {
+    let mut server = McpServer::new();
+
+    let response = server.handle_json_rpc(json!({
+        "jsonrpc": "2.0",
+        "method": "tools/list"
+    }));
+
+    assert_eq!(response, None);
+}
+
+#[test]
+fn cli_list_tools_emits_json_tool_descriptors() {
+    let output = Command::new(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .arg("--list-tools")
+        .output()
+        .expect("binary should run");
+
+    assert!(output.status.success());
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    let names: Vec<_> = payload["tools"]
+        .as_array()
+        .expect("tools should be an array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool should have a name"))
+        .collect();
+
+    assert_eq!(names, expected_tool_names());
+}
+
+#[test]
+fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin should be piped");
+        for message in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flow_check","arguments":{"flow":{"nodes":[]},"mode":"core"}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"start_run","arguments":{"run_id":"run-a","nodes":["root"]}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"deliver_artifact","arguments":{"run_id":"run-a","activation_id":"root","artifact_key":"brief","payload":{"text":"ready"}}}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"validate_stop","arguments":{"run_id":"run-a","activation_id":"root"}}}),
+        ] {
+            writeln!(stdin, "{message}").expect("request should be written");
+        }
+    }
+
+    let output = child.wait_with_output().expect("child should exit");
+    assert!(output.status.success());
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("stdout should be UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("response should be JSON"))
+        .collect();
+
+    assert_eq!(responses.len(), 6);
+    assert_eq!(
+        responses[0]["result"]["serverInfo"]["name"],
+        "humanize-plugin-mcp"
+    );
+    assert_eq!(
+        responses[1]["result"]["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .len(),
+        expected_tool_names().len()
+    );
+    assert_eq!(responses[2]["result"]["structuredContent"]["ok"], true);
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["run_id"],
+        "run-a"
+    );
+    assert_eq!(
+        responses[4]["result"]["structuredContent"]["artifact_key"],
+        "brief"
+    );
+    assert_eq!(responses[5]["result"]["structuredContent"]["valid"], true);
+}

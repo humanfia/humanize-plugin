@@ -1,0 +1,1530 @@
+use std::collections::BTreeMap;
+use std::io::{self, BufRead, Write};
+
+use crate::flow;
+use crate::runtime::{self, BoardPatch, NodeSpec, Runtime, StopContract};
+use serde::Serialize;
+use serde_json::{Value, json};
+
+pub const RUNTIME_TOOL_NAMES: [&str; 9] = [
+    "start_run",
+    "get_context",
+    "deliver_artifact",
+    "record_effect",
+    "patch_board",
+    "activate_node",
+    "send_message",
+    "validate_stop",
+    "apply_flow_lock",
+];
+
+pub const AUTHORING_TOOL_NAMES: [&str; 4] =
+    ["flow_apply", "flow_check", "flow_lock", "flow_export"];
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct McpSurface;
+
+impl McpSurface {
+    pub fn runtime_tools(&self) -> Vec<McpToolDescriptor> {
+        RUNTIME_TOOL_NAMES
+            .iter()
+            .map(|name| descriptor_for(name))
+            .collect()
+    }
+
+    pub fn authoring_tools(&self) -> Vec<McpToolDescriptor> {
+        AUTHORING_TOOL_NAMES
+            .iter()
+            .map(|name| descriptor_for(name))
+            .collect()
+    }
+
+    pub fn tools(&self) -> Vec<McpToolDescriptor> {
+        RUNTIME_TOOL_NAMES
+            .iter()
+            .chain(AUTHORING_TOOL_NAMES.iter())
+            .map(|name| descriptor_for(name))
+            .collect()
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<McpToolDescriptor> {
+        RUNTIME_TOOL_NAMES
+            .iter()
+            .chain(AUTHORING_TOOL_NAMES.iter())
+            .find(|tool_name| *tool_name == &name)
+            .map(|tool_name| descriptor_for(tool_name))
+    }
+
+    pub fn tools_list_json(&self) -> Value {
+        json!({ "tools": self.tools() })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct McpToolDescriptor {
+    name: &'static str,
+    description: &'static str,
+    #[serde(rename = "inputSchema")]
+    input_schema: Value,
+}
+
+impl McpToolDescriptor {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn description(&self) -> &'static str {
+        self.description
+    }
+
+    pub fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct McpServer {
+    surface: McpSurface,
+    state: McpServerState,
+}
+
+impl McpServer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn handle_json_rpc(&mut self, request: Value) -> Option<Value> {
+        let id = request.get("id").cloned();
+        let method = match request.get("method").and_then(Value::as_str) {
+            Some(method) => method,
+            None => return Some(error_response(id, -32600, "invalid JSON-RPC request")),
+        };
+
+        id.as_ref()?;
+
+        match method {
+            "initialize" => Some(success_response(id, initialize_result())),
+            "tools/list" => Some(success_response(id, self.surface.tools_list_json())),
+            "tools/call" => Some(self.handle_tool_call(id, request.get("params"))),
+            _ => Some(error_response(id, -32601, "method not found")),
+        }
+    }
+
+    fn handle_tool_call(&mut self, id: Option<Value>, params: Option<&Value>) -> Value {
+        let Some(params) = params.and_then(Value::as_object) else {
+            return error_response(id, -32602, "tools/call params must be an object");
+        };
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return error_response(id, -32602, "tools/call params.name must be a string");
+        };
+
+        if self.surface.lookup(name).is_none() {
+            return error_response(id, -32602, "unknown tool");
+        }
+
+        let Some(arguments) = params.get("arguments") else {
+            return error_response(id, -32602, "tools/call params.arguments must be an object");
+        };
+        if !arguments.is_object() {
+            return error_response(id, -32602, "tools/call params.arguments must be an object");
+        }
+
+        match self.call_tool(name, arguments) {
+            Ok(tool_result) => success_response(id, tool_result.to_json()),
+            Err(err) => error_response(id, -32602, &err.message),
+        }
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        match name {
+            "start_run" => self.start_run(arguments),
+            "get_context" => self.get_context(arguments),
+            "deliver_artifact" => self.deliver_artifact(arguments),
+            "record_effect" => self.record_effect(arguments),
+            "patch_board" => self.patch_board(arguments),
+            "activate_node" => self.activate_node(arguments),
+            "send_message" => self.send_message(arguments),
+            "validate_stop" => self.validate_stop(arguments),
+            "apply_flow_lock" => self.apply_flow_lock(arguments),
+            "flow_apply" => self.flow_apply(arguments),
+            "flow_check" => self.flow_check(arguments),
+            "flow_lock" => self.flow_lock(arguments),
+            "flow_export" => self.flow_export(arguments),
+            _ => Ok(ToolCallResult::error(
+                json!({ "ok": false, "error": "unknown tool" }),
+            )),
+        }
+    }
+
+    fn start_run(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let nodes = node_specs(arguments)?;
+        let activation_ids = self
+            .state
+            .runtime
+            .start_run(run_id, nodes)
+            .map_err(ToolError::from_runtime)?;
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "activation_ids": activation_ids,
+            "tmux": {
+                "enabled": false,
+                "created": false
+            }
+        })))
+    }
+
+    fn get_context(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        match optional_string(arguments, &["run_id", "runId"])? {
+            Some(run_id) => {
+                if !self.state.runtime.has_run(run_id) {
+                    return Err(ToolError::from_runtime(
+                        runtime::RuntimeError::RunNotFound {
+                            run_id: run_id.to_owned(),
+                        },
+                    ));
+                }
+                let context = self.state.runtime_context_json(run_id);
+                Ok(ToolCallResult::ok(
+                    json!({ "ok": true, "run_id": run_id, "context": context }),
+                ))
+            }
+            None => {
+                let runs = self
+                    .state
+                    .runtime
+                    .state()
+                    .runs
+                    .iter()
+                    .map(|run_id| self.state.runtime_context_json(run_id))
+                    .collect::<Vec<_>>();
+                Ok(ToolCallResult::ok(json!({ "ok": true, "runs": runs })))
+            }
+        }
+    }
+
+    fn deliver_artifact(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        require_string_arguments(
+            arguments,
+            &[
+                &["run_id", "runId"],
+                &["activation_id", "activationId"],
+                &["artifact_key", "artifactKey", "key"],
+            ],
+        )?;
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let activation_id = require_string(arguments, &["activation_id", "activationId"])?;
+        let artifact_key = require_string(arguments, &["artifact_key", "artifactKey", "key"])?;
+        let payload = payload_string(arguments.get("payload"))?;
+        let artifact_id = self
+            .state
+            .runtime
+            .deliver_artifact(run_id, activation_id, artifact_key, payload)
+            .map_err(ToolError::from_runtime)?;
+        let record = self
+            .state
+            .runtime
+            .state()
+            .artifact_records
+            .get(&artifact_id)
+            .cloned();
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "activation_id": activation_id,
+            "artifact_key": artifact_key,
+            "artifact_id": artifact_id,
+            "content_hash": record.as_ref().map(|artifact| artifact.content_hash.as_str())
+        })))
+    }
+
+    fn record_effect(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let activation_id = require_string(arguments, &["activation_id", "activationId"])?;
+        let effect_key = require_string(arguments, &["effect_key", "effectKey", "key"])?;
+        let payload = payload_string(arguments.get("payload"))?;
+        self.state
+            .runtime
+            .record_effect(run_id, activation_id, effect_key, payload)
+            .map_err(ToolError::from_runtime)?;
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "activation_id": activation_id,
+            "effect_key": effect_key
+        })))
+    }
+
+    fn patch_board(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let activation_id = require_string(arguments, &["activation_id", "activationId"])?;
+        let patch = require_object_arg(arguments, &["patch"])?;
+        if patch.is_empty() {
+            return Err(ToolError::invalid("patch must include at least one key"));
+        }
+        let expected_version = optional_u64(arguments, &["expected_version", "expectedVersion"])?;
+        let mut board_version = self.state.runtime.state().board_version;
+        for (index, (key, value)) in patch.iter().enumerate() {
+            let mut board_patch = BoardPatch::new(key, value_as_string(value)?);
+            if index == 0 {
+                if let Some(expected_version) = expected_version {
+                    board_patch = board_patch.expect_version(expected_version);
+                }
+            }
+            board_version = self
+                .state
+                .runtime
+                .patch_board(run_id, activation_id, board_patch)
+                .map_err(ToolError::from_runtime)?;
+        }
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "activation_id": activation_id,
+            "board_version": board_version
+        })))
+    }
+
+    fn activate_node(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let node_id = require_string(arguments, &["node_id", "nodeId"])?;
+        let requested_activation_id =
+            optional_string(arguments, &["activation_id", "activationId"])?;
+        if let Some(requested_activation_id) = requested_activation_id {
+            if requested_activation_id != node_id {
+                return Err(ToolError::invalid(
+                    "activation_id must match node_id when using the public runtime API",
+                ));
+            }
+        }
+        let node = node_spec_from_arguments(node_id, arguments)?;
+        let activation_id = self
+            .state
+            .runtime
+            .activate_node(run_id, &node, None)
+            .map_err(ToolError::from_runtime)?;
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "node_id": node_id,
+            "activation_id": activation_id
+        })))
+    }
+
+    fn send_message(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let message = arguments
+            .get("message")
+            .ok_or_else(|| ToolError::missing("message"))?
+            .clone();
+        let message_count = {
+            let messages = self.state.messages.entry(run_id.to_string()).or_default();
+            messages.push(message);
+            messages.len()
+        };
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "message_count": message_count
+        })))
+    }
+
+    fn validate_stop(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let activation_id = require_string(arguments, &["activation_id", "activationId"])?;
+
+        match self.state.runtime.validate_stop(run_id, activation_id) {
+            Ok(()) => Ok(ToolCallResult::ok(json!({
+                "ok": true,
+                "run_id": run_id,
+                "activation_id": activation_id,
+                "valid": true,
+                "missing": []
+            }))),
+            Err(err) => Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "activation_id": activation_id,
+                "valid": false,
+                "missing": stop_validation_missing(&err),
+                "error": err.to_string()
+            }))),
+        }
+    }
+
+    fn apply_flow_lock(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let mode = flow_lock_mode_arg(arguments)?;
+        let lock_id = require_string(
+            arguments,
+            &["lock_id", "lockId", "flow_lock_id", "flowLockId"],
+        )?;
+        let content_hash = require_string(arguments, &["content_hash", "contentHash"])?;
+        self.state
+            .runtime
+            .apply_flow_lock(run_id, mode, lock_id, content_hash)
+            .map_err(ToolError::from_runtime)?;
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "mode": flow_lock_mode_name(mode),
+            "lock_id": lock_id,
+            "content_hash": content_hash
+        })))
+    }
+
+    fn flow_apply(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        if arguments.get("flow").is_some() {
+            let draft = flow_draft_arg(arguments)?;
+            if flow_draft_is_empty(&draft) {
+                return Err(ToolError::invalid(
+                    "flow must include at least one authoring field",
+                ));
+            }
+            let mode = flow_check_mode_arg(arguments)?;
+            return match flow::flow_lock(&draft, mode) {
+                Ok(lock) => {
+                    let lock_id = lock.id().to_string();
+                    let content_hash = content_hash(lock.normalized_content());
+                    let diagnostics = diagnostics_json(lock.diagnostics());
+                    self.state.flow_locks.insert(lock_id.clone(), lock);
+                    Ok(ToolCallResult::ok(json!({
+                        "ok": true,
+                        "mode": flow_check_mode_name(mode),
+                        "flow_lock_id": lock_id,
+                        "lock_id": lock_id,
+                        "content_hash": content_hash,
+                        "diagnostics": diagnostics
+                    })))
+                }
+                Err(err) => Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "mode": flow_check_mode_name(mode),
+                    "diagnostics": diagnostics_json(&err.diagnostics)
+                }))),
+            };
+        }
+
+        let flow_lock_id = require_string(
+            arguments,
+            &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
+        )?;
+        let Some(lock) = self.state.flow_locks.get(flow_lock_id) else {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "flow_lock_id": flow_lock_id,
+                "error": "flow lock not found"
+            })));
+        };
+        let content_hash = content_hash(lock.normalized_content());
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "mode": flow_check_mode_name(lock.mode()),
+            "flow_lock_id": flow_lock_id,
+            "lock_id": flow_lock_id,
+            "content_hash": content_hash,
+            "diagnostics": diagnostics_json(lock.diagnostics())
+        })))
+    }
+
+    fn flow_check(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let draft = flow_draft_arg(arguments)?;
+        let mode = flow_check_mode_arg(arguments)?;
+        let report = flow::flow_check(&draft, mode);
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "mode": flow_check_mode_name(report.mode),
+            "diagnostics": diagnostics_json(&report.diagnostics)
+        })))
+    }
+
+    fn flow_lock(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let draft = flow_draft_arg(arguments)?;
+        let mode = flow_check_mode_arg(arguments)?;
+        match flow::flow_lock(&draft, mode) {
+            Ok(lock) => {
+                let lock_id = lock.id().to_string();
+                let content_hash = content_hash(lock.normalized_content());
+                self.state.flow_locks.insert(lock_id.clone(), lock);
+                Ok(ToolCallResult::ok(json!({
+                    "ok": true,
+                    "mode": flow_check_mode_name(mode),
+                    "flow_lock_id": lock_id,
+                    "lock_id": lock_id,
+                    "content_hash": content_hash
+                })))
+            }
+            Err(err) => Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "mode": flow_check_mode_name(mode),
+                "diagnostics": diagnostics_json(&err.diagnostics)
+            }))),
+        }
+    }
+
+    fn flow_export(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let flow_lock_id = require_string(
+            arguments,
+            &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
+        )?;
+        let format = flow_export_format_arg(arguments)?;
+        let Some(lock) = self.state.flow_locks.get(flow_lock_id) else {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "flow_lock_id": flow_lock_id,
+                "error": "flow lock not found"
+            })));
+        };
+        let document = flow::flow_export(lock, format);
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "flow_lock_id": flow_lock_id,
+            "format": flow_export_format_name(format),
+            "document": document
+        })))
+    }
+}
+
+pub fn serve_stdio<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+    let mut server = McpServer::new();
+
+    while let Some(message) = read_wire_message(reader)? {
+        let request = match serde_json::from_str::<Value>(&message.body) {
+            Ok(request) => request,
+            Err(_) => {
+                write_wire_message(
+                    writer,
+                    message.format,
+                    &error_response(None, -32700, "parse error"),
+                )?;
+                continue;
+            }
+        };
+
+        if let Some(response) = server.handle_json_rpc(request) {
+            write_wire_message(writer, message.format, &response)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct McpServerState {
+    runtime: Runtime,
+    flow_locks: BTreeMap<String, flow::FlowLock>,
+    messages: BTreeMap<String, Vec<Value>>,
+}
+
+impl McpServerState {
+    fn runtime_context_json(&self, run_id: &str) -> Value {
+        let state = self.runtime.state();
+        let message_count = self.messages.get(run_id).map(Vec::len).unwrap_or(0);
+        let activations = state
+            .activations
+            .iter()
+            .filter(|((activation_run_id, _), _)| activation_run_id == run_id)
+            .map(|((_, activation_id), activation)| {
+                (
+                    activation_id.clone(),
+                    json!({
+                        "activation_id": activation.activation_id,
+                        "run_id": activation.run_id,
+                        "node_id": activation.node_id,
+                        "stable_key": activation.stable_key,
+                        "context": activation.context,
+                        "required_artifacts": activation.stop_contract.required_artifacts(),
+                        "required_effects": activation.stop_contract.required_effects(),
+                        "flow_lock_mode": activation.flow_lock_mode.map(flow_lock_mode_name)
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let activation_ids = activations.keys().cloned().collect::<Vec<_>>();
+        let artifacts = state
+            .artifact_records
+            .iter()
+            .filter(|(_, artifact)| artifact.run_id == run_id)
+            .map(|(artifact_id, artifact)| {
+                (
+                    artifact_id.clone(),
+                    json!({
+                        "artifact_id": artifact.artifact_id,
+                        "run_id": artifact.run_id,
+                        "activation_id": artifact.activation_id,
+                        "artifact_key": artifact.artifact_key,
+                        "content_hash": artifact.content_hash,
+                        "payload": artifact.payload,
+                        "event_sequence": artifact.event_sequence
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let latest_artifact_by_slot_index = state
+            .latest_artifact_by_slot_index
+            .iter()
+            .filter(|((slot_run_id, _), _)| slot_run_id == run_id)
+            .map(|((_, artifact_key), artifact_id)| (artifact_key.clone(), artifact_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let effects = state
+            .effects
+            .iter()
+            .filter(|((effect_run_id, _, _), _)| effect_run_id == run_id)
+            .map(|((_, activation_id, effect_key), payload)| {
+                (format!("{activation_id}:{effect_key}"), payload.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let flow_lock_applications = state
+            .flow_lock_applications
+            .iter()
+            .filter(|(_, application)| application.run_id == run_id)
+            .map(|(application_id, application)| {
+                (
+                    application_id.clone(),
+                    json!({
+                        "application_id": application.application_id,
+                        "run_id": application.run_id,
+                        "mode": flow_lock_mode_name(application.mode),
+                        "lock_id": application.lock_id,
+                        "content_hash": application.content_hash,
+                        "event_sequence": application.event_sequence
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        json!({
+            "run_id": run_id,
+            "activation_ids": activation_ids,
+            "activations": activations,
+            "artifacts": artifacts,
+            "latest_artifact_by_slot_index": latest_artifact_by_slot_index,
+            "effects": effects,
+            "board": state.boards.get(run_id).cloned().unwrap_or_default(),
+            "board_version": state.board_versions.get(run_id).copied().unwrap_or(0),
+            "message_count": message_count,
+            "flow_lock_mode": state.flow_lock_mode_by_run.get(run_id).copied().map(flow_lock_mode_name),
+            "latest_flow_lock_application": state.latest_flow_lock_application_by_run.get(run_id),
+            "flow_lock_applications": flow_lock_applications
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallResult {
+    structured: Value,
+    is_error: bool,
+}
+
+impl ToolCallResult {
+    fn ok(structured: Value) -> Self {
+        Self {
+            structured,
+            is_error: false,
+        }
+    }
+
+    fn error(structured: Value) -> Self {
+        Self {
+            structured,
+            is_error: true,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let text = serde_json::to_string(&self.structured)
+            .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"serialization failed\"}".to_string());
+
+        json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": text
+                }
+            ],
+            "structuredContent": self.structured,
+            "isError": self.is_error
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WireFormat {
+    Line,
+    ContentLength,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct WireMessage {
+    format: WireFormat,
+    body: String,
+}
+
+fn read_wire_message<R: BufRead>(reader: &mut R) -> io::Result<Option<WireMessage>> {
+    loop {
+        let mut first_line = String::new();
+        if reader.read_line(&mut first_line)? == 0 {
+            return Ok(None);
+        }
+
+        if first_line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(length) = content_length(&first_line) {
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header)? == 0 {
+                    return Ok(None);
+                }
+                if header.trim().is_empty() {
+                    break;
+                }
+            }
+
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body)?;
+            let body = String::from_utf8(body)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+            return Ok(Some(WireMessage {
+                format: WireFormat::ContentLength,
+                body,
+            }));
+        }
+
+        return Ok(Some(WireMessage {
+            format: WireFormat::Line,
+            body: first_line.trim_end_matches(['\r', '\n']).to_string(),
+        }));
+    }
+}
+
+fn write_wire_message<W: Write>(
+    writer: &mut W,
+    format: WireFormat,
+    response: &Value,
+) -> io::Result<()> {
+    let body = response.to_string();
+    match format {
+        WireFormat::Line => {
+            writeln!(writer, "{body}")?;
+        }
+        WireFormat::ContentLength => {
+            write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len())?;
+        }
+    }
+    writer.flush()
+}
+
+fn content_length(line: &str) -> Option<usize> {
+    let (name, value) = line.split_once(':')?;
+    if name.trim().eq_ignore_ascii_case("content-length") {
+        value.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+fn descriptor_for(name: &str) -> McpToolDescriptor {
+    match name {
+        "start_run" => descriptor(
+            "start_run",
+            "Start a local workflow run and create initial node activations.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "required_artifacts": {
+                                            "type": "array",
+                                            "items": { "type": "string" }
+                                        },
+                                        "required_effects": {
+                                            "type": "array",
+                                            "items": { "type": "string" }
+                                        }
+                                    },
+                                    "required": ["id"]
+                                }
+                            ]
+                        }
+                    },
+                    "required_artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "required_effects": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                }),
+                &["run_id"],
+            ),
+        ),
+        "get_context" => descriptor(
+            "get_context",
+            "Return local context for one run or all in-memory runs.",
+            object_schema(json!({ "run_id": { "type": "string" } }), &[]),
+        ),
+        "deliver_artifact" => descriptor(
+            "deliver_artifact",
+            "Record an artifact payload for a run activation.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "activation_id": { "type": "string" },
+                    "artifact_key": { "type": "string" },
+                    "payload": {}
+                }),
+                &["run_id", "activation_id", "artifact_key"],
+            ),
+        ),
+        "record_effect" => descriptor(
+            "record_effect",
+            "Record an effect fact for a run activation.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "activation_id": { "type": "string" },
+                    "effect_key": { "type": "string" },
+                    "payload": {}
+                }),
+                &["run_id", "activation_id", "effect_key"],
+            ),
+        ),
+        "patch_board" => descriptor(
+            "patch_board",
+            "Patch local run board values with optional version checking.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "activation_id": { "type": "string" },
+                    "expected_version": { "type": "integer", "minimum": 0 },
+                    "patch": { "type": "object" }
+                }),
+                &["run_id", "activation_id", "patch"],
+            ),
+        ),
+        "activate_node" => descriptor(
+            "activate_node",
+            "Create runtime metadata for a node activation.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "activation_id": { "type": "string" }
+                }),
+                &["run_id", "node_id"],
+            ),
+        ),
+        "send_message" => descriptor(
+            "send_message",
+            "Store a local message associated with a run.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "message": {}
+                }),
+                &["run_id", "message"],
+            ),
+        ),
+        "validate_stop" => descriptor(
+            "validate_stop",
+            "Validate whether a runtime activation satisfies its local stop contract.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "activation_id": { "type": "string" }
+                }),
+                &["run_id", "activation_id"],
+            ),
+        ),
+        "apply_flow_lock" => descriptor(
+            "apply_flow_lock",
+            "Apply a flow lock to runtime policy with lock provenance.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["future_activations", "checkpoint_restart"]
+                    },
+                    "lock_id": { "type": "string" },
+                    "content_hash": { "type": "string" }
+                }),
+                &["run_id", "mode", "lock_id", "content_hash"],
+            ),
+        ),
+        "flow_apply" => descriptor(
+            "flow_apply",
+            "Record that a supplied or locked flow was selected for application.",
+            object_schema(
+                json!({ "flow": {}, "flow_lock_id": { "type": "string" } }),
+                &[],
+            ),
+        ),
+        "flow_check" => descriptor(
+            "flow_check",
+            "Run the flow authoring checker for a flow draft.",
+            object_schema(
+                json!({ "flow": {}, "mode": { "type": "string" } }),
+                &["flow"],
+            ),
+        ),
+        "flow_lock" => descriptor(
+            "flow_lock",
+            "Create a deterministic flow lock for a valid flow draft.",
+            object_schema(
+                json!({ "flow": {}, "mode": { "type": "string" } }),
+                &["flow"],
+            ),
+        ),
+        "flow_export" => descriptor(
+            "flow_export",
+            "Export a known flow lock through the flow authoring exporter.",
+            object_schema(
+                json!({
+                    "flow_lock_id": { "type": "string" },
+                    "format": { "type": "string", "enum": ["json", "yaml"] }
+                }),
+                &["flow_lock_id"],
+            ),
+        ),
+        _ => descriptor(
+            "unknown",
+            "Unknown tool descriptor.",
+            object_schema(json!({}), &[]),
+        ),
+    }
+}
+
+fn descriptor(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+) -> McpToolDescriptor {
+    McpToolDescriptor {
+        name,
+        description,
+        input_schema,
+    }
+}
+
+fn object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": true
+    })
+}
+
+fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "humanize-plugin-mcp",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
+}
+
+fn success_response(id: Option<Value>, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "result": result
+    })
+}
+
+fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ToolError {
+    message: String,
+}
+
+impl ToolError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn missing(name: &str) -> Self {
+        Self::invalid(format!("missing required argument: {name}"))
+    }
+
+    fn from_runtime(err: runtime::RuntimeError) -> Self {
+        Self::invalid(err.to_string())
+    }
+}
+
+fn require_string<'a>(arguments: &'a Value, names: &[&str]) -> Result<&'a str, ToolError> {
+    for name in names {
+        if let Some(value) = arguments.get(*name) {
+            return value
+                .as_str()
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be a string")));
+        }
+    }
+    Err(ToolError::missing(names[0]))
+}
+
+fn optional_string<'a>(arguments: &'a Value, names: &[&str]) -> Result<Option<&'a str>, ToolError> {
+    for name in names {
+        if let Some(value) = arguments.get(*name) {
+            return value
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be a string")));
+        }
+    }
+    Ok(None)
+}
+
+fn require_string_arguments(arguments: &Value, fields: &[&[&str]]) -> Result<(), ToolError> {
+    let mut missing = Vec::new();
+    for names in fields {
+        let mut found = false;
+        for name in *names {
+            if let Some(value) = arguments.get(*name) {
+                found = true;
+                if !value.is_string() {
+                    return Err(ToolError::invalid(format!("{name} must be a string")));
+                }
+            }
+        }
+        if !found {
+            missing.push(names[0]);
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolError::invalid(format!(
+            "missing required arguments: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+fn optional_u64(arguments: &Value, names: &[&str]) -> Result<Option<u64>, ToolError> {
+    for name in names {
+        if let Some(value) = arguments.get(*name) {
+            return value
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be an unsigned integer")));
+        }
+    }
+    Ok(None)
+}
+
+fn require_object_arg<'a>(
+    arguments: &'a Value,
+    names: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>, ToolError> {
+    for name in names {
+        if let Some(value) = arguments.get(*name) {
+            return value
+                .as_object()
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be an object")));
+        }
+    }
+    Err(ToolError::missing(names[0]))
+}
+
+fn payload_string(value: Option<&Value>) -> Result<String, ToolError> {
+    match value {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(value) => serde_json::to_string(value)
+            .map_err(|_| ToolError::invalid("payload must be JSON serializable")),
+        None => Ok("null".to_string()),
+    }
+}
+
+fn value_as_string(value: &Value) -> Result<String, ToolError> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        value => serde_json::to_string(value)
+            .map_err(|_| ToolError::invalid("value must be JSON serializable")),
+    }
+}
+
+fn node_specs(arguments: &Value) -> Result<Vec<NodeSpec>, ToolError> {
+    let nodes = match arguments.get("nodes") {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| ToolError::invalid("nodes must be an array"))?,
+        None => {
+            return Ok(vec![node_spec_from_arguments("root", arguments)?]);
+        }
+    };
+
+    if nodes.is_empty() {
+        return Ok(vec![node_spec_from_arguments("root", arguments)?]);
+    }
+
+    nodes
+        .iter()
+        .map(|node| match node {
+            Value::String(id) => Ok(NodeSpec::new(id)),
+            Value::Object(object) => node_spec_from_object(object),
+            _ => Err(ToolError::invalid("nodes items must be strings or objects")),
+        })
+        .collect()
+}
+
+fn node_spec_from_arguments(id: &str, arguments: &Value) -> Result<NodeSpec, ToolError> {
+    let required_artifacts =
+        optional_string_array(arguments, &["required_artifacts", "requiredArtifacts"])?;
+    let required_effects =
+        optional_string_array(arguments, &["required_effects", "requiredEffects"])?;
+    let mut node = NodeSpec::new(id)
+        .with_stop_contract(StopContract::new(required_artifacts, required_effects));
+    if let Some(for_each) = optional_string(arguments, &["for_each", "forEach"])? {
+        node = node.with_for_each(for_each);
+    }
+    Ok(node)
+}
+
+fn node_spec_from_object(object: &serde_json::Map<String, Value>) -> Result<NodeSpec, ToolError> {
+    let id = string_field(object, &["id", "node_id", "nodeId"])?;
+    let required_artifacts =
+        optional_string_array_from_object(object, &["required_artifacts", "requiredArtifacts"])?;
+    let required_effects =
+        optional_string_array_from_object(object, &["required_effects", "requiredEffects"])?;
+    let mut node = NodeSpec::new(id)
+        .with_stop_contract(StopContract::new(required_artifacts, required_effects));
+    if let Some(for_each) = optional_string_field(object, &["for_each", "forEach"])? {
+        node = node.with_for_each(for_each);
+    }
+    Ok(node)
+}
+
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    names: &[&str],
+) -> Result<&'a str, ToolError> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value
+                .as_str()
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be a string")));
+        }
+    }
+    Err(ToolError::missing(names[0]))
+}
+
+fn optional_string_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    names: &[&str],
+) -> Result<Option<&'a str>, ToolError> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be a string")));
+        }
+    }
+    Ok(None)
+}
+
+fn optional_string_array(arguments: &Value, names: &[&str]) -> Result<Vec<String>, ToolError> {
+    for name in names {
+        if let Some(value) = arguments.get(*name) {
+            return string_array(value, name);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn optional_string_array_from_object(
+    object: &serde_json::Map<String, Value>,
+    names: &[&str],
+) -> Result<Vec<String>, ToolError> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return string_array(value, name);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn string_array(value: &Value, name: &str) -> Result<Vec<String>, ToolError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| ToolError::invalid(format!("{name} must be an array")))?;
+    values
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ToolError::invalid(format!("{name} items must be strings")))
+        })
+        .collect()
+}
+
+fn flow_lock_mode_arg(arguments: &Value) -> Result<runtime::FlowLockMode, ToolError> {
+    match require_string(arguments, &["mode"])? {
+        "future_activations" | "futureActivations" | "future-activations" => {
+            Ok(runtime::FlowLockMode::FutureActivations)
+        }
+        "checkpoint_restart" | "checkpointRestart" | "checkpoint-restart" => {
+            Ok(runtime::FlowLockMode::CheckpointRestart)
+        }
+        value => Err(ToolError::invalid(format!(
+            "unknown flow lock mode: {value}"
+        ))),
+    }
+}
+
+fn flow_lock_mode_name(mode: runtime::FlowLockMode) -> &'static str {
+    match mode {
+        runtime::FlowLockMode::FutureActivations => "future_activations",
+        runtime::FlowLockMode::CheckpointRestart => "checkpoint_restart",
+    }
+}
+
+fn stop_validation_missing(err: &runtime::StopValidationError) -> Vec<String> {
+    match err {
+        runtime::StopValidationError::RunNotFound { .. }
+        | runtime::StopValidationError::ActivationNotFound { .. }
+        | runtime::StopValidationError::ActivationNotFoundInRun { .. } => {
+            vec!["activation".into()]
+        }
+        runtime::StopValidationError::MissingArtifact { artifact_key, .. } => {
+            vec![format!("artifact:{artifact_key}")]
+        }
+        runtime::StopValidationError::MissingEffect { effect_key, .. } => {
+            vec![format!("effect:{effect_key}")]
+        }
+    }
+}
+
+fn flow_draft_arg(arguments: &Value) -> Result<flow::FlowDraft, ToolError> {
+    let flow = require_object_arg(arguments, &["flow"])?;
+
+    Ok(flow::FlowDraft {
+        nodes: optional_array_field(flow, "nodes")?
+            .iter()
+            .map(parse_flow_node)
+            .collect::<Result<Vec<_>, _>>()?,
+        contracts: optional_array_field(flow, "contracts")?
+            .iter()
+            .map(parse_flow_contract)
+            .collect::<Result<Vec<_>, _>>()?,
+        routes: optional_array_field(flow, "routes")?
+            .iter()
+            .map(parse_flow_route)
+            .collect::<Result<Vec<_>, _>>()?,
+        resources: optional_array_field(flow, "resources")?
+            .iter()
+            .map(parse_flow_resource)
+            .collect::<Result<Vec<_>, _>>()?,
+        imports: optional_array_field(flow, "imports")?
+            .iter()
+            .map(parse_flow_import)
+            .collect::<Result<Vec<_>, _>>()?,
+        policies: parse_flow_policies(flow.get("policies"))?,
+        extensions: match flow.get("extensions") {
+            Some(value) => string_array(value, "extensions")?,
+            None => Vec::new(),
+        },
+    })
+}
+
+fn flow_draft_is_empty(draft: &flow::FlowDraft) -> bool {
+    draft.nodes.is_empty()
+        && draft.contracts.is_empty()
+        && draft.routes.is_empty()
+        && draft.resources.is_empty()
+        && draft.imports.is_empty()
+        && draft.policies == flow::FlowPolicies::default()
+        && draft.extensions.is_empty()
+}
+
+fn optional_array_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a [Value], ToolError> {
+    match object.get(name) {
+        Some(value) => value
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| ToolError::invalid(format!("{name} must be an array"))),
+        None => Ok(&[]),
+    }
+}
+
+fn parse_flow_node(value: &Value) -> Result<flow::FlowNode, ToolError> {
+    match value {
+        Value::String(id) => Ok(flow::FlowNode {
+            id: id.clone(),
+            ..flow::FlowNode::default()
+        }),
+        Value::Object(object) => Ok(flow::FlowNode {
+            id: string_field(object, &["id"])?.to_string(),
+            contract_id: optional_string_field(object, &["contract_id", "contractId"])?
+                .map(str::to_string),
+            write_scopes: match object
+                .get("write_scopes")
+                .or_else(|| object.get("writeScopes"))
+            {
+                Some(value) => parse_write_scopes(value, "write_scopes")?,
+                None => Vec::new(),
+            },
+            extensions: match object.get("extensions") {
+                Some(value) => string_array(value, "extensions")?,
+                None => Vec::new(),
+            },
+        }),
+        _ => Err(ToolError::invalid("nodes items must be strings or objects")),
+    }
+}
+
+fn parse_flow_contract(value: &Value) -> Result<flow::FlowContract, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("contracts items must be objects"))?;
+    Ok(flow::FlowContract {
+        id: string_field(object, &["id"])?.to_string(),
+        completion: optional_string_field(object, &["completion"])?
+            .map(parse_contract_completion)
+            .transpose()?,
+        artifacts: optional_array_field(object, "artifacts")?
+            .iter()
+            .map(parse_contract_artifact)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn parse_contract_completion(value: &str) -> Result<flow::ContractCompletion, ToolError> {
+    match value {
+        "manual" | "Manual" => Ok(flow::ContractCompletion::Manual),
+        "all_artifacts" | "allArtifacts" | "AllArtifacts" => {
+            Ok(flow::ContractCompletion::AllArtifacts)
+        }
+        value => Err(ToolError::invalid(format!(
+            "unknown contract completion: {value}"
+        ))),
+    }
+}
+
+fn parse_contract_artifact(value: &Value) -> Result<flow::ContractArtifact, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("artifacts items must be objects"))?;
+    Ok(flow::ContractArtifact {
+        id: string_field(object, &["id"])?.to_string(),
+        schema_resource_id: optional_string_field(
+            object,
+            &["schema_resource_id", "schemaResourceId"],
+        )?
+        .map(str::to_string),
+    })
+}
+
+fn parse_flow_route(value: &Value) -> Result<flow::FlowRoute, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("routes items must be objects"))?;
+    Ok(flow::FlowRoute {
+        predicate: string_field(object, &["predicate"])?.to_string(),
+        for_each: optional_string_field(object, &["for_each", "forEach"])?.map(str::to_string),
+        activate: string_field(object, &["activate"])?.to_string(),
+    })
+}
+
+fn parse_flow_resource(value: &Value) -> Result<flow::FlowResource, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("resources items must be objects"))?;
+    Ok(flow::FlowResource {
+        id: string_field(object, &["id"])?.to_string(),
+        kind: parse_resource_kind(string_field(object, &["kind"])?)?,
+        source: string_field(object, &["source"])?.to_string(),
+    })
+}
+
+fn parse_resource_kind(value: &str) -> Result<flow::ResourceKind, ToolError> {
+    match value {
+        "schema" | "Schema" => Ok(flow::ResourceKind::Schema),
+        "rule" | "Rule" => Ok(flow::ResourceKind::Rule),
+        "profile" | "Profile" => Ok(flow::ResourceKind::Profile),
+        "view" | "View" => Ok(flow::ResourceKind::View),
+        "prompt" | "Prompt" => Ok(flow::ResourceKind::Prompt),
+        "script" | "Script" => Ok(flow::ResourceKind::Script),
+        "flow" | "Flow" => Ok(flow::ResourceKind::Flow),
+        value => Err(ToolError::invalid(format!(
+            "unknown resource kind: {value}"
+        ))),
+    }
+}
+
+fn parse_flow_import(value: &Value) -> Result<flow::FlowImport, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("imports items must be objects"))?;
+    Ok(flow::FlowImport {
+        resource_id: string_field(object, &["resource_id", "resourceId"])?.to_string(),
+        alias: optional_string_field(object, &["alias"])?.map(str::to_string),
+    })
+}
+
+fn parse_flow_policies(value: Option<&Value>) -> Result<flow::FlowPolicies, ToolError> {
+    let Some(value) = value else {
+        return Ok(flow::FlowPolicies::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("policies must be an object"))?;
+    let write_scopes = match object
+        .get("write_scopes")
+        .or_else(|| object.get("writeScopes"))
+    {
+        Some(value) => parse_write_scopes(value, "write_scopes")?,
+        None => Vec::new(),
+    };
+    Ok(flow::FlowPolicies { write_scopes })
+}
+
+fn parse_write_scopes(value: &Value, name: &str) -> Result<Vec<flow::WriteScope>, ToolError> {
+    let scopes = value
+        .as_array()
+        .ok_or_else(|| ToolError::invalid(format!("{name} must be an array")))?;
+    scopes.iter().map(parse_write_scope).collect()
+}
+
+fn parse_write_scope(value: &Value) -> Result<flow::WriteScope, ToolError> {
+    match value {
+        Value::String(value) if value == "workspace" => Ok(flow::WriteScope::Workspace),
+        Value::String(value) if value == "system" => Ok(flow::WriteScope::System),
+        Value::String(value) if value.starts_with("artifact:") => Ok(flow::WriteScope::Artifact(
+            value.trim_start_matches("artifact:").to_string(),
+        )),
+        Value::String(value) if value.starts_with("resource:") => Ok(flow::WriteScope::Resource(
+            value.trim_start_matches("resource:").to_string(),
+        )),
+        Value::Object(object) => {
+            let kind = string_field(object, &["kind", "type"])?;
+            match kind {
+                "artifact" => Ok(flow::WriteScope::Artifact(
+                    string_field(object, &["value", "id"])?.to_string(),
+                )),
+                "resource" => Ok(flow::WriteScope::Resource(
+                    string_field(object, &["value", "id"])?.to_string(),
+                )),
+                "workspace" => Ok(flow::WriteScope::Workspace),
+                "system" => Ok(flow::WriteScope::System),
+                value => Err(ToolError::invalid(format!("unknown write scope: {value}"))),
+            }
+        }
+        _ => Err(ToolError::invalid(
+            "write scope items must be strings or objects",
+        )),
+    }
+}
+
+fn flow_check_mode_arg(arguments: &Value) -> Result<flow::FlowCheckMode, ToolError> {
+    match optional_string(arguments, &["mode"])? {
+        Some("core") | None => Ok(flow::FlowCheckMode::Core),
+        Some("strict") => Ok(flow::FlowCheckMode::Strict),
+        Some(value) => Err(ToolError::invalid(format!(
+            "unknown flow check mode: {value}"
+        ))),
+    }
+}
+
+fn flow_check_mode_name(mode: flow::FlowCheckMode) -> &'static str {
+    match mode {
+        flow::FlowCheckMode::Core => "core",
+        flow::FlowCheckMode::Strict => "strict",
+    }
+}
+
+fn flow_export_format_arg(arguments: &Value) -> Result<flow::FlowExportFormat, ToolError> {
+    match optional_string(arguments, &["format"])? {
+        Some("json") | None => Ok(flow::FlowExportFormat::Json),
+        Some("yaml") => Ok(flow::FlowExportFormat::Yaml),
+        Some(value) => Err(ToolError::invalid(format!(
+            "unknown flow export format: {value}"
+        ))),
+    }
+}
+
+fn flow_export_format_name(format: flow::FlowExportFormat) -> &'static str {
+    match format {
+        flow::FlowExportFormat::Json => "json",
+        flow::FlowExportFormat::Yaml => "yaml",
+    }
+}
+
+fn diagnostics_json(diagnostics: &[flow::Diagnostic]) -> Vec<Value> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "code": diagnostic.code,
+                "severity": severity_name(diagnostic.severity),
+                "location": diagnostic.location,
+                "message": diagnostic.message,
+                "fix_hint": diagnostic.fix_hint
+            })
+        })
+        .collect()
+}
+
+fn severity_name(severity: flow::Severity) -> &'static str {
+    match severity {
+        flow::Severity::Error => "error",
+        flow::Severity::Warning => "warning",
+    }
+}
+
+fn content_hash(input: &str) -> String {
+    format!("fnv1a64:{:016x}", stable_hash(input))
+}
+
+fn stable_hash(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
