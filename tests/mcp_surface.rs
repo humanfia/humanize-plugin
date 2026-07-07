@@ -152,6 +152,19 @@ fn node_less_missing_readme_flow() -> Value {
     })
 }
 
+fn blank_inline_readme_flow() -> Value {
+    json!({
+        "nodes": ["root"],
+        "resources": [
+            {
+                "id": "readme.main",
+                "kind": "readme",
+                "source": "inline:   "
+            }
+        ]
+    })
+}
+
 fn valid_flow() -> Value {
     json!({
         "nodes": [
@@ -681,6 +694,25 @@ fn flow_check_rejects_node_less_non_empty_flow_missing_readme() {
 
     assert_tool_error(&response);
     assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
+}
+
+#[test]
+fn flow_check_rejects_blank_inline_readme() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "mode": "core",
+            "flow": blank_inline_readme_flow()
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_EMPTY_README"]);
+    assert_eq!(structured(&response)["diagnostics"][0]["severity"], "error");
 }
 
 #[test]

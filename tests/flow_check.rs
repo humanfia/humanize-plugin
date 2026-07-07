@@ -313,6 +313,78 @@ fn core_check_requires_readme_resource_for_runnable_drafts() {
 }
 
 #[test]
+fn core_check_requires_readme_content_for_runnable_drafts() {
+    for source in [
+        "",
+        "   ",
+        "inline:",
+        "inline:   ",
+        "inline:\n\t",
+        " inline:   ",
+    ] {
+        let mut draft = valid_draft();
+        draft.resources[0].source = source.into();
+
+        let report = flow_check(&draft, FlowCheckMode::Core);
+
+        assert_eq!(
+            diagnostic_codes(&report.diagnostics),
+            vec!["FLOW_EMPTY_README"],
+            "source {source:?} should be rejected"
+        );
+        assert_eq!(report.diagnostics[0].severity, Severity::Error);
+        assert_eq!(report.diagnostics[0].location, "resources");
+    }
+}
+
+#[test]
+fn core_check_rejects_multiple_readme_resources_when_all_are_empty() {
+    let mut draft = valid_draft();
+    draft.resources[0].source = "inline: ".into();
+    draft.resources.push(FlowResource {
+        id: "readme.secondary".into(),
+        kind: ResourceKind::Readme,
+        source: "  ".into(),
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_EMPTY_README"]
+    );
+    assert_eq!(report.diagnostics[0].severity, Severity::Error);
+}
+
+#[test]
+fn core_check_accepts_any_valid_readme_resource() {
+    let mut draft = valid_draft();
+    draft.resources[0].source = "inline: ".into();
+    draft.resources.push(FlowResource {
+        id: "readme.secondary".into(),
+        kind: ResourceKind::Readme,
+        source: "docs/README.md".into(),
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(report.diagnostics, Vec::new());
+}
+
+#[test]
+fn flow_lock_rejects_empty_readme() {
+    let mut draft = valid_draft();
+    draft.resources[0].source = "inline: ".into();
+
+    let err = flow_lock(&draft, FlowCheckMode::Core).unwrap_err();
+
+    assert_eq!(
+        diagnostic_codes(&err.diagnostics),
+        vec!["FLOW_EMPTY_README"]
+    );
+}
+
+#[test]
 fn core_check_requires_readme_for_node_less_non_empty_drafts() {
     let cases = [
         (

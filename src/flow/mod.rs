@@ -260,13 +260,22 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
         .collect::<HashSet<_>>();
     let mut diagnostics = Vec::new();
 
-    if draft_is_non_empty_package(draft) && !draft_has_readme(draft) {
-        diagnostics.push(Diagnostic::error(
-            "FLOW_MISSING_README",
-            "resources",
-            "non-empty flow packages must include a README resource",
-            "Add a resource with kind 'readme' that describes the package.",
-        ));
+    if draft_is_non_empty_package(draft) {
+        if !draft_has_readme(draft) {
+            diagnostics.push(Diagnostic::error(
+                "FLOW_MISSING_README",
+                "resources",
+                "non-empty flow packages must include a README resource",
+                "Add a resource with kind 'readme' that describes the package.",
+            ));
+        } else if !draft_has_readme_content(draft) {
+            diagnostics.push(Diagnostic::error(
+                "FLOW_EMPTY_README",
+                "resources",
+                "README resources must include explanatory content",
+                "Add non-empty content to at least one README resource.",
+            ));
+        }
     }
 
     for (index, route) in draft.routes.iter().enumerate() {
@@ -654,6 +663,25 @@ fn draft_has_readme(draft: &FlowDraft) -> bool {
         .resources
         .iter()
         .any(|resource| resource.kind == ResourceKind::Readme)
+}
+
+fn draft_has_readme_content(draft: &FlowDraft) -> bool {
+    draft
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == ResourceKind::Readme)
+        .any(|resource| readme_source_has_content(&resource.source))
+}
+
+fn readme_source_has_content(source: &str) -> bool {
+    let source = source.trim();
+    if source.is_empty() {
+        return false;
+    }
+
+    source
+        .strip_prefix("inline:")
+        .is_none_or(|inline_source| !inline_source.trim().is_empty())
 }
 
 fn unique_ascii_ids(values: &[String], fallback: &str) -> Vec<String> {
