@@ -51,6 +51,7 @@ fn expected_tool_names() -> Vec<&'static str> {
         "view_snapshot",
         "view_browser",
         "flow_apply",
+        "flow_suggest",
         "flow_check",
         "flow_lock",
         "flow_export",
@@ -115,6 +116,14 @@ fn diagnostic_codes(response: &Value) -> Vec<&str> {
 fn assert_tool_error(response: &Value) {
     assert_eq!(response["result"]["isError"], true);
     assert_eq!(structured(response)["ok"], false);
+}
+
+fn assert_prefixed_hex(value: &str, prefix: &str) {
+    let suffix = value
+        .strip_prefix(prefix)
+        .expect("value should include expected prefix");
+    assert_eq!(suffix.len(), 16);
+    assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
 }
 
 fn readme_resource() -> Value {
@@ -380,6 +389,185 @@ fn deliver_artifact_rejects_missing_required_arguments() {
             .as_str()
             .expect("error should include a message")
             .contains("artifact_key")
+    );
+}
+
+#[test]
+fn flow_suggest_schema_covers_goal_nodes_and_artifact() {
+    let surface = McpSurface;
+    let descriptor = surface
+        .lookup("flow_suggest")
+        .expect("flow_suggest descriptor should be present");
+    let schema = descriptor.input_schema();
+
+    assert_eq!(schema["required"], json!(["goal"]));
+    assert_eq!(schema["properties"]["goal"]["type"], "string");
+    assert_eq!(schema["properties"]["artifact"]["type"], "string");
+    assert_eq!(schema["properties"]["nodes"]["type"], "array");
+    assert_eq!(schema["properties"]["nodes"]["items"]["type"], "string");
+}
+
+#[test]
+fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
+    let mut server = McpServer::new();
+
+    let suggested = call_tool(
+        &mut server,
+        1,
+        "flow_suggest",
+        json!({
+            "goal": "Draft a concise migration brief.",
+            "nodes": ["Collect facts", "Review output"],
+            "artifact": "Brief"
+        }),
+    );
+
+    assert_eq!(suggested["result"]["isError"], false);
+    assert_eq!(structured(&suggested)["ok"], true);
+    assert_eq!(structured(&suggested)["valid"], true);
+    assert_eq!(structured(&suggested)["mode"], "core");
+    assert_eq!(structured(&suggested)["diagnostics"], json!([]));
+    assert_eq!(
+        structured(&suggested)["flow"]["nodes"],
+        json!([
+            {
+                "id": "collect_facts",
+                "contract_id": "contract.collect_facts",
+                "write_scopes": [],
+                "extensions": []
+            },
+            {
+                "id": "review_output",
+                "contract_id": "contract.review_output",
+                "write_scopes": [],
+                "extensions": []
+            }
+        ])
+    );
+    assert_eq!(
+        structured(&suggested)["flow"]["contracts"][0],
+        json!({
+            "id": "contract.collect_facts",
+            "completion": "all_artifacts",
+            "artifacts": [
+                {
+                    "id": "brief",
+                    "schema_resource_id": "schema.collect_facts.brief"
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        structured(&suggested)["flow"]["resources"][0],
+        json!({
+            "id": "readme.main",
+            "kind": "readme",
+            "source": "inline:Draft a concise migration brief."
+        })
+    );
+    assert_eq!(structured(&suggested)["flow"]["routes"], json!([]));
+    assert_eq!(structured(&suggested)["flow"]["imports"], json!([]));
+    assert_eq!(
+        structured(&suggested)["flow"]["policies"],
+        json!({ "write_scopes": [] })
+    );
+    assert_eq!(structured(&suggested)["flow"]["extensions"], json!([]));
+
+    let checked = call_tool(
+        &mut server,
+        2,
+        "flow_check",
+        json!({
+            "flow": structured(&suggested)["flow"].clone()
+        }),
+    );
+
+    assert_eq!(checked["result"]["isError"], false);
+    assert_eq!(structured(&checked)["ok"], true);
+    assert_eq!(structured(&checked)["diagnostics"], json!([]));
+}
+
+#[test]
+fn flow_suggest_flow_round_trips_through_lock_and_export() {
+    let mut server = McpServer::new();
+
+    let suggested = call_tool(
+        &mut server,
+        1,
+        "flow_suggest",
+        json!({
+            "goal": "Draft a concise migration brief.",
+            "nodes": ["Collect facts", "Review output"],
+            "artifact": "Brief"
+        }),
+    );
+
+    assert_eq!(structured(&suggested)["ok"], true);
+    let flow = structured(&suggested)["flow"].clone();
+
+    let locked = call_tool(
+        &mut server,
+        2,
+        "flow_lock",
+        json!({
+            "flow": flow
+        }),
+    );
+
+    assert_eq!(locked["result"]["isError"], false);
+    assert_eq!(structured(&locked)["ok"], true);
+    assert_eq!(structured(&locked)["mode"], "core");
+    let lock_id = structured(&locked)["flow_lock_id"]
+        .as_str()
+        .expect("flow_lock should return a flow lock id");
+    assert_eq!(structured(&locked)["lock_id"], lock_id);
+    assert_prefixed_hex(lock_id, "flk_");
+    assert_prefixed_hex(
+        structured(&locked)["content_hash"]
+            .as_str()
+            .expect("flow_lock should return a content hash"),
+        "fnv1a64:",
+    );
+
+    let exported = call_tool(
+        &mut server,
+        3,
+        "flow_export",
+        json!({
+            "flow_lock_id": lock_id,
+            "format": "json"
+        }),
+    );
+
+    assert_eq!(exported["result"]["isError"], false);
+    assert_eq!(structured(&exported)["ok"], true);
+    assert_eq!(structured(&exported)["flow_lock_id"], lock_id);
+    let document = structured(&exported)["document"]
+        .as_str()
+        .expect("export should include a document");
+    assert!(document.contains(lock_id));
+    assert!(document.contains("readme.main"));
+}
+
+#[test]
+fn flow_suggest_rejects_blank_goal() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_suggest",
+        json!({
+            "goal": " \t\n "
+        }),
+    );
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("goal")
     );
 }
 

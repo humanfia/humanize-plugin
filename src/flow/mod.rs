@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct FlowDraft {
@@ -165,6 +165,85 @@ pub struct FlowLockError {
 pub enum FlowExportFormat {
     Json,
     Yaml,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct FlowSuggestInput {
+    pub goal: String,
+    pub nodes: Vec<String>,
+    pub artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FlowSuggestError {
+    message: String,
+}
+
+impl FlowSuggestError {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+pub fn flow_suggest(input: FlowSuggestInput) -> Result<FlowDraft, FlowSuggestError> {
+    let goal = input.goal.trim();
+    if goal.is_empty() {
+        return Err(FlowSuggestError {
+            message: "goal must not be blank".into(),
+        });
+    }
+
+    let artifact = input
+        .artifact
+        .as_deref()
+        .map(|value| slug_ascii_id(value, "result"))
+        .unwrap_or_else(|| "result".into());
+    let raw_nodes = if input.nodes.is_empty() {
+        vec!["root".to_string()]
+    } else {
+        input.nodes
+    };
+    let node_ids = unique_ascii_ids(&raw_nodes, "node");
+
+    let nodes = node_ids
+        .iter()
+        .map(|node_id| FlowNode {
+            id: node_id.clone(),
+            contract_id: Some(format!("contract.{node_id}")),
+            ..FlowNode::default()
+        })
+        .collect::<Vec<_>>();
+    let contracts = node_ids
+        .iter()
+        .map(|node_id| FlowContract {
+            id: format!("contract.{node_id}"),
+            completion: Some(ContractCompletion::AllArtifacts),
+            artifacts: vec![ContractArtifact {
+                id: artifact.clone(),
+                schema_resource_id: Some(format!("schema.{node_id}.{artifact}")),
+            }],
+        })
+        .collect::<Vec<_>>();
+    let mut resources = vec![FlowResource {
+        id: "readme.main".into(),
+        kind: ResourceKind::Readme,
+        source: format!("inline:{goal}"),
+    }];
+    resources.extend(node_ids.iter().map(|node_id| FlowResource {
+        id: format!("schema.{node_id}.{artifact}"),
+        kind: ResourceKind::Schema,
+        source: format!("inline:{artifact}"),
+    }));
+
+    Ok(FlowDraft {
+        nodes,
+        contracts,
+        routes: Vec::new(),
+        resources,
+        imports: Vec::new(),
+        policies: FlowPolicies::default(),
+        extensions: Vec::new(),
+    })
 }
 
 pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
@@ -575,6 +654,58 @@ fn draft_has_readme(draft: &FlowDraft) -> bool {
         .resources
         .iter()
         .any(|resource| resource.kind == ResourceKind::Readme)
+}
+
+fn unique_ascii_ids(values: &[String], fallback: &str) -> Vec<String> {
+    let mut counts = HashMap::new();
+    let mut used = HashSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let base = slug_ascii_id(value, fallback);
+            let mut count = counts.get(&base).copied().unwrap_or(0) + 1;
+
+            loop {
+                let candidate = if count == 1 {
+                    base.clone()
+                } else {
+                    format!("{base}_{count}")
+                };
+
+                if used.insert(candidate.clone()) {
+                    counts.insert(base, count);
+                    return candidate;
+                }
+
+                count += 1;
+            }
+        })
+        .collect()
+}
+
+fn slug_ascii_id(value: &str, fallback: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_separator = false;
+
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !slug.is_empty() && !last_was_separator {
+            slug.push('_');
+            last_was_separator = true;
+        }
+    }
+
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        fallback.to_string()
+    } else {
+        slug
+    }
 }
 
 fn is_boolean_literal(value: &str) -> bool {

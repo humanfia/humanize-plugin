@@ -5,8 +5,11 @@ use crate::adapters::tmux::{CommandRunner, SystemCommandRunner, TmuxAdapter};
 use crate::flow;
 use crate::runtime::{self, BoardPatch, NodeSpec, Runtime, StopContract};
 use crate::view::{VisualizationSnapshot, render_terminal_dashboard, serve_browser_snapshot};
+use flow_json::flow_draft_json;
 use serde::Serialize;
 use serde_json::{Value, json};
+
+mod flow_json;
 
 pub const RUNTIME_TOOL_NAMES: [&str; 12] = [
     "start_run",
@@ -23,8 +26,13 @@ pub const RUNTIME_TOOL_NAMES: [&str; 12] = [
     "view_browser",
 ];
 
-pub const AUTHORING_TOOL_NAMES: [&str; 4] =
-    ["flow_apply", "flow_check", "flow_lock", "flow_export"];
+pub const AUTHORING_TOOL_NAMES: [&str; 5] = [
+    "flow_apply",
+    "flow_suggest",
+    "flow_check",
+    "flow_lock",
+    "flow_export",
+];
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct McpSurface;
@@ -171,6 +179,7 @@ impl<R: CommandRunner> McpServer<R> {
             "view_snapshot" => self.view_snapshot(arguments),
             "view_browser" => self.view_browser(arguments),
             "flow_apply" => self.flow_apply(arguments),
+            "flow_suggest" => self.flow_suggest(arguments),
             "flow_check" => self.flow_check(arguments),
             "flow_lock" => self.flow_lock(arguments),
             "flow_export" => self.flow_export(arguments),
@@ -562,6 +571,27 @@ impl<R: CommandRunner> McpServer<R> {
             "content_hash": content_hash,
             "diagnostics": diagnostics_json(lock.diagnostics())
         })))
+    }
+
+    fn flow_suggest(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let input = flow_suggest_input_arg(arguments)?;
+        let draft = flow::flow_suggest(input)
+            .map_err(|err| ToolError::invalid(err.message().to_string()))?;
+        let report = flow::flow_check(&draft, flow::FlowCheckMode::Core);
+        let valid = !report.has_errors();
+        let structured = json!({
+            "ok": valid,
+            "flow": flow_draft_json(&draft),
+            "mode": flow_check_mode_name(report.mode),
+            "diagnostics": diagnostics_json(&report.diagnostics),
+            "valid": valid
+        });
+
+        if valid {
+            Ok(ToolCallResult::ok(structured))
+        } else {
+            Ok(ToolCallResult::error(structured))
+        }
     }
 
     fn flow_check(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -976,6 +1006,21 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             object_schema(
                 json!({ "flow": {}, "flow_lock_id": { "type": "string" } }),
                 &[],
+            ),
+        ),
+        "flow_suggest" => descriptor(
+            "flow_suggest",
+            "Suggest a minimal flow draft skeleton for a terse authoring goal.",
+            object_schema(
+                json!({
+                    "goal": { "type": "string" },
+                    "nodes": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "artifact": { "type": "string" }
+                }),
+                &["goal"],
             ),
         ),
         "flow_check" => descriptor(
@@ -1396,6 +1441,14 @@ fn stop_validation_missing(err: &runtime::StopValidationError) -> Vec<String> {
             vec![format!("effect:{effect_key}")]
         }
     }
+}
+
+fn flow_suggest_input_arg(arguments: &Value) -> Result<flow::FlowSuggestInput, ToolError> {
+    Ok(flow::FlowSuggestInput {
+        goal: require_string(arguments, &["goal"])?.to_string(),
+        nodes: optional_string_array(arguments, &["nodes"])?,
+        artifact: optional_string(arguments, &["artifact"])?.map(str::to_string),
+    })
 }
 
 fn flow_draft_arg(arguments: &Value) -> Result<flow::FlowDraft, ToolError> {

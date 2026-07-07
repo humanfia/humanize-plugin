@@ -1,8 +1,9 @@
 use humanize_plugin::flow::{
     ContractArtifact, ContractCompletion, Diagnostic, FlowCheckMode, FlowContract, FlowDraft,
-    FlowExportFormat, FlowImport, FlowNode, FlowPolicies, FlowResource, FlowRoute, ResourceKind,
-    RunCompatibility, Severity, WriteScope, effective_node_write_scopes, flow_check,
-    flow_check_run_compatibility, flow_export, flow_lock,
+    FlowExportFormat, FlowImport, FlowNode, FlowPolicies, FlowResource, FlowRoute,
+    FlowSuggestInput, ResourceKind, RunCompatibility, Severity, WriteScope,
+    effective_node_write_scopes, flow_check, flow_check_run_compatibility, flow_export, flow_lock,
+    flow_suggest,
 };
 
 fn valid_draft() -> FlowDraft {
@@ -73,6 +74,179 @@ fn diagnostic_codes(diagnostics: &[Diagnostic]) -> Vec<&str> {
         .iter()
         .map(|diagnostic| diagnostic.code.as_str())
         .collect()
+}
+
+#[test]
+fn flow_suggest_builds_default_valid_skeleton() {
+    let draft = flow_suggest(FlowSuggestInput {
+        goal: "Summarize release risk.".into(),
+        ..FlowSuggestInput::default()
+    })
+    .expect("suggested flow should be built");
+
+    assert_eq!(
+        draft.nodes,
+        vec![FlowNode {
+            id: "root".into(),
+            contract_id: Some("contract.root".into()),
+            ..FlowNode::default()
+        }]
+    );
+    assert_eq!(
+        draft.contracts,
+        vec![FlowContract {
+            id: "contract.root".into(),
+            completion: Some(ContractCompletion::AllArtifacts),
+            artifacts: vec![ContractArtifact {
+                id: "result".into(),
+                schema_resource_id: Some("schema.root.result".into()),
+            }],
+        }]
+    );
+    assert_eq!(
+        draft.resources,
+        vec![
+            FlowResource {
+                id: "readme.main".into(),
+                kind: ResourceKind::Readme,
+                source: "inline:Summarize release risk.".into(),
+            },
+            FlowResource {
+                id: "schema.root.result".into(),
+                kind: ResourceKind::Schema,
+                source: "inline:result".into(),
+            },
+        ]
+    );
+    assert_eq!(draft.routes, Vec::<FlowRoute>::new());
+    assert_eq!(draft.imports, Vec::<FlowImport>::new());
+    assert_eq!(draft.policies, FlowPolicies::default());
+    assert_eq!(draft.extensions, Vec::<String>::new());
+    assert_eq!(
+        flow_check(&draft, FlowCheckMode::Core).diagnostics,
+        Vec::new()
+    );
+}
+
+#[test]
+fn flow_suggest_slugs_and_deduplicates_node_ids() {
+    let draft = flow_suggest(FlowSuggestInput {
+        goal: "Build a compact migration brief.".into(),
+        nodes: vec![
+            " Review API ".into(),
+            "review_api_2".into(),
+            "review_api".into(),
+            format!("D{}j{} Vu", '\u{00e9}', '\u{00e0}'),
+            "!!!".into(),
+            " ".into(),
+        ],
+        artifact: Some(" !!! ".into()),
+    })
+    .expect("suggested flow should be built");
+
+    let node_ids = draft
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        node_ids,
+        vec![
+            "review_api",
+            "review_api_2",
+            "review_api_3",
+            "d_j_vu",
+            "node",
+            "node_2"
+        ]
+    );
+    assert_eq!(
+        draft
+            .nodes
+            .iter()
+            .map(|node| node.contract_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("contract.review_api"),
+            Some("contract.review_api_2"),
+            Some("contract.review_api_3"),
+            Some("contract.d_j_vu"),
+            Some("contract.node"),
+            Some("contract.node_2"),
+        ]
+    );
+    assert_eq!(
+        draft
+            .contracts
+            .iter()
+            .map(|contract| {
+                (
+                    contract.id.as_str(),
+                    contract.completion.as_ref(),
+                    contract.artifacts[0].id.as_str(),
+                    contract.artifacts[0].schema_resource_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "contract.review_api",
+                Some(&ContractCompletion::AllArtifacts),
+                "result",
+                Some("schema.review_api.result"),
+            ),
+            (
+                "contract.review_api_2",
+                Some(&ContractCompletion::AllArtifacts),
+                "result",
+                Some("schema.review_api_2.result"),
+            ),
+            (
+                "contract.review_api_3",
+                Some(&ContractCompletion::AllArtifacts),
+                "result",
+                Some("schema.review_api_3.result"),
+            ),
+            (
+                "contract.d_j_vu",
+                Some(&ContractCompletion::AllArtifacts),
+                "result",
+                Some("schema.d_j_vu.result"),
+            ),
+            (
+                "contract.node",
+                Some(&ContractCompletion::AllArtifacts),
+                "result",
+                Some("schema.node.result"),
+            ),
+            (
+                "contract.node_2",
+                Some(&ContractCompletion::AllArtifacts),
+                "result",
+                Some("schema.node_2.result"),
+            ),
+        ]
+    );
+    assert_eq!(
+        draft
+            .resources
+            .iter()
+            .filter(|resource| resource.kind == ResourceKind::Schema)
+            .map(|resource| (resource.id.as_str(), resource.source.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("schema.review_api.result", "inline:result"),
+            ("schema.review_api_2.result", "inline:result"),
+            ("schema.review_api_3.result", "inline:result"),
+            ("schema.d_j_vu.result", "inline:result"),
+            ("schema.node.result", "inline:result"),
+            ("schema.node_2.result", "inline:result"),
+        ]
+    );
+    assert_eq!(
+        flow_check(&draft, FlowCheckMode::Core).diagnostics,
+        Vec::new()
+    );
 }
 
 #[test]
