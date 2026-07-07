@@ -4,11 +4,11 @@ use std::io::{self, BufRead, Write};
 use crate::adapters::tmux::{CommandRunner, SystemCommandRunner, TmuxAdapter};
 use crate::flow;
 use crate::runtime::{self, BoardPatch, NodeSpec, Runtime, StopContract};
-use crate::view::VisualizationSnapshot;
+use crate::view::{VisualizationSnapshot, render_terminal_dashboard, serve_browser_snapshot};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub const RUNTIME_TOOL_NAMES: [&str; 9] = [
+pub const RUNTIME_TOOL_NAMES: [&str; 12] = [
     "start_run",
     "get_context",
     "deliver_artifact",
@@ -18,6 +18,9 @@ pub const RUNTIME_TOOL_NAMES: [&str; 9] = [
     "send_message",
     "validate_stop",
     "apply_flow_lock",
+    "view_terminal",
+    "view_snapshot",
+    "view_browser",
 ];
 
 pub const AUTHORING_TOOL_NAMES: [&str; 4] =
@@ -164,6 +167,9 @@ impl<R: CommandRunner> McpServer<R> {
             "send_message" => self.send_message(arguments),
             "validate_stop" => self.validate_stop(arguments),
             "apply_flow_lock" => self.apply_flow_lock(arguments),
+            "view_terminal" => self.view_terminal(arguments),
+            "view_snapshot" => self.view_snapshot(arguments),
+            "view_browser" => self.view_browser(arguments),
             "flow_apply" => self.flow_apply(arguments),
             "flow_check" => self.flow_check(arguments),
             "flow_lock" => self.flow_lock(arguments),
@@ -429,6 +435,78 @@ impl<R: CommandRunner> McpServer<R> {
             "lock_id": lock_id,
             "content_hash": content_hash
         })))
+    }
+
+    fn view_terminal(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let snapshot = self.view_snapshot_arg(arguments)?;
+        let run_count = snapshot.runs.len();
+        let dashboard = render_terminal_dashboard(&snapshot);
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "format": "terminal",
+            "dashboard": dashboard,
+            "run_count": run_count
+        })))
+    }
+
+    fn view_snapshot(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let snapshot = self.view_snapshot_arg(arguments)?;
+        let run_count = snapshot.runs.len();
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "format": "json",
+            "snapshot": snapshot,
+            "run_count": run_count
+        })))
+    }
+
+    fn view_browser(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let host = optional_string(arguments, &["host"])?.unwrap_or("127.0.0.1");
+        let host = match host {
+            "127.0.0.1" | "localhost" => "127.0.0.1",
+            _ => {
+                return Err(ToolError::invalid(
+                    "view_browser host must be loopback: 127.0.0.1 or localhost",
+                ));
+            }
+        };
+        let port = optional_u64(arguments, &["port"])?
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|_| ToolError::invalid("port must be between 0 and 65535"))?
+            .unwrap_or(0);
+        let snapshot = self.state.runtime_snapshot();
+        let run_count = snapshot.runs.len();
+        let server = serve_browser_snapshot(host, port, &snapshot).map_err(ToolError::from_view)?;
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "url": server.url,
+            "host": server.host,
+            "port": server.port,
+            "run_count": run_count
+        })))
+    }
+
+    fn view_snapshot_arg(&self, arguments: &Value) -> Result<VisualizationSnapshot, ToolError> {
+        let snapshot = self.state.runtime_snapshot();
+        match optional_string(arguments, &["run_id", "runId"])? {
+            Some(run_id) => {
+                let Some(run) = snapshot.run(run_id) else {
+                    return Err(ToolError::from_runtime(
+                        runtime::RuntimeError::RunNotFound {
+                            run_id: run_id.to_string(),
+                        },
+                    ));
+                };
+                Ok(VisualizationSnapshot {
+                    runs: vec![run.clone()],
+                })
+            }
+            None => Ok(snapshot),
+        }
     }
 
     fn flow_apply(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -871,6 +949,27 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                 &["run_id", "mode", "lock_id", "content_hash"],
             ),
         ),
+        "view_terminal" => descriptor(
+            "view_terminal",
+            "Render the current in-memory runtime snapshot as terminal text.",
+            object_schema(json!({ "run_id": { "type": "string" } }), &[]),
+        ),
+        "view_snapshot" => descriptor(
+            "view_snapshot",
+            "Return the current in-memory runtime snapshot as structured JSON.",
+            object_schema(json!({ "run_id": { "type": "string" } }), &[]),
+        ),
+        "view_browser" => descriptor(
+            "view_browser",
+            "Serve the current in-memory runtime snapshot on a local read-only HTTP port.",
+            object_schema(
+                json!({
+                    "host": { "type": "string" },
+                    "port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+                }),
+                &[],
+            ),
+        ),
         "flow_apply" => descriptor(
             "flow_apply",
             "Record that a supplied or locked flow was selected for application.",
@@ -989,6 +1088,10 @@ impl ToolError {
 
     fn from_tmux(err: crate::adapters::tmux::TmuxError) -> Self {
         Self::invalid(format!("tmux {err}"))
+    }
+
+    fn from_view(err: io::Error) -> Self {
+        Self::invalid(format!("view browser {err}"))
     }
 }
 

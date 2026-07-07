@@ -1,11 +1,13 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::time::Duration;
 
 use humanize_plugin::adapters::tmux::{CommandOutput, CommandRunner, TmuxError};
-use humanize_plugin::mcp::{AUTHORING_TOOL_NAMES, McpServer, McpSurface, RUNTIME_TOOL_NAMES};
+use humanize_plugin::mcp::{McpServer, McpSurface};
 use serde_json::{Value, json};
 
 #[derive(Clone, Default)]
@@ -35,11 +37,24 @@ impl CommandRunner for RecordingRunner {
 }
 
 fn expected_tool_names() -> Vec<&'static str> {
-    RUNTIME_TOOL_NAMES
-        .iter()
-        .chain(AUTHORING_TOOL_NAMES.iter())
-        .copied()
-        .collect()
+    vec![
+        "start_run",
+        "get_context",
+        "deliver_artifact",
+        "record_effect",
+        "patch_board",
+        "activate_node",
+        "send_message",
+        "validate_stop",
+        "apply_flow_lock",
+        "view_terminal",
+        "view_snapshot",
+        "view_browser",
+        "flow_apply",
+        "flow_check",
+        "flow_lock",
+        "flow_export",
+    ]
 }
 
 fn call_tool<R: CommandRunner>(
@@ -63,6 +78,25 @@ fn call_tool<R: CommandRunner>(
 
 fn structured(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
+}
+
+fn http_get(host: &str, port: u64, path: &str) -> String {
+    let mut stream =
+        TcpStream::connect((host, port as u16)).expect("browser view server should accept TCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout should be set");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("request should be written");
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("response should be readable");
+    response
 }
 
 fn diagnostic_codes(response: &Value) -> Vec<&str> {
@@ -109,6 +143,51 @@ fn node_less_missing_readme_flow() -> Value {
     })
 }
 
+fn populate_view_run<R: CommandRunner>(server: &mut McpServer<R>, run_id: &str) {
+    let started = call_tool(
+        server,
+        1,
+        "start_run",
+        json!({
+            "run_id": run_id,
+            "nodes": [
+                {
+                    "id": "root",
+                    "required_artifacts": ["brief", "report"],
+                    "required_effects": ["shell", "review"]
+                }
+            ]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let artifact = call_tool(
+        server,
+        2,
+        "deliver_artifact",
+        json!({
+            "run_id": run_id,
+            "activation_id": "root",
+            "artifact_key": "brief",
+            "payload": "ready"
+        }),
+    );
+    assert_eq!(structured(&artifact)["ok"], true);
+
+    let effect = call_tool(
+        server,
+        3,
+        "record_effect",
+        json!({
+            "run_id": run_id,
+            "activation_id": "root",
+            "effect_key": "shell",
+            "payload": "cargo test"
+        }),
+    );
+    assert_eq!(structured(&effect)["ok"], true);
+}
+
 #[test]
 fn mcp_surface_exposes_exact_tool_names_and_lookup() {
     let surface = McpSurface;
@@ -120,6 +199,140 @@ fn mcp_surface_exposes_exact_tool_names_and_lookup() {
         assert_eq!(descriptor.name(), name);
     }
     assert!(surface.lookup("unknown_tool").is_none());
+}
+
+#[test]
+fn view_terminal_returns_dashboard_for_runtime_snapshot() {
+    let mut server = McpServer::new();
+    populate_view_run(&mut server, "run-view");
+
+    let viewed = call_tool(&mut server, 4, "view_terminal", json!({}));
+
+    assert_eq!(structured(&viewed)["ok"], true);
+    assert_eq!(structured(&viewed)["format"], "terminal");
+    assert_eq!(structured(&viewed)["run_count"], 1);
+    let dashboard = structured(&viewed)["dashboard"]
+        .as_str()
+        .expect("dashboard should be text");
+    assert!(dashboard.contains("humanize dashboard"));
+    assert!(dashboard.contains(
+        "run run-view | activations 1 | board v0 | messages 0 | artifacts 1 | effects 1 | missing 2"
+    ));
+    assert!(dashboard.contains("root | node root | missing artifact:report, effect:review"));
+}
+
+#[test]
+fn view_snapshot_returns_filterable_structured_snapshot() {
+    let mut server = McpServer::new();
+    populate_view_run(&mut server, "run-view-a");
+    populate_view_run(&mut server, "run-view-b");
+
+    let viewed = call_tool(
+        &mut server,
+        4,
+        "view_snapshot",
+        json!({
+            "run_id": "run-view-b"
+        }),
+    );
+
+    assert_eq!(structured(&viewed)["ok"], true);
+    assert_eq!(structured(&viewed)["format"], "json");
+    assert_eq!(structured(&viewed)["run_count"], 1);
+    assert_eq!(
+        structured(&viewed)["snapshot"]["runs"][0]["run_id"],
+        "run-view-b"
+    );
+    assert_eq!(
+        structured(&viewed)["snapshot"]["runs"][0]["missing_stop_contracts"]["root"],
+        json!(["artifact:report", "effect:review"])
+    );
+
+    let missing = call_tool(
+        &mut server,
+        5,
+        "view_snapshot",
+        json!({
+            "run_id": "missing-run"
+        }),
+    );
+    assert_eq!(missing["error"]["code"], -32602);
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("missing-run")
+    );
+}
+
+#[test]
+fn view_browser_rejects_non_loopback_host() {
+    let mut server = McpServer::new();
+
+    let viewed = call_tool(
+        &mut server,
+        1,
+        "view_browser",
+        json!({
+            "host": "0.0.0.0",
+            "port": 0
+        }),
+    );
+
+    assert_eq!(viewed["error"]["code"], -32602);
+    assert!(
+        viewed["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("loopback")
+    );
+}
+
+#[test]
+fn view_browser_serves_html_and_snapshot_json_from_local_port() {
+    let mut server = McpServer::new();
+    populate_view_run(&mut server, "run-browser");
+
+    let viewed = call_tool(
+        &mut server,
+        4,
+        "view_browser",
+        json!({
+            "host": "127.0.0.1",
+            "port": 0
+        }),
+    );
+
+    assert_eq!(structured(&viewed)["ok"], true);
+    assert_eq!(structured(&viewed)["host"], "127.0.0.1");
+    assert_eq!(structured(&viewed)["run_count"], 1);
+    let port = structured(&viewed)["port"]
+        .as_u64()
+        .expect("port should be numeric");
+    assert_ne!(port, 0);
+    assert_eq!(
+        structured(&viewed)["url"],
+        format!("http://127.0.0.1:{port}/")
+    );
+
+    let html_response = http_get("127.0.0.1", port, "/");
+    assert!(html_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(html_response.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(html_response.contains("<title>Humanize Dashboard</title>"));
+    assert!(html_response.contains("run-browser"));
+
+    let json_response = http_get("127.0.0.1", port, "/snapshot.json");
+    assert!(json_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(json_response.contains("Content-Type: application/json"));
+    let body = json_response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("HTTP response should include a body");
+    let snapshot: Value = serde_json::from_str(body).expect("snapshot should be JSON");
+    assert_eq!(snapshot["runs"][0]["run_id"], "run-browser");
+
+    let missing_response = http_get("127.0.0.1", port, "/missing");
+    assert!(missing_response.starts_with("HTTP/1.1 404 Not Found"));
 }
 
 #[test]
