@@ -87,6 +87,7 @@ impl<R: CommandRunner> McpServer<R> {
             "start_run" => self.start_run(arguments),
             "get_context" => self.get_context(arguments),
             "deliver_artifact" => self.deliver_artifact(arguments),
+            "fanout_from_artifact" => self.fanout_from_artifact(arguments),
             "record_effect" => self.record_effect(arguments),
             "patch_board" => self.patch_board(arguments),
             "activate_node" => self.activate_node(arguments),
@@ -221,6 +222,50 @@ impl<R: CommandRunner> McpServer<R> {
             "artifact_key": artifact_key,
             "artifact_id": artifact_id,
             "content_hash": record.as_ref().map(|artifact| artifact.content_hash.as_str())
+        })))
+    }
+
+    fn fanout_from_artifact(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        require_string_arguments(
+            arguments,
+            &[
+                &["run_id", "runId"],
+                &["node_id", "nodeId"],
+                &["artifact_key", "artifactKey", "key"],
+            ],
+        )?;
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        let node_id = require_string(arguments, &["node_id", "nodeId"])?;
+        let artifact_key = require_string(arguments, &["artifact_key", "artifactKey", "key"])?;
+        let node = node_spec_from_arguments(node_id, arguments)?;
+        let activation_ids = self
+            .state
+            .runtime
+            .fanout_from_artifact(run_id, &node, artifact_key)
+            .map_err(ToolError::from_runtime)?;
+        let state = self.state.runtime.state();
+        let activations = activation_ids
+            .iter()
+            .map(|activation_id| {
+                let stable_key = state
+                    .activations
+                    .get(&(run_id.to_string(), activation_id.clone()))
+                    .and_then(|activation| activation.stable_key.clone());
+                json!({
+                    "activation_id": activation_id,
+                    "stable_key": stable_key
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "node_id": node_id,
+            "artifact_key": artifact_key,
+            "activation_count": activation_ids.len(),
+            "activation_ids": activation_ids,
+            "activations": activations
         })))
     }
 

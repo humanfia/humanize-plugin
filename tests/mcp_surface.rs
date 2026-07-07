@@ -13,6 +13,7 @@ fn expected_tool_names() -> Vec<&'static str> {
         "start_run",
         "get_context",
         "deliver_artifact",
+        "fanout_from_artifact",
         "record_effect",
         "patch_board",
         "activate_node",
@@ -41,6 +42,26 @@ fn mcp_surface_exposes_exact_tool_names_and_lookup() {
         assert_eq!(descriptor.name(), name);
     }
     assert!(surface.lookup("unknown_tool").is_none());
+}
+#[test]
+fn fanout_from_artifact_schema_requires_runtime_arguments() {
+    let surface = McpSurface;
+    let descriptor = surface
+        .lookup("fanout_from_artifact")
+        .expect("fanout_from_artifact descriptor should be present");
+    let schema = descriptor.input_schema();
+
+    assert_eq!(
+        schema["required"],
+        json!(["run_id", "node_id", "artifact_key"])
+    );
+    assert_eq!(schema["properties"]["run_id"]["type"], "string");
+    assert_eq!(schema["properties"]["node_id"]["type"], "string");
+    assert_eq!(schema["properties"]["artifact_key"]["type"], "string");
+    assert_eq!(schema["properties"]["for_each"]["type"], "string");
+    assert_eq!(schema["properties"]["forEach"]["type"], "string");
+    assert_eq!(schema["properties"]["required_artifacts"]["type"], "array");
+    assert_eq!(schema["properties"]["required_effects"]["type"], "array");
 }
 #[test]
 fn start_run_schema_requires_tmux_session_and_window_when_enabled() {

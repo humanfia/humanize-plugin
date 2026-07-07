@@ -510,19 +510,28 @@ impl Runtime {
                 artifact_key: artifact_key.clone(),
             })?;
 
-        let mut activation_ids = Vec::new();
+        let mut planned_activations = Vec::new();
         for (index, item) in artifact_payload.lines().enumerate() {
             let stable_key = format!("{artifact_key}/{index}");
+            let activation_id = activation_id_for(node, Some(&stable_key));
+            if self
+                .state
+                .activations
+                .contains_key(&activation_key(&run_id, &activation_id))
+            {
+                return Err(RuntimeError::DuplicateActivation { activation_id });
+            }
             let mut context = BTreeMap::new();
             context.insert("for_each".to_owned(), artifact_key.clone());
             context.insert("index".to_owned(), index.to_string());
             context.insert("item".to_owned(), item.to_owned());
-            activation_ids.push(self.activate_node_with_context(
-                run_id.clone(),
-                node,
-                Some(&stable_key),
-                context,
-            )?);
+            planned_activations.push((activation_id, stable_key, context));
+        }
+
+        let mut activation_ids = Vec::with_capacity(planned_activations.len());
+        for (activation_id, stable_key, context) in planned_activations {
+            self.activate_node_with_context(run_id.clone(), node, Some(&stable_key), context)?;
+            activation_ids.push(activation_id);
         }
         Ok(activation_ids)
     }

@@ -1,10 +1,11 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub const RUNTIME_TOOL_NAMES: [&str; 12] = [
+pub const RUNTIME_TOOL_NAMES: [&str; 13] = [
     "start_run",
     "get_context",
     "deliver_artifact",
+    "fanout_from_artifact",
     "record_effect",
     "patch_board",
     "activate_node",
@@ -166,6 +167,28 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                     "payload": {}
                 }),
                 &["run_id", "activation_id", "artifact_key"],
+            ),
+        ),
+        "fanout_from_artifact" => descriptor(
+            "fanout_from_artifact",
+            "Create one runtime activation per line in the latest artifact slot.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "node_id": { "type": "string" },
+                    "artifact_key": { "type": "string" },
+                    "for_each": { "type": "string" },
+                    "forEach": { "type": "string" },
+                    "required_artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "required_effects": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                }),
+                &["run_id", "node_id", "artifact_key"],
             ),
         ),
         "record_effect" => descriptor(

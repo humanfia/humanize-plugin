@@ -346,6 +346,38 @@ fn fanout_activation_uses_artifact_data_and_stable_keys() {
 }
 
 #[test]
+fn fanout_duplicate_activation_rejects_without_partial_append() {
+    let mut runtime = Runtime::default();
+    runtime
+        .start_run("run-a", vec![NodeSpec::new("root")])
+        .unwrap();
+    runtime
+        .deliver_artifact("run-a", "root", "items", "alpha\nbeta")
+        .unwrap();
+    runtime
+        .activate_node("run-a", &NodeSpec::new("process"), Some("items/1"))
+        .unwrap();
+    let event_count = runtime.events().len();
+
+    let err = runtime
+        .fanout_from_artifact(
+            "run-a",
+            &NodeSpec::new("process").with_for_each("items"),
+            "items",
+        )
+        .unwrap_err();
+
+    assert_eq!(err.to_string(), "duplicate activation: process:items/1");
+    assert_eq!(runtime.events().len(), event_count);
+    assert!(
+        !runtime
+            .state()
+            .activations
+            .contains_key(&activation_key("run-a", "process:items/0"))
+    );
+}
+
+#[test]
 fn validate_stop_only_checks_the_local_activation_contract() {
     let mut runtime = Runtime::default();
     runtime

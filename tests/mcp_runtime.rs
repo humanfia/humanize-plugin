@@ -460,3 +460,194 @@ fn validate_stop_uses_activation_contract_before_and_after_artifact_delivery() {
     assert_eq!(structured(&allowed)["valid"], true);
     assert_eq!(structured(&allowed)["missing"], json!([]));
 }
+
+#[test]
+fn fanout_from_artifact_returns_activation_metadata_and_context() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-fanout",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let delivered = call_tool(
+        &mut server,
+        2,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-fanout",
+            "activation_id": "root",
+            "artifact_key": "items",
+            "payload": "alpha\nbeta"
+        }),
+    );
+    assert_eq!(structured(&delivered)["ok"], true);
+
+    let fanout = call_tool(
+        &mut server,
+        3,
+        "fanout_from_artifact",
+        json!({
+            "run_id": "run-fanout",
+            "node_id": "process",
+            "artifact_key": "items",
+            "forEach": "items",
+            "required_artifacts": ["done"],
+            "required_effects": ["shell"]
+        }),
+    );
+
+    assert_eq!(structured(&fanout)["ok"], true);
+    assert_eq!(structured(&fanout)["run_id"], "run-fanout");
+    assert_eq!(structured(&fanout)["node_id"], "process");
+    assert_eq!(structured(&fanout)["artifact_key"], "items");
+    assert_eq!(structured(&fanout)["activation_count"], 2);
+    assert_eq!(
+        structured(&fanout)["activation_ids"],
+        json!(["process:items/0", "process:items/1"])
+    );
+    assert_eq!(
+        structured(&fanout)["activations"],
+        json!([
+            {
+                "activation_id": "process:items/0",
+                "stable_key": "items/0"
+            },
+            {
+                "activation_id": "process:items/1",
+                "stable_key": "items/1"
+            }
+        ])
+    );
+
+    let context = call_tool(
+        &mut server,
+        4,
+        "get_context",
+        json!({
+            "run_id": "run-fanout"
+        }),
+    );
+    let activation = &structured(&context)["context"]["activations"]["process:items/0"];
+    assert_eq!(activation["stable_key"], "items/0");
+    assert_eq!(activation["context"]["for_each"], "items");
+    assert_eq!(activation["context"]["index"], "0");
+    assert_eq!(activation["context"]["item"], "alpha");
+    assert_eq!(activation["required_artifacts"], json!(["done"]));
+    assert_eq!(activation["required_effects"], json!(["shell"]));
+}
+
+#[test]
+fn fanout_from_artifact_missing_artifact_returns_error_without_activation() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-missing-fanout",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let fanout = call_tool(
+        &mut server,
+        2,
+        "fanout_from_artifact",
+        json!({
+            "run_id": "run-missing-fanout",
+            "node_id": "process",
+            "artifact_key": "items"
+        }),
+    );
+
+    assert_eq!(fanout["error"]["code"], -32602);
+    assert!(
+        fanout["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("artifact not found: items")
+    );
+
+    let context = call_tool(
+        &mut server,
+        3,
+        "get_context",
+        json!({
+            "run_id": "run-missing-fanout"
+        }),
+    );
+    assert_eq!(
+        structured(&context)["context"]["activation_ids"],
+        json!(["root"])
+    );
+}
+
+#[test]
+fn fanout_from_artifact_for_each_mismatch_returns_error_without_activation() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-mismatch-fanout",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+    let delivered = call_tool(
+        &mut server,
+        2,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-mismatch-fanout",
+            "activation_id": "root",
+            "artifact_key": "items",
+            "payload": "alpha"
+        }),
+    );
+    assert_eq!(structured(&delivered)["ok"], true);
+
+    let fanout = call_tool(
+        &mut server,
+        3,
+        "fanout_from_artifact",
+        json!({
+            "run_id": "run-mismatch-fanout",
+            "node_id": "process",
+            "artifact_key": "items",
+            "for_each": "other"
+        }),
+    );
+
+    assert_eq!(fanout["error"]["code"], -32602);
+    assert!(
+        fanout["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("for_each mismatch: expected other, actual items")
+    );
+
+    let context = call_tool(
+        &mut server,
+        4,
+        "get_context",
+        json!({
+            "run_id": "run-mismatch-fanout"
+        }),
+    );
+    assert_eq!(
+        structured(&context)["context"]["activation_ids"],
+        json!(["root"])
+    );
+}
