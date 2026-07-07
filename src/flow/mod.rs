@@ -154,6 +154,7 @@ pub struct FlowLock {
     id: String,
     mode: FlowCheckMode,
     diagnostics: Vec<Diagnostic>,
+    draft: FlowDraft,
     normalized_content: String,
 }
 
@@ -168,6 +169,10 @@ impl FlowLock {
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    pub fn draft(&self) -> &FlowDraft {
+        &self.draft
     }
 
     pub fn normalized_content(&self) -> &str {
@@ -555,6 +560,7 @@ pub fn flow_lock(draft: &FlowDraft, mode: FlowCheckMode) -> Result<FlowLock, Flo
         id,
         mode,
         diagnostics: report.diagnostics,
+        draft: draft.clone(),
         normalized_content,
     })
 }

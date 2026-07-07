@@ -69,6 +69,68 @@ fn valid_draft() -> FlowDraft {
     }
 }
 
+fn draft_with_ordered_authoring_data() -> FlowDraft {
+    let mut draft = valid_draft();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Agent,
+        prompt_ref: Some("prompt.start".into()),
+        resource_refs: vec!["schema.summary".into(), "prompt.start".into()],
+        reads: vec!["artifact.input".into(), "board.state".into()],
+        writes: vec!["artifact.handoff".into(), "event.started".into()],
+        verdict_artifact: Some("artifact.verdict".into()),
+    });
+    draft.nodes[0].write_scopes = vec![
+        WriteScope::Resource("schema.summary".into()),
+        WriteScope::Artifact("handoff".into()),
+    ];
+    draft.nodes[0].extensions = vec!["Route".into(), "Node".into()];
+    draft.routes = vec![
+        FlowRoute {
+            predicate: "exists(artifact.handoff)".into(),
+            for_each: None,
+            activate: "finish".into(),
+        },
+        FlowRoute {
+            predicate: "exists(artifact.input)".into(),
+            for_each: Some("artifact.items".into()),
+            activate: "start".into(),
+        },
+    ];
+    draft.resources.push(FlowResource {
+        id: "prompt.start".into(),
+        kind: ResourceKind::Prompt,
+        source: "inline:Review the handoff.".into(),
+    });
+    draft.imports.push(FlowImport {
+        resource_id: "schema.summary".into(),
+        alias: Some("summary_schema".into()),
+    });
+    draft.policies.write_scopes = vec![
+        WriteScope::Resource("schema.summary".into()),
+        WriteScope::Artifact("handoff".into()),
+    ];
+    draft.extensions = vec!["Route".into(), "Node".into()];
+    draft
+}
+
+fn reverse_normalized_authoring_order(draft: &mut FlowDraft) {
+    draft.nodes.reverse();
+    draft.contracts.reverse();
+    draft.routes.reverse();
+    draft.resources.reverse();
+    draft.imports.reverse();
+    draft.policies.write_scopes.reverse();
+    draft.extensions.reverse();
+
+    if let Some(action) = &mut draft.nodes[1].action {
+        action.resource_refs.reverse();
+        action.reads.reverse();
+        action.writes.reverse();
+    }
+    draft.nodes[1].write_scopes.reverse();
+    draft.nodes[1].extensions.reverse();
+}
+
 fn diagnostic_codes(diagnostics: &[Diagnostic]) -> Vec<&str> {
     diagnostics
         .iter()
@@ -940,6 +1002,35 @@ fn flow_lock_id_is_deterministic_from_normalized_content_and_check_mode() {
     assert_ne!(core_lock.id(), strict_lock.id());
     assert_eq!(core_lock.mode(), FlowCheckMode::Core);
     assert_eq!(strict_lock.mode(), FlowCheckMode::Strict);
+}
+
+#[test]
+fn flow_lock_retains_typed_draft_snapshot() {
+    let draft = draft_with_ordered_authoring_data();
+
+    let lock = flow_lock(&draft, FlowCheckMode::Core).unwrap();
+
+    assert_eq!(lock.draft(), &draft);
+    assert_eq!(&lock.draft().routes, &draft.routes);
+    assert_eq!(&lock.draft().nodes[0].action, &draft.nodes[0].action);
+    assert_eq!(&lock.draft().resources, &draft.resources);
+}
+
+#[test]
+fn flow_lock_id_is_stable_without_reordering_stored_draft() {
+    let draft = draft_with_ordered_authoring_data();
+    let mut reordered = draft.clone();
+    reverse_normalized_authoring_order(&mut reordered);
+
+    let lock = flow_lock(&draft, FlowCheckMode::Core).unwrap();
+    let reordered_lock = flow_lock(&reordered, FlowCheckMode::Core).unwrap();
+
+    assert_eq!(lock.id(), reordered_lock.id());
+    assert_eq!(lock.draft(), &draft);
+    assert_eq!(reordered_lock.draft(), &reordered);
+    assert_ne!(&lock.draft().routes, &reordered_lock.draft().routes);
+    assert_ne!(&lock.draft().nodes, &reordered_lock.draft().nodes);
+    assert_ne!(&lock.draft().resources, &reordered_lock.draft().resources);
 }
 
 #[test]
