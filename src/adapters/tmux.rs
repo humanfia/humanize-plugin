@@ -46,6 +46,17 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         run_id: impl Into<String>,
     ) -> Result<TmuxWindow, TmuxError> {
         let run_id = run_id.into();
+        self.create_window_named(session, run_id.clone(), run_id)
+    }
+
+    pub fn create_window_named(
+        &self,
+        session: &TmuxSession,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+    ) -> Result<TmuxWindow, TmuxError> {
+        let run_id = run_id.into();
+        let window_name = window_name.into();
         let output = self.run_checked(argv(
             [
                 "tmux",
@@ -57,11 +68,16 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 session.id(),
                 "-n",
             ],
-            [run_id.as_str()],
+            [window_name.as_str()],
         ))?;
         let window_id = trimmed_stdout(&output, "window id")?;
 
-        Ok(TmuxWindow::new(session.id(), run_id, window_id))
+        Ok(TmuxWindow::new_named(
+            session.id(),
+            run_id,
+            window_name,
+            window_id,
+        ))
     }
 
     pub fn split_pane_for_activation(
@@ -130,6 +146,7 @@ impl TmuxSession {
 pub struct TmuxWindow {
     session_id: String,
     run_id: String,
+    name: String,
     id: String,
 }
 
@@ -139,9 +156,25 @@ impl TmuxWindow {
         run_id: impl Into<String>,
         id: impl Into<String>,
     ) -> Self {
+        let run_id = run_id.into();
+        Self {
+            session_id: session_id.into(),
+            name: run_id.clone(),
+            run_id,
+            id: id.into(),
+        }
+    }
+
+    pub fn new_named(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        name: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
             run_id: run_id.into(),
+            name: name.into(),
             id: id.into(),
         }
     }
@@ -152,6 +185,10 @@ impl TmuxWindow {
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn id(&self) -> &str {

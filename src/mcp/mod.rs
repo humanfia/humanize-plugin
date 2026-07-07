@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 
+use crate::adapters::tmux::{CommandRunner, SystemCommandRunner, TmuxAdapter};
 use crate::flow;
 use crate::runtime::{self, BoardPatch, NodeSpec, Runtime, StopContract};
 use serde::Serialize;
@@ -82,15 +83,31 @@ impl McpToolDescriptor {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct McpServer {
+pub struct McpServer<R: CommandRunner = SystemCommandRunner> {
     surface: McpSurface,
     state: McpServerState,
+    tmux_adapter: TmuxAdapter<R>,
 }
 
-impl McpServer {
+impl McpServer<SystemCommandRunner> {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_tmux_runner(SystemCommandRunner)
+    }
+}
+
+impl Default for McpServer<SystemCommandRunner> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<R: CommandRunner> McpServer<R> {
+    pub fn with_tmux_runner(runner: R) -> Self {
+        Self {
+            surface: McpSurface,
+            state: McpServerState::default(),
+            tmux_adapter: TmuxAdapter::with_runner(runner),
+        }
     }
 
     pub fn handle_json_rpc(&mut self, request: Value) -> Option<Value> {
@@ -159,6 +176,8 @@ impl McpServer {
     fn start_run(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         let run_id = require_string(arguments, &["run_id", "runId"])?;
         let nodes = node_specs(arguments)?;
+        validate_start_run_preconditions(&self.state.runtime, run_id, &nodes)?;
+        let tmux = self.start_run_tmux_metadata(run_id, arguments)?;
         let activation_ids = self
             .state
             .runtime
@@ -169,11 +188,39 @@ impl McpServer {
             "ok": true,
             "run_id": run_id,
             "activation_ids": activation_ids,
-            "tmux": {
+            "tmux": tmux
+        })))
+    }
+
+    fn start_run_tmux_metadata(&self, run_id: &str, arguments: &Value) -> Result<Value, ToolError> {
+        match tmux_start_options(arguments)? {
+            TmuxStartOptions::Disabled => Ok(json!({
                 "enabled": false,
                 "created": false
+            })),
+            TmuxStartOptions::Enabled {
+                session_id,
+                window_name,
+            } => {
+                let session = self
+                    .tmux_adapter
+                    .ensure_session(session_id.as_str())
+                    .map_err(ToolError::from_tmux)?;
+                let window = self
+                    .tmux_adapter
+                    .create_window_named(&session, run_id, window_name.as_str())
+                    .map_err(ToolError::from_tmux)?;
+
+                Ok(json!({
+                    "enabled": true,
+                    "created": true,
+                    "session_id": session.id(),
+                    "window_id": window.id(),
+                    "window_name": window.name(),
+                    "run_id": window.run_id()
+                }))
             }
-        })))
+        }
     }
 
     fn get_context(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -440,12 +487,18 @@ impl McpServer {
         let draft = flow_draft_arg(arguments)?;
         let mode = flow_check_mode_arg(arguments)?;
         let report = flow::flow_check(&draft, mode);
-
-        Ok(ToolCallResult::ok(json!({
-            "ok": true,
+        let ok = !report.has_errors();
+        let structured = json!({
+            "ok": ok,
             "mode": flow_check_mode_name(report.mode),
             "diagnostics": diagnostics_json(&report.diagnostics)
-        })))
+        });
+
+        if ok {
+            Ok(ToolCallResult::ok(structured))
+        } else {
+            Ok(ToolCallResult::error(structured))
+        }
     }
 
     fn flow_lock(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -775,6 +828,28 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                     "required_effects": {
                         "type": "array",
                         "items": { "type": "string" }
+                    },
+                    "tmux": {
+                        "type": "object",
+                        "description": "tmux mapping options. When enabled is true, session and window are required.",
+                        "properties": {
+                            "enabled": { "type": "boolean" },
+                            "session": { "type": "string" },
+                            "window": { "type": "string" }
+                        },
+                        "allOf": [
+                            {
+                                "if": {
+                                    "properties": {
+                                        "enabled": { "const": true }
+                                    },
+                                    "required": ["enabled"]
+                                },
+                                "then": {
+                                    "required": ["session", "window"]
+                                }
+                            }
+                        ]
                     }
                 }),
                 &["run_id"],
@@ -989,6 +1064,10 @@ impl ToolError {
     fn from_runtime(err: runtime::RuntimeError) -> Self {
         Self::invalid(err.to_string())
     }
+
+    fn from_tmux(err: crate::adapters::tmux::TmuxError) -> Self {
+        Self::invalid(format!("tmux {err}"))
+    }
 }
 
 fn require_string<'a>(arguments: &'a Value, names: &[&str]) -> Result<&'a str, ToolError> {
@@ -1106,6 +1185,64 @@ fn node_specs(arguments: &Value) -> Result<Vec<NodeSpec>, ToolError> {
             _ => Err(ToolError::invalid("nodes items must be strings or objects")),
         })
         .collect()
+}
+
+fn validate_start_run_preconditions(
+    runtime: &Runtime,
+    run_id: &str,
+    nodes: &[NodeSpec],
+) -> Result<(), ToolError> {
+    if runtime.has_run(run_id) {
+        return Err(ToolError::from_runtime(
+            runtime::RuntimeError::DuplicateRun {
+                run_id: run_id.to_string(),
+            },
+        ));
+    }
+
+    let mut seen_activation_ids = BTreeSet::new();
+    for node in nodes {
+        let activation_id = node.id().to_string();
+        if !seen_activation_ids.insert(activation_id.clone()) {
+            return Err(ToolError::from_runtime(
+                runtime::RuntimeError::DuplicateActivation { activation_id },
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum TmuxStartOptions {
+    Disabled,
+    Enabled {
+        session_id: String,
+        window_name: String,
+    },
+}
+
+fn tmux_start_options(arguments: &Value) -> Result<TmuxStartOptions, ToolError> {
+    let Some(value) = arguments.get("tmux") else {
+        return Ok(TmuxStartOptions::Disabled);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("tmux must be an object"))?;
+    let enabled = match object.get("enabled") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => return Err(ToolError::invalid("tmux.enabled must be a boolean")),
+        None => false,
+    };
+
+    if !enabled {
+        return Ok(TmuxStartOptions::Disabled);
+    }
+
+    Ok(TmuxStartOptions::Enabled {
+        session_id: string_field(object, &["session", "session_id", "sessionId"])?.to_string(),
+        window_name: string_field(object, &["window", "window_name", "windowName"])?.to_string(),
+    })
 }
 
 fn node_spec_from_arguments(id: &str, arguments: &Value) -> Result<NodeSpec, ToolError> {
@@ -1390,6 +1527,7 @@ fn parse_resource_kind(value: &str) -> Result<flow::ResourceKind, ToolError> {
         "prompt" | "Prompt" => Ok(flow::ResourceKind::Prompt),
         "script" | "Script" => Ok(flow::ResourceKind::Script),
         "flow" | "Flow" => Ok(flow::ResourceKind::Flow),
+        "readme" | "Readme" | "README" => Ok(flow::ResourceKind::Readme),
         value => Err(ToolError::invalid(format!(
             "unknown resource kind: {value}"
         ))),

@@ -44,6 +44,11 @@ fn valid_draft() -> FlowDraft {
         }],
         resources: vec![
             FlowResource {
+                id: "readme.main".into(),
+                kind: ResourceKind::Readme,
+                source: "inline:Audit this library without editing files.".into(),
+            },
+            FlowResource {
                 id: "schema.handoff".into(),
                 kind: ResourceKind::Schema,
                 source: "inline:handoff".into(),
@@ -110,6 +115,130 @@ fn core_check_reports_authoring_errors() {
 }
 
 #[test]
+fn core_check_requires_readme_resource_for_runnable_drafts() {
+    let mut draft = valid_draft();
+    draft
+        .resources
+        .retain(|resource| resource.id != "readme.main");
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_MISSING_README"]
+    );
+    assert_eq!(report.diagnostics[0].severity, Severity::Error);
+    assert_eq!(report.diagnostics[0].location, "resources");
+    assert!(report.diagnostics[0].message.contains("README"));
+
+    let err = flow_lock(&draft, FlowCheckMode::Core).unwrap_err();
+    assert_eq!(
+        diagnostic_codes(&err.diagnostics),
+        vec!["FLOW_MISSING_README"]
+    );
+}
+
+#[test]
+fn core_check_requires_readme_for_node_less_non_empty_drafts() {
+    let cases = [
+        (
+            "resources",
+            FlowDraft {
+                resources: vec![FlowResource {
+                    id: "schema.handoff".into(),
+                    kind: ResourceKind::Schema,
+                    source: "inline:handoff".into(),
+                }],
+                ..FlowDraft::default()
+            },
+        ),
+        (
+            "imports",
+            FlowDraft {
+                imports: vec![FlowImport {
+                    resource_id: "schema.handoff".into(),
+                    alias: Some("handoff".into()),
+                }],
+                ..FlowDraft::default()
+            },
+        ),
+        (
+            "contracts",
+            FlowDraft {
+                contracts: vec![FlowContract {
+                    id: "contract.audit".into(),
+                    completion: Some(ContractCompletion::Manual),
+                    artifacts: Vec::new(),
+                }],
+                ..FlowDraft::default()
+            },
+        ),
+        (
+            "routes",
+            FlowDraft {
+                routes: vec![FlowRoute {
+                    predicate: "exists(artifact.ready)".into(),
+                    for_each: None,
+                    activate: "review".into(),
+                }],
+                ..FlowDraft::default()
+            },
+        ),
+        (
+            "policies",
+            FlowDraft {
+                policies: FlowPolicies {
+                    write_scopes: vec![WriteScope::Artifact("handoff".into())],
+                },
+                ..FlowDraft::default()
+            },
+        ),
+        (
+            "extensions",
+            FlowDraft {
+                extensions: vec!["Route".into()],
+                ..FlowDraft::default()
+            },
+        ),
+    ];
+
+    for (name, draft) in cases {
+        let report = flow_check(&draft, FlowCheckMode::Core);
+        let codes = diagnostic_codes(&report.diagnostics);
+
+        assert!(
+            codes.contains(&"FLOW_MISSING_README"),
+            "{name} draft should require a README resource, got {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn flow_lock_rejects_node_less_resource_package_without_readme() {
+    let draft = FlowDraft {
+        resources: vec![FlowResource {
+            id: "schema.handoff".into(),
+            kind: ResourceKind::Schema,
+            source: "inline:handoff".into(),
+        }],
+        ..FlowDraft::default()
+    };
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_MISSING_README"]
+    );
+
+    let err = flow_lock(&draft, FlowCheckMode::Core).unwrap_err();
+    assert_eq!(
+        diagnostic_codes(&err.diagnostics),
+        vec!["FLOW_MISSING_README"]
+    );
+}
+
+#[test]
 fn broad_write_scope_is_warning_in_core_and_error_in_strict() {
     let mut draft = valid_draft();
     draft.policies.write_scopes = vec![WriteScope::Workspace];
@@ -164,12 +293,16 @@ fn route_predicates_and_fanout_survive_lock_normalization_and_export() {
 
     assert!(normalized.contains("\"predicate\":\"exists(event.review_requested)\""));
     assert!(normalized.contains("\"for_each\":\"artifact.items\""));
+    assert!(normalized.contains("\"id\":\"readme.main\""));
+    assert!(normalized.contains("\"kind\":\"readme\""));
 
     let json = flow_export(&lock, FlowExportFormat::Json);
     let yaml = flow_export(&lock, FlowExportFormat::Yaml);
 
     assert!(json.contains("exists(event.review_requested)"));
+    assert!(json.contains("readme.main"));
     assert!(yaml.contains("artifact.items"));
+    assert!(yaml.contains("readme.main"));
 }
 
 #[test]
@@ -359,7 +492,7 @@ fn flow_export_is_deterministic_for_json_and_yaml() {
 #[test]
 fn run_compatibility_reports_unavailable_resources() {
     let input = RunCompatibility {
-        available_resources: vec!["schema.handoff".into()],
+        available_resources: vec!["readme.main".into(), "schema.handoff".into()],
     };
 
     let result = flow_check_run_compatibility(&valid_draft(), input);

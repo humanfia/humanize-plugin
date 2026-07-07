@@ -63,6 +63,18 @@ loaded for that session. This does not write to `~/.codex/config.toml`.
 The local runtime maps tmux session to the host coding session, tmux window to a
 workflow run, and tmux pane to a node activation.
 
+## Real Trial Prompt
+
+For a real trial, start with a terse natural-language request instead of a
+detailed MCP script:
+
+```text
+Use Humanize to audit this C library without editing files.
+```
+
+A low-capability human-simulator can drive tmux with send/capture operations for
+realistic tests while pane creation remains lazy.
+
 ## v0 Limitations
 
 - Runtime state is local and in-memory.

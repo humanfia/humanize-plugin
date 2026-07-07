@@ -1,8 +1,38 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 
+use humanize_plugin::adapters::tmux::{CommandOutput, CommandRunner, TmuxError};
 use humanize_plugin::mcp::{AUTHORING_TOOL_NAMES, McpServer, McpSurface, RUNTIME_TOOL_NAMES};
 use serde_json::{Value, json};
+
+#[derive(Clone, Default)]
+struct RecordingRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    outputs: Rc<RefCell<VecDeque<CommandOutput>>>,
+}
+
+impl RecordingRunner {
+    fn with_outputs(outputs: Vec<CommandOutput>) -> Self {
+        Self {
+            calls: Rc::new(RefCell::new(Vec::new())),
+            outputs: Rc::new(RefCell::new(outputs.into())),
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl CommandRunner for RecordingRunner {
+    fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        self.calls.borrow_mut().push(argv);
+        Ok(self.outputs.borrow_mut().pop_front().unwrap_or_default())
+    }
+}
 
 fn expected_tool_names() -> Vec<&'static str> {
     RUNTIME_TOOL_NAMES
@@ -12,7 +42,12 @@ fn expected_tool_names() -> Vec<&'static str> {
         .collect()
 }
 
-fn call_tool(server: &mut McpServer, id: u64, name: &str, arguments: Value) -> Value {
+fn call_tool<R: CommandRunner>(
+    server: &mut McpServer<R>,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Value {
     server
         .handle_json_rpc(json!({
             "jsonrpc": "2.0",
@@ -43,6 +78,37 @@ fn diagnostic_codes(response: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn assert_tool_error(response: &Value) {
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(structured(response)["ok"], false);
+}
+
+fn readme_resource() -> Value {
+    json!({
+        "id": "readme.main",
+        "kind": "readme",
+        "source": "inline:Use Humanize to audit this library without editing files."
+    })
+}
+
+fn missing_readme_flow() -> Value {
+    json!({
+        "nodes": ["root"]
+    })
+}
+
+fn node_less_missing_readme_flow() -> Value {
+    json!({
+        "resources": [
+            {
+                "id": "schema.handoff",
+                "kind": "schema",
+                "source": "inline:handoff"
+            }
+        ]
+    })
+}
+
 #[test]
 fn mcp_surface_exposes_exact_tool_names_and_lookup() {
     let surface = McpSurface;
@@ -54,6 +120,24 @@ fn mcp_surface_exposes_exact_tool_names_and_lookup() {
         assert_eq!(descriptor.name(), name);
     }
     assert!(surface.lookup("unknown_tool").is_none());
+}
+
+#[test]
+fn start_run_schema_requires_tmux_session_and_window_when_enabled() {
+    let surface = McpSurface;
+    let descriptor = surface
+        .lookup("start_run")
+        .expect("start_run descriptor should be present");
+    let schema = descriptor.input_schema();
+    let tmux_schema = &schema["properties"]["tmux"];
+    let enabled_case = &tmux_schema["allOf"][0];
+
+    assert_eq!(enabled_case["if"]["required"], json!(["enabled"]));
+    assert_eq!(enabled_case["if"]["properties"]["enabled"]["const"], true);
+    assert_eq!(
+        enabled_case["then"]["required"],
+        json!(["session", "window"])
+    );
 }
 
 #[test]
@@ -87,7 +171,7 @@ fn deliver_artifact_rejects_missing_required_arguments() {
 }
 
 #[test]
-fn flow_check_reports_effectful_predicate_diagnostics() {
+fn flow_check_rejects_effectful_predicate_diagnostics() {
     let mut server = McpServer::new();
 
     let response = call_tool(
@@ -101,6 +185,7 @@ fn flow_check_reports_effectful_predicate_diagnostics() {
                     { "id": "start" },
                     { "id": "finish" }
                 ],
+                "resources": [readme_resource()],
                 "routes": [
                     {
                         "predicate": "shell('cargo test')",
@@ -111,11 +196,155 @@ fn flow_check_reports_effectful_predicate_diagnostics() {
         }),
     );
 
-    assert_eq!(structured(&response)["ok"], true);
+    assert_tool_error(&response);
     assert_eq!(
         diagnostic_codes(&response),
         vec!["FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN"]
     );
+}
+
+#[test]
+fn flow_check_rejects_missing_readme_in_core_and_strict() {
+    for (id, mode) in [(1, "core"), (2, "strict")] {
+        let mut server = McpServer::new();
+
+        let response = call_tool(
+            &mut server,
+            id,
+            "flow_check",
+            json!({
+                "mode": mode,
+                "flow": missing_readme_flow()
+            }),
+        );
+
+        assert_tool_error(&response);
+        assert_eq!(structured(&response)["mode"], mode);
+        assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
+        assert_eq!(structured(&response)["diagnostics"][0]["severity"], "error");
+    }
+}
+
+#[test]
+fn flow_check_rejects_node_less_non_empty_flow_missing_readme() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "mode": "core",
+            "flow": node_less_missing_readme_flow()
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
+}
+
+#[test]
+fn flow_check_keeps_core_warning_diagnostics_successful() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "mode": "core",
+            "flow": {
+                "nodes": ["root"],
+                "resources": [readme_resource()],
+                "policies": {
+                    "write_scopes": ["workspace"]
+                }
+            }
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(structured(&response)["ok"], true);
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_BROAD_WRITE_SCOPE"]);
+    assert_eq!(
+        structured(&response)["diagnostics"][0]["severity"],
+        "warning"
+    );
+}
+
+#[test]
+fn flow_lock_rejects_missing_readme() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_lock",
+        json!({
+            "mode": "core",
+            "flow": missing_readme_flow()
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(structured(&response)["mode"], "core");
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
+    assert_eq!(structured(&response)["diagnostics"][0]["severity"], "error");
+}
+
+#[test]
+fn flow_lock_rejects_node_less_non_empty_flow_missing_readme() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_lock",
+        json!({
+            "mode": "core",
+            "flow": node_less_missing_readme_flow()
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
+}
+
+#[test]
+fn flow_apply_rejects_missing_readme() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_apply",
+        json!({
+            "flow": missing_readme_flow()
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(structured(&response)["mode"], "core");
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
+    assert_eq!(structured(&response)["diagnostics"][0]["severity"], "error");
+}
+
+#[test]
+fn flow_apply_rejects_node_less_non_empty_flow_missing_readme() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_apply",
+        json!({
+            "flow": node_less_missing_readme_flow()
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(structured(&response)["mode"], "core");
+    assert_eq!(diagnostic_codes(&response), vec!["FLOW_MISSING_README"]);
 }
 
 #[test]
@@ -169,6 +398,7 @@ fn flow_apply_rejects_effectful_predicate_with_diagnostics() {
                     { "id": "start" },
                     { "id": "finish" }
                 ],
+                "resources": [readme_resource()],
                 "routes": [
                     {
                         "predicate": "shell('cargo test')",
@@ -201,6 +431,7 @@ fn flow_apply_records_valid_flow_lock_for_export() {
                     { "id": "start" },
                     { "id": "finish" }
                 ],
+                "resources": [readme_resource()],
                 "routes": [
                     {
                         "predicate": "exists(artifact.ready)",
@@ -240,6 +471,12 @@ fn flow_apply_records_valid_flow_lock_for_export() {
             .expect("export should include a document")
             .contains(lock_id)
     );
+    assert!(
+        structured(&exported)["document"]
+            .as_str()
+            .expect("export should include a document")
+            .contains("readme.main")
+    );
 }
 
 #[test]
@@ -260,6 +497,122 @@ fn start_run_reports_tmux_disabled_without_static_creation_claim() {
     assert_eq!(structured(&started)["tmux"]["enabled"], false);
     assert_eq!(structured(&started)["tmux"]["created"], false);
     assert!(structured(&started).get("tmux_mapping").is_none());
+}
+
+#[test]
+fn start_run_creates_explicit_tmux_window_without_panes() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success(""),
+        CommandOutput::success("%9\n"),
+    ]);
+    let mut server = McpServer::with_tmux_runner(runner.clone());
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-tmux-created",
+            "nodes": ["root", "reviewer"],
+            "tmux": {
+                "enabled": true,
+                "session": "host-a",
+                "window": "audit-run"
+            }
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(
+        structured(&started)["activation_ids"],
+        json!(["root", "reviewer"])
+    );
+    assert_eq!(structured(&started)["tmux"]["enabled"], true);
+    assert_eq!(structured(&started)["tmux"]["created"], true);
+    assert_eq!(structured(&started)["tmux"]["session_id"], "host-a");
+    assert_eq!(structured(&started)["tmux"]["window_id"], "%9");
+    assert_eq!(structured(&started)["tmux"]["window_name"], "audit-run");
+    assert_eq!(structured(&started)["tmux"]["run_id"], "run-tmux-created");
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["tmux", "has-session", "-t", "host-a"],
+            vec!["tmux", "new-session", "-d", "-s", "host-a"],
+            vec![
+                "tmux",
+                "new-window",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-t",
+                "host-a",
+                "-n",
+                "audit-run",
+            ],
+        ]
+        .into_iter()
+        .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn start_run_returns_error_when_tmux_creation_fails_without_starting_runtime() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::failure("new-session failed"),
+    ]);
+    let mut server = McpServer::with_tmux_runner(runner.clone());
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-tmux-failed",
+            "nodes": ["root"],
+            "tmux": {
+                "enabled": true,
+                "session": "host-a",
+                "window": "audit-run"
+            }
+        }),
+    );
+
+    assert_eq!(started["error"]["code"], -32602);
+    assert!(
+        started["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("tmux")
+    );
+
+    let context = call_tool(
+        &mut server,
+        2,
+        "get_context",
+        json!({
+            "run_id": "run-tmux-failed"
+        }),
+    );
+    assert_eq!(context["error"]["code"], -32602);
+    assert!(
+        context["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("run-tmux-failed")
+    );
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["tmux", "has-session", "-t", "host-a"],
+            vec!["tmux", "new-session", "-d", "-s", "host-a"],
+        ]
+        .into_iter()
+        .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -501,7 +854,7 @@ fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
         for message in [
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flow_check","arguments":{"flow":{"nodes":[]},"mode":"core"}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flow_check","arguments":{"flow":{"nodes":["root"],"resources":[readme_resource()]},"mode":"core"}}}),
             json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"start_run","arguments":{"run_id":"run-a","nodes":["root"]}}}),
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"deliver_artifact","arguments":{"run_id":"run-a","activation_id":"root","artifact_key":"brief","payload":{"text":"ready"}}}}),
             json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"validate_stop","arguments":{"run_id":"run-a","activation_id":"root"}}}),

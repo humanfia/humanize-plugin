@@ -61,6 +61,7 @@ pub enum ResourceKind {
     Prompt,
     Script,
     Flow,
+    Readme,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -179,6 +180,15 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
         .map(|resource| resource.id.as_str())
         .collect::<HashSet<_>>();
     let mut diagnostics = Vec::new();
+
+    if draft_is_non_empty_package(draft) && !draft_has_readme(draft) {
+        diagnostics.push(Diagnostic::error(
+            "FLOW_MISSING_README",
+            "resources",
+            "non-empty flow packages must include a README resource",
+            "Add a resource with kind 'readme' that describes the package.",
+        ));
+    }
 
     for (index, route) in draft.routes.iter().enumerate() {
         if !node_ids.contains(route.activate.as_str()) {
@@ -409,6 +419,7 @@ impl ResourceKind {
             Self::Prompt => "prompt",
             Self::Script => "script",
             Self::Flow => "flow",
+            Self::Readme => "readme",
         }
     }
 }
@@ -547,6 +558,23 @@ fn is_authoring_extension_kind(extension: &str) -> bool {
             | "Import"
             | "Policy"
     )
+}
+
+fn draft_is_non_empty_package(draft: &FlowDraft) -> bool {
+    !draft.nodes.is_empty()
+        || !draft.contracts.is_empty()
+        || !draft.routes.is_empty()
+        || !draft.resources.is_empty()
+        || !draft.imports.is_empty()
+        || !draft.policies.write_scopes.is_empty()
+        || !draft.extensions.is_empty()
+}
+
+fn draft_has_readme(draft: &FlowDraft) -> bool {
+    draft
+        .resources
+        .iter()
+        .any(|resource| resource.kind == ResourceKind::Readme)
 }
 
 fn is_boolean_literal(value: &str) -> bool {
