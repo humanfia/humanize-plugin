@@ -1,7 +1,7 @@
 use humanize_plugin::flow::{
     ContractArtifact, ContractCompletion, Diagnostic, FlowCheckMode, FlowContract, FlowDraft,
     FlowExportFormat, FlowImport, FlowNode, FlowPolicies, FlowResource, FlowRoute,
-    FlowSuggestInput, ResourceKind, RunCompatibility, Severity, WriteScope,
+    FlowSuggestInput, NodeAction, NodeDriver, ResourceKind, RunCompatibility, Severity, WriteScope,
     effective_node_write_scopes, flow_check, flow_check_run_compatibility, flow_export, flow_lock,
     flow_suggest,
 };
@@ -122,9 +122,184 @@ fn flow_suggest_builds_default_valid_skeleton() {
     assert_eq!(draft.imports, Vec::<FlowImport>::new());
     assert_eq!(draft.policies, FlowPolicies::default());
     assert_eq!(draft.extensions, Vec::<String>::new());
+    assert!(draft.nodes.iter().all(|node| node.action.is_none()));
     assert_eq!(
         flow_check(&draft, FlowCheckMode::Core).diagnostics,
         Vec::new()
+    );
+}
+
+#[test]
+fn action_descriptor_is_valid_when_prompt_resource_refs_and_fact_paths_exist() {
+    let mut draft = valid_draft();
+    draft.resources.extend([
+        FlowResource {
+            id: "prompt.review".into(),
+            kind: ResourceKind::Prompt,
+            source: "inline:Review the facts.".into(),
+        },
+        FlowResource {
+            id: "script.collect".into(),
+            kind: ResourceKind::Script,
+            source: "scripts/collect.sh".into(),
+        },
+    ]);
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Review,
+        prompt_ref: Some("prompt.review".into()),
+        resource_refs: vec!["script.collect".into()],
+        reads: vec![
+            "artifact.handoff".into(),
+            "board.ready".into(),
+            "event.requested".into(),
+        ],
+        writes: vec!["artifact.summary".into(), "board.done".into()],
+        verdict_artifact: Some("artifact.review_verdict".into()),
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(report.diagnostics, Vec::new());
+}
+
+#[test]
+fn action_resource_refs_must_reference_known_resource_ids() {
+    let mut draft = valid_draft();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Agent,
+        prompt_ref: None,
+        resource_refs: vec!["script.missing".into()],
+        reads: vec!["artifact.handoff".into()],
+        writes: vec!["artifact.summary".into()],
+        verdict_artifact: None,
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_UNKNOWN_ACTION_RESOURCE"]
+    );
+    assert_eq!(
+        report.diagnostics[0].location,
+        "nodes[start].action.resource_refs[0]"
+    );
+}
+
+#[test]
+fn action_prompt_ref_must_reference_known_resource_id() {
+    let mut draft = valid_draft();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Agent,
+        prompt_ref: Some("prompt.missing".into()),
+        resource_refs: Vec::new(),
+        reads: vec!["artifact.handoff".into()],
+        writes: vec!["artifact.summary".into()],
+        verdict_artifact: None,
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_UNKNOWN_ACTION_PROMPT"]
+    );
+    assert_eq!(
+        report.diagnostics[0].location,
+        "nodes[start].action.prompt_ref"
+    );
+}
+
+#[test]
+fn action_prompt_ref_must_reference_prompt_resource_kind() {
+    let mut draft = valid_draft();
+    draft.resources.push(FlowResource {
+        id: "script.collect".into(),
+        kind: ResourceKind::Script,
+        source: "scripts/collect.sh".into(),
+    });
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Agent,
+        prompt_ref: Some("script.collect".into()),
+        resource_refs: Vec::new(),
+        reads: vec!["artifact.handoff".into()],
+        writes: vec!["artifact.summary".into()],
+        verdict_artifact: None,
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_INVALID_ACTION_PROMPT"]
+    );
+    assert_eq!(
+        report.diagnostics[0].location,
+        "nodes[start].action.prompt_ref"
+    );
+}
+
+#[test]
+fn action_fact_paths_and_verdict_artifact_are_validated() {
+    let mut draft = valid_draft();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Human,
+        prompt_ref: None,
+        resource_refs: Vec::new(),
+        reads: vec!["user.name".into()],
+        writes: vec!["resource.output".into()],
+        verdict_artifact: Some(" ".into()),
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec![
+            "FLOW_INVALID_ACTION_READ",
+            "FLOW_INVALID_ACTION_WRITE",
+            "FLOW_EMPTY_ACTION_VERDICT_ARTIFACT",
+        ]
+    );
+    assert_eq!(
+        report.diagnostics[0].location,
+        "nodes[start].action.reads[0]"
+    );
+    assert_eq!(
+        report.diagnostics[1].location,
+        "nodes[start].action.writes[0]"
+    );
+    assert_eq!(
+        report.diagnostics[2].location,
+        "nodes[start].action.verdict_artifact"
+    );
+}
+
+#[test]
+fn action_fact_paths_reject_blank_segments() {
+    let mut draft = valid_draft();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Agent,
+        prompt_ref: None,
+        resource_refs: Vec::new(),
+        reads: vec!["artifact. ".into()],
+        writes: vec!["board. ".into()],
+        verdict_artifact: None,
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_INVALID_ACTION_READ", "FLOW_INVALID_ACTION_WRITE"]
+    );
+    assert_eq!(
+        report.diagnostics[0].location,
+        "nodes[start].action.reads[0]"
+    );
+    assert_eq!(
+        report.diagnostics[1].location,
+        "nodes[start].action.writes[0]"
     );
 }
 
@@ -549,6 +724,55 @@ fn route_predicates_and_fanout_survive_lock_normalization_and_export() {
     assert!(json.contains("readme.main"));
     assert!(yaml.contains("artifact.items"));
     assert!(yaml.contains("readme.main"));
+}
+
+#[test]
+fn action_descriptor_survives_lock_normalization_and_export() {
+    let mut draft = valid_draft();
+    draft.resources.extend([
+        FlowResource {
+            id: "script.collect".into(),
+            kind: ResourceKind::Script,
+            source: "scripts/collect.sh".into(),
+        },
+        FlowResource {
+            id: "prompt.review".into(),
+            kind: ResourceKind::Prompt,
+            source: "inline:Review the facts.".into(),
+        },
+        FlowResource {
+            id: "view.summary".into(),
+            kind: ResourceKind::View,
+            source: "views/summary.json".into(),
+        },
+    ]);
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Review,
+        prompt_ref: Some("prompt.review".into()),
+        resource_refs: vec!["view.summary".into(), "script.collect".into()],
+        reads: vec!["event.requested".into(), "artifact.handoff".into()],
+        writes: vec!["board.done".into(), "artifact.summary".into()],
+        verdict_artifact: Some("artifact.review_verdict".into()),
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(report.diagnostics, Vec::new());
+
+    let lock = flow_lock(&draft, FlowCheckMode::Core).unwrap();
+    let normalized = lock.normalized_content();
+
+    assert!(normalized.contains(
+        "\"action\":{\"driver\":\"review\",\"prompt_ref\":\"prompt.review\",\"resource_refs\":[\"script.collect\",\"view.summary\"],\"reads\":[\"artifact.handoff\",\"event.requested\"],\"writes\":[\"artifact.summary\",\"board.done\"],\"verdict_artifact\":\"artifact.review_verdict\"}"
+    ));
+
+    let json = flow_export(&lock, FlowExportFormat::Json);
+    let yaml = flow_export(&lock, FlowExportFormat::Yaml);
+
+    assert!(json.contains("artifact.review_verdict"));
+    assert!(json.contains("prompt.review"));
+    assert!(yaml.contains("artifact.review_verdict"));
+    assert!(yaml.contains("prompt.review"));
 }
 
 #[test]

@@ -15,8 +15,27 @@ pub struct FlowDraft {
 pub struct FlowNode {
     pub id: String,
     pub contract_id: Option<String>,
+    pub action: Option<NodeAction>,
     pub write_scopes: Vec<WriteScope>,
     pub extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NodeAction {
+    pub driver: NodeDriver,
+    pub prompt_ref: Option<String>,
+    pub resource_refs: Vec<String>,
+    pub reads: Vec<String>,
+    pub writes: Vec<String>,
+    pub verdict_artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NodeDriver {
+    Agent,
+    Script,
+    Review,
+    Human,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -258,6 +277,11 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
         .filter(|resource| resource.kind == ResourceKind::Schema)
         .map(|resource| resource.id.as_str())
         .collect::<HashSet<_>>();
+    let resource_by_id = draft
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), &resource.kind))
+        .collect::<HashMap<_, _>>();
     let mut diagnostics = Vec::new();
 
     if draft_is_non_empty_package(draft) {
@@ -358,6 +382,78 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
         }
     }
     for node in &draft.nodes {
+        if let Some(action) = &node.action {
+            if let Some(prompt_ref) = &action.prompt_ref {
+                match resource_by_id.get(prompt_ref.as_str()) {
+                    Some(ResourceKind::Prompt) => {}
+                    Some(_) => diagnostics.push(Diagnostic::error(
+                        "FLOW_INVALID_ACTION_PROMPT",
+                        format!("nodes[{}].action.prompt_ref", node.id),
+                        format!(
+                            "node action prompt_ref '{}' must reference a prompt resource",
+                            prompt_ref
+                        ),
+                        "Use a resource with kind 'prompt' for prompt_ref.",
+                    )),
+                    None => diagnostics.push(Diagnostic::error(
+                        "FLOW_UNKNOWN_ACTION_PROMPT",
+                        format!("nodes[{}].action.prompt_ref", node.id),
+                        format!(
+                            "node action references missing prompt resource '{}'",
+                            prompt_ref
+                        ),
+                        "Add the prompt resource or update the action prompt reference.",
+                    )),
+                }
+            }
+
+            for (index, resource_id) in action.resource_refs.iter().enumerate() {
+                if !resource_by_id.contains_key(resource_id.as_str()) {
+                    diagnostics.push(Diagnostic::error(
+                        "FLOW_UNKNOWN_ACTION_RESOURCE",
+                        format!("nodes[{}].action.resource_refs[{}]", node.id, index),
+                        format!("node action references missing resource '{}'", resource_id),
+                        "Add the resource or update the action resource reference.",
+                    ));
+                }
+            }
+
+            for (index, fact_path) in action.reads.iter().enumerate() {
+                if !is_fact_path(fact_path) {
+                    diagnostics.push(Diagnostic::error(
+                        "FLOW_INVALID_ACTION_READ",
+                        format!("nodes[{}].action.reads[{}]", node.id, index),
+                        format!("action read path '{}' is not a fact path", fact_path),
+                        "Use artifact.*, board.*, or event.* fact paths.",
+                    ));
+                }
+            }
+
+            for (index, fact_path) in action.writes.iter().enumerate() {
+                if !is_fact_path(fact_path) {
+                    diagnostics.push(Diagnostic::error(
+                        "FLOW_INVALID_ACTION_WRITE",
+                        format!("nodes[{}].action.writes[{}]", node.id, index),
+                        format!("action write path '{}' is not a fact path", fact_path),
+                        "Use artifact.*, board.*, or event.* fact paths.",
+                    ));
+                }
+            }
+
+            if action
+                .verdict_artifact
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                diagnostics.push(Diagnostic::error(
+                    "FLOW_EMPTY_ACTION_VERDICT_ARTIFACT",
+                    format!("nodes[{}].action.verdict_artifact", node.id),
+                    "action verdict artifact must not be empty",
+                    "Use a non-empty artifact-like id such as artifact.verdict.",
+                ));
+            }
+        }
+
         for (index, extension) in node.extensions.iter().enumerate() {
             if !is_authoring_extension_kind(extension) {
                 diagnostics.push(Diagnostic::error(
@@ -493,6 +589,17 @@ impl ContractCompletion {
         match self {
             Self::Manual => "manual",
             Self::AllArtifacts => "all_artifacts",
+        }
+    }
+}
+
+impl NodeDriver {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Script => "script",
+            Self::Review => "review",
+            Self::Human => "human",
         }
     }
 }
@@ -743,7 +850,15 @@ fn is_boolean_literal(value: &str) -> bool {
 fn is_fact_path(value: &str) -> bool {
     ["artifact.", "board.", "event."]
         .iter()
-        .any(|prefix| value.starts_with(prefix) && value.len() > prefix.len())
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .is_some_and(|path| {
+            path.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            })
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -885,15 +1000,38 @@ fn normalize_nodes(nodes: &[FlowNode]) -> String {
             let mut extensions = node.extensions.clone();
             extensions.sort();
             format!(
-                "{{\"id\":{},\"contract_id\":{},\"write_scopes\":{},\"extensions\":{}}}",
+                "{{\"id\":{},\"contract_id\":{},\"action\":{},\"write_scopes\":{},\"extensions\":{}}}",
                 quote(&node.id),
                 quote_option(node.contract_id.as_deref()),
+                normalize_action(node.action.as_ref()),
                 normalize_write_scopes(&write_scopes),
                 normalize_strings(&extensions)
             )
         })
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))
+}
+
+fn normalize_action(action: Option<&NodeAction>) -> String {
+    let Some(action) = action else {
+        return "null".into();
+    };
+    let mut resource_refs = action.resource_refs.clone();
+    resource_refs.sort();
+    let mut reads = action.reads.clone();
+    reads.sort();
+    let mut writes = action.writes.clone();
+    writes.sort();
+
+    format!(
+        "{{\"driver\":{},\"prompt_ref\":{},\"resource_refs\":{},\"reads\":{},\"writes\":{},\"verdict_artifact\":{}}}",
+        quote(action.driver.as_str()),
+        quote_option(action.prompt_ref.as_deref()),
+        normalize_strings(&resource_refs),
+        normalize_strings(&reads),
+        normalize_strings(&writes),
+        quote_option(action.verdict_artifact.as_deref())
+    )
 }
 
 fn normalize_contracts(contracts: &[FlowContract]) -> String {

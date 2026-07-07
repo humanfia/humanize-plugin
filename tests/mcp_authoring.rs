@@ -60,6 +60,11 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
             }
         ])
     );
+    assert!(
+        structured(&suggested)["flow"]["nodes"][0]
+            .get("action")
+            .is_none()
+    );
     assert_eq!(
         structured(&suggested)["flow"]["contracts"][0],
         json!({
@@ -102,6 +107,164 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
     assert_eq!(structured(&checked)["ok"], true);
     assert_eq!(structured(&checked)["diagnostics"], json!([]));
 }
+
+#[test]
+fn flow_check_accepts_node_action_descriptor() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "mode": "core",
+            "flow": {
+                "nodes": [
+                    {
+                        "id": "root",
+                        "action": {
+                            "driver": "agent",
+                            "promptRef": "prompt.review",
+                            "resourceRefs": ["script.collect"],
+                            "reads": ["artifact.handoff", "board.ready"],
+                            "writes": ["artifact.summary"],
+                            "verdictArtifact": "artifact.review_verdict"
+                        }
+                    }
+                ],
+                "resources": [
+                    readme_resource(),
+                    {
+                        "id": "prompt.review",
+                        "kind": "prompt",
+                        "source": "inline:Review the facts."
+                    },
+                    {
+                        "id": "script.collect",
+                        "kind": "script",
+                        "source": "scripts/collect.sh"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(structured(&response)["ok"], true);
+    assert_eq!(structured(&response)["diagnostics"], json!([]));
+}
+
+#[test]
+fn flow_action_export_uses_snake_case_after_lock() {
+    let mut server = McpServer::new();
+
+    let locked = call_tool(
+        &mut server,
+        1,
+        "flow_lock",
+        json!({
+            "mode": "core",
+            "flow": {
+                "nodes": [
+                    {
+                        "id": "root",
+                        "action": {
+                            "driver": "review",
+                            "promptRef": "prompt.review",
+                            "resourceRefs": ["script.collect"],
+                            "reads": ["artifact.handoff", "board.ready"],
+                            "writes": ["artifact.summary"],
+                            "verdictArtifact": "artifact.review_verdict"
+                        }
+                    }
+                ],
+                "resources": [
+                    readme_resource(),
+                    {
+                        "id": "prompt.review",
+                        "kind": "prompt",
+                        "source": "inline:Review the facts."
+                    },
+                    {
+                        "id": "script.collect",
+                        "kind": "script",
+                        "source": "scripts/collect.sh"
+                    }
+                ]
+            }
+        }),
+    );
+
+    assert_eq!(locked["result"]["isError"], false);
+    assert_eq!(structured(&locked)["ok"], true);
+    let lock_id = structured(&locked)["flow_lock_id"]
+        .as_str()
+        .expect("flow_lock should return a flow lock id");
+
+    let exported = call_tool(
+        &mut server,
+        2,
+        "flow_export",
+        json!({
+            "flow_lock_id": lock_id,
+            "format": "json"
+        }),
+    );
+
+    assert_eq!(exported["result"]["isError"], false);
+    assert_eq!(structured(&exported)["ok"], true);
+    let document = structured(&exported)["document"]
+        .as_str()
+        .expect("export should include a document");
+    let exported_json = serde_json::from_str::<serde_json::Value>(document)
+        .expect("exported document should be JSON");
+    let content = exported_json["content"]
+        .as_str()
+        .expect("exported document should include normalized content");
+
+    assert!(content.contains("\"prompt_ref\":\"prompt.review\""));
+    assert!(content.contains("\"resource_refs\":[\"script.collect\"]"));
+    assert!(content.contains("\"verdict_artifact\":\"artifact.review_verdict\""));
+    assert!(!content.contains("promptRef"));
+    assert!(!content.contains("resourceRefs"));
+    assert!(!content.contains("verdictArtifact"));
+}
+
+#[test]
+fn flow_check_rejects_unknown_action_driver_at_parse_time() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "mode": "core",
+            "flow": {
+                "nodes": [
+                    {
+                        "id": "root",
+                        "action": {
+                            "driver": "worker",
+                            "reads": ["artifact.handoff"],
+                            "writes": ["artifact.summary"]
+                        }
+                    }
+                ],
+                "resources": [readme_resource()]
+            }
+        }),
+    );
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("unknown action driver")
+    );
+}
+
 #[test]
 fn flow_suggest_flow_round_trips_through_lock_and_export() {
     let mut server = McpServer::new();

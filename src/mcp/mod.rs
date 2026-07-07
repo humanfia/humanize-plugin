@@ -1198,6 +1198,7 @@ fn parse_flow_node(value: &Value) -> Result<flow::FlowNode, ToolError> {
             id: string_field(object, &["id"])?.to_string(),
             contract_id: optional_string_field(object, &["contract_id", "contractId"])?
                 .map(str::to_string),
+            action: object.get("action").map(parse_node_action).transpose()?,
             write_scopes: match object
                 .get("write_scopes")
                 .or_else(|| object.get("writeScopes"))
@@ -1211,6 +1212,43 @@ fn parse_flow_node(value: &Value) -> Result<flow::FlowNode, ToolError> {
             },
         }),
         _ => Err(ToolError::invalid("nodes items must be strings or objects")),
+    }
+}
+
+fn parse_node_action(value: &Value) -> Result<flow::NodeAction, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("action must be an object"))?;
+    Ok(flow::NodeAction {
+        driver: parse_node_driver(string_field(object, &["driver"])?)?,
+        prompt_ref: optional_string_field(object, &["prompt_ref", "promptRef"])?
+            .map(str::to_string),
+        resource_refs: optional_string_array_from_object(
+            object,
+            &["resource_refs", "resourceRefs"],
+        )?,
+        reads: match object.get("reads") {
+            Some(value) => string_array(value, "reads")?,
+            None => Vec::new(),
+        },
+        writes: match object.get("writes") {
+            Some(value) => string_array(value, "writes")?,
+            None => Vec::new(),
+        },
+        verdict_artifact: optional_string_field(object, &["verdict_artifact", "verdictArtifact"])?
+            .map(str::to_string),
+    })
+}
+
+fn parse_node_driver(value: &str) -> Result<flow::NodeDriver, ToolError> {
+    match value {
+        "agent" | "Agent" => Ok(flow::NodeDriver::Agent),
+        "script" | "Script" => Ok(flow::NodeDriver::Script),
+        "review" | "Review" => Ok(flow::NodeDriver::Review),
+        "human" | "Human" => Ok(flow::NodeDriver::Human),
+        value => Err(ToolError::invalid(format!(
+            "unknown action driver: {value}"
+        ))),
     }
 }
 

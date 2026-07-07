@@ -17,11 +17,29 @@ fn flow_node_json(node: &flow::FlowNode) -> Value {
     let mut object = Map::new();
     object.insert("id".into(), json!(node.id));
     insert_optional_string(&mut object, "contract_id", node.contract_id.as_deref());
+    if let Some(action) = &node.action {
+        object.insert("action".into(), node_action_json(action));
+    }
     object.insert(
         "write_scopes".into(),
         Value::Array(write_scopes_json(&node.write_scopes)),
     );
     object.insert("extensions".into(), json!(node.extensions));
+    Value::Object(object)
+}
+
+fn node_action_json(action: &flow::NodeAction) -> Value {
+    let mut object = Map::new();
+    object.insert("driver".into(), json!(node_driver_name(action.driver)));
+    insert_optional_string(&mut object, "prompt_ref", action.prompt_ref.as_deref());
+    object.insert("resource_refs".into(), json!(action.resource_refs));
+    object.insert("reads".into(), json!(action.reads));
+    object.insert("writes".into(), json!(action.writes));
+    insert_optional_string(
+        &mut object,
+        "verdict_artifact",
+        action.verdict_artifact.as_deref(),
+    );
     Value::Object(object)
 }
 
@@ -106,6 +124,15 @@ fn contract_completion_name(completion: &flow::ContractCompletion) -> &'static s
     }
 }
 
+fn node_driver_name(driver: flow::NodeDriver) -> &'static str {
+    match driver {
+        flow::NodeDriver::Agent => "agent",
+        flow::NodeDriver::Script => "script",
+        flow::NodeDriver::Review => "review",
+        flow::NodeDriver::Human => "human",
+    }
+}
+
 fn resource_kind_name(kind: &flow::ResourceKind) -> &'static str {
     match kind {
         flow::ResourceKind::Schema => "schema",
@@ -134,6 +161,26 @@ mod tests {
                 flow::FlowNode {
                     id: "review".into(),
                     contract_id: Some("contract.review".into()),
+                    action: Some(flow::NodeAction {
+                        driver: flow::NodeDriver::Human,
+                        prompt_ref: Some("prompt.review".into()),
+                        resource_refs: vec!["script.collect".into()],
+                        reads: vec!["artifact.brief".into()],
+                        writes: vec!["artifact.report".into()],
+                        verdict_artifact: Some("artifact.review_verdict".into()),
+                    }),
+                    ..flow::FlowNode::default()
+                },
+                flow::FlowNode {
+                    id: "script".into(),
+                    action: Some(flow::NodeAction {
+                        driver: flow::NodeDriver::Script,
+                        prompt_ref: None,
+                        resource_refs: Vec::new(),
+                        reads: Vec::new(),
+                        writes: Vec::new(),
+                        verdict_artifact: None,
+                    }),
                     ..flow::FlowNode::default()
                 },
             ],
@@ -184,8 +231,34 @@ mod tests {
 
         let value = flow_draft_json(&draft);
 
+        assert!(value["nodes"][0].get("action").is_none());
         assert!(value["nodes"][0].get("contract_id").is_none());
         assert_eq!(value["nodes"][1]["contract_id"], "contract.review");
+        assert_eq!(value["nodes"][1]["action"]["driver"], "human");
+        assert_eq!(value["nodes"][1]["action"]["prompt_ref"], "prompt.review");
+        assert_eq!(
+            value["nodes"][1]["action"]["resource_refs"],
+            json!(["script.collect"])
+        );
+        assert_eq!(
+            value["nodes"][1]["action"]["reads"],
+            json!(["artifact.brief"])
+        );
+        assert_eq!(
+            value["nodes"][1]["action"]["writes"],
+            json!(["artifact.report"])
+        );
+        assert_eq!(
+            value["nodes"][1]["action"]["verdict_artifact"],
+            "artifact.review_verdict"
+        );
+        assert!(
+            value["nodes"][2]["action"]
+                .get("verdict_artifact")
+                .is_none()
+        );
+        assert!(value["nodes"][2]["action"].get("prompt_ref").is_none());
+        assert_eq!(value["nodes"][2]["action"]["resource_refs"], json!([]),);
         assert!(value["contracts"][0].get("completion").is_none());
         assert!(
             value["contracts"][0]["artifacts"][0]
