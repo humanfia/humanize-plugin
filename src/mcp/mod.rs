@@ -431,10 +431,33 @@ impl<R: CommandRunner> McpServer<R> {
             arguments,
             &["lock_id", "lockId", "flow_lock_id", "flowLockId"],
         )?;
-        let content_hash = require_string(arguments, &["content_hash", "contentHash"])?;
+        let provided_content_hash = require_string(arguments, &["content_hash", "contentHash"])?;
+        let Some(lock) = self.state.flow_locks.get(lock_id) else {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "lock_id": lock_id,
+                "flow_lock_id": lock_id,
+                "error": "flow lock not found"
+            })));
+        };
+        let expected_content_hash = content_hash(lock.normalized_content());
+        if provided_content_hash != expected_content_hash {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "mode": flow_lock_mode_name(mode),
+                "lock_id": lock_id,
+                "flow_lock_id": lock_id,
+                "content_hash": provided_content_hash,
+                "expected_content_hash": expected_content_hash,
+                "error": "flow lock content hash mismatch"
+            })));
+        }
+
         self.state
             .runtime
-            .apply_flow_lock(run_id, mode, lock_id, content_hash)
+            .apply_flow_lock(run_id, mode, lock_id, provided_content_hash)
             .map_err(ToolError::from_runtime)?;
 
         Ok(ToolCallResult::ok(json!({
@@ -442,7 +465,7 @@ impl<R: CommandRunner> McpServer<R> {
             "run_id": run_id,
             "mode": flow_lock_mode_name(mode),
             "lock_id": lock_id,
-            "content_hash": content_hash
+            "content_hash": provided_content_hash
         })))
     }
 

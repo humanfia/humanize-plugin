@@ -152,6 +152,45 @@ fn node_less_missing_readme_flow() -> Value {
     })
 }
 
+fn valid_flow() -> Value {
+    json!({
+        "nodes": [
+            { "id": "root" },
+            { "id": "finish" }
+        ],
+        "resources": [readme_resource()],
+        "routes": [
+            {
+                "predicate": "exists(artifact.ready)",
+                "activate": "finish"
+            }
+        ]
+    })
+}
+
+fn lock_valid_flow<R: CommandRunner>(server: &mut McpServer<R>, id: u64) -> (String, String) {
+    let locked = call_tool(
+        server,
+        id,
+        "flow_lock",
+        json!({
+            "flow": valid_flow()
+        }),
+    );
+
+    assert_eq!(structured(&locked)["ok"], true);
+    let lock_id = structured(&locked)["flow_lock_id"]
+        .as_str()
+        .expect("flow_lock should return a flow lock id")
+        .to_string();
+    let content_hash = structured(&locked)["content_hash"]
+        .as_str()
+        .expect("flow_lock should return a content hash")
+        .to_string();
+
+    (lock_id, content_hash)
+}
+
 fn populate_view_run<R: CommandRunner>(server: &mut McpServer<R>, run_id: &str) {
     let started = call_tool(
         server,
@@ -1346,9 +1385,11 @@ fn validate_stop_uses_activation_contract_before_and_after_artifact_delivery() {
 fn apply_flow_lock_requires_and_records_lock_provenance() {
     let mut server = McpServer::new();
 
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+
     let started = call_tool(
         &mut server,
-        1,
+        2,
         "start_run",
         json!({
             "run_id": "run-lock",
@@ -1359,12 +1400,12 @@ fn apply_flow_lock_requires_and_records_lock_provenance() {
 
     let missing_provenance = call_tool(
         &mut server,
-        2,
+        3,
         "apply_flow_lock",
         json!({
             "run_id": "run-lock",
             "mode": "future_activations",
-            "content_hash": "sha256:first"
+            "content_hash": content_hash
         }),
     );
     assert_eq!(missing_provenance["error"]["code"], -32602);
@@ -1377,22 +1418,22 @@ fn apply_flow_lock_requires_and_records_lock_provenance() {
 
     let applied = call_tool(
         &mut server,
-        3,
+        4,
         "apply_flow_lock",
         json!({
             "run_id": "run-lock",
             "mode": "future_activations",
-            "lock_id": "lock-a",
-            "content_hash": "sha256:first"
+            "lock_id": lock_id,
+            "content_hash": content_hash
         }),
     );
     assert_eq!(structured(&applied)["ok"], true);
-    assert_eq!(structured(&applied)["lock_id"], "lock-a");
-    assert_eq!(structured(&applied)["content_hash"], "sha256:first");
+    assert_eq!(structured(&applied)["lock_id"], lock_id);
+    assert_eq!(structured(&applied)["content_hash"], content_hash);
 
     let context = call_tool(
         &mut server,
-        4,
+        5,
         "get_context",
         json!({
             "run_id": "run-lock"
@@ -1405,8 +1446,178 @@ fn apply_flow_lock_requires_and_records_lock_provenance() {
         .values()
         .next()
         .expect("one flow lock application should be recorded");
-    assert_eq!(latest["lock_id"], "lock-a");
-    assert_eq!(latest["content_hash"], "sha256:first");
+    assert_eq!(latest["lock_id"], lock_id);
+    assert_eq!(latest["content_hash"], content_hash);
+}
+
+#[test]
+fn apply_flow_lock_rejects_unknown_lock_without_runtime_apply() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-unknown-lock",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let response = call_tool(
+        &mut server,
+        2,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-unknown-lock",
+            "mode": "future_activations",
+            "lock_id": "lock-missing",
+            "content_hash": "fnv1a64:0000000000000000"
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(structured(&response)["lock_id"], "lock-missing");
+    assert_eq!(structured(&response)["error"], "flow lock not found");
+
+    let context = call_tool(
+        &mut server,
+        3,
+        "get_context",
+        json!({
+            "run_id": "run-unknown-lock"
+        }),
+    );
+    assert!(structured(&context)["context"]["flow_lock_mode"].is_null());
+    assert_eq!(
+        structured(&context)["context"]["flow_lock_applications"],
+        json!({})
+    );
+}
+
+#[test]
+fn apply_flow_lock_rejects_hash_mismatch_without_runtime_apply() {
+    let mut server = McpServer::new();
+
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "start_run",
+        json!({
+            "run_id": "run-hash-mismatch",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let response = call_tool(
+        &mut server,
+        3,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-hash-mismatch",
+            "mode": "future_activations",
+            "lock_id": lock_id,
+            "content_hash": "fnv1a64:0000000000000000"
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(structured(&response)["lock_id"], lock_id);
+    assert_eq!(
+        structured(&response)["content_hash"],
+        "fnv1a64:0000000000000000"
+    );
+    assert_eq!(structured(&response)["expected_content_hash"], content_hash);
+    assert_eq!(
+        structured(&response)["error"],
+        "flow lock content hash mismatch"
+    );
+
+    let context = call_tool(
+        &mut server,
+        4,
+        "get_context",
+        json!({
+            "run_id": "run-hash-mismatch"
+        }),
+    );
+    assert!(structured(&context)["context"]["flow_lock_mode"].is_null());
+    assert_eq!(
+        structured(&context)["context"]["flow_lock_applications"],
+        json!({})
+    );
+}
+
+#[test]
+fn apply_flow_lock_accepts_flow_lock_id_alias_for_stored_lock() {
+    let mut server = McpServer::new();
+
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+    let started = call_tool(
+        &mut server,
+        2,
+        "start_run",
+        json!({
+            "run_id": "run-lock-alias",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let applied = call_tool(
+        &mut server,
+        3,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-lock-alias",
+            "mode": "checkpoint_restart",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+
+    assert_eq!(structured(&applied)["ok"], true);
+    assert_eq!(structured(&applied)["lock_id"], lock_id);
+    assert_eq!(structured(&applied)["content_hash"], content_hash);
+    assert_eq!(structured(&applied)["mode"], "checkpoint_restart");
+}
+
+#[test]
+fn apply_flow_lock_rejects_lock_created_in_another_server() {
+    let mut authoring_server = McpServer::new();
+    let (lock_id, content_hash) = lock_valid_flow(&mut authoring_server, 1);
+
+    let mut runtime_server = McpServer::new();
+    let started = call_tool(
+        &mut runtime_server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-other-server-lock",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let response = call_tool(
+        &mut runtime_server,
+        2,
+        "apply_flow_lock",
+        json!({
+            "run_id": "run-other-server-lock",
+            "mode": "future_activations",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+
+    assert_tool_error(&response);
+    assert_eq!(structured(&response)["lock_id"], lock_id);
+    assert_eq!(structured(&response)["error"], "flow lock not found");
 }
 
 #[test]
