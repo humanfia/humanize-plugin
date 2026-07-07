@@ -147,13 +147,17 @@ pub fn valid_flow() -> Value {
         ]
     })
 }
-pub fn lock_valid_flow<R: CommandRunner>(server: &mut McpServer<R>, id: u64) -> (String, String) {
+pub fn lock_flow<R: CommandRunner>(
+    server: &mut McpServer<R>,
+    id: u64,
+    flow: Value,
+) -> (String, String) {
     let locked = call_tool(
         server,
         id,
         "flow_lock",
         json!({
-            "flow": valid_flow()
+            "flow": flow
         }),
     );
 
@@ -168,6 +172,9 @@ pub fn lock_valid_flow<R: CommandRunner>(server: &mut McpServer<R>, id: u64) -> 
         .to_string();
 
     (lock_id, content_hash)
+}
+pub fn lock_valid_flow<R: CommandRunner>(server: &mut McpServer<R>, id: u64) -> (String, String) {
+    lock_flow(server, id, valid_flow())
 }
 pub fn populate_view_run<R: CommandRunner>(server: &mut McpServer<R>, run_id: &str) {
     let started = call_tool(

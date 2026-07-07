@@ -9,6 +9,7 @@ use flow_json::flow_draft_json;
 use serde_json::{Value, json};
 
 mod flow_json;
+mod route_preview;
 mod surface;
 
 pub use surface::{AUTHORING_TOOL_NAMES, McpSurface, McpToolDescriptor, RUNTIME_TOOL_NAMES};
@@ -94,6 +95,7 @@ impl<R: CommandRunner> McpServer<R> {
             "send_message" => self.send_message(arguments),
             "validate_stop" => self.validate_stop(arguments),
             "apply_flow_lock" => self.apply_flow_lock(arguments),
+            "preview_flow_routes" => self.preview_flow_routes(arguments),
             "view_terminal" => self.view_terminal(arguments),
             "view_snapshot" => self.view_snapshot(arguments),
             "view_browser" => self.view_browser(arguments),
@@ -430,6 +432,10 @@ impl<R: CommandRunner> McpServer<R> {
             "lock_id": lock_id,
             "content_hash": provided_content_hash
         })))
+    }
+
+    fn preview_flow_routes(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        route_preview::preview_flow_routes(&self.state, arguments)
     }
 
     fn view_terminal(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {

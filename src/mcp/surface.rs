@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub const RUNTIME_TOOL_NAMES: [&str; 13] = [
+pub const RUNTIME_TOOL_NAMES: [&str; 14] = [
     "start_run",
     "get_context",
     "deliver_artifact",
@@ -12,6 +12,7 @@ pub const RUNTIME_TOOL_NAMES: [&str; 13] = [
     "send_message",
     "validate_stop",
     "apply_flow_lock",
+    "preview_flow_routes",
     "view_terminal",
     "view_snapshot",
     "view_browser",
@@ -265,6 +266,22 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                     "content_hash": { "type": "string" }
                 }),
                 &["run_id", "mode", "lock_id", "content_hash"],
+            ),
+        ),
+        "preview_flow_routes" => descriptor(
+            "preview_flow_routes",
+            "Preview typed flow lock route activations from current runtime facts.",
+            object_schema(
+                json!({
+                    "run_id": { "type": "string" },
+                    "flow_lock_id": { "type": "string" },
+                    "flowLockId": { "type": "string" },
+                    "lock_id": { "type": "string" },
+                    "lockId": { "type": "string" },
+                    "content_hash": { "type": "string" },
+                    "contentHash": { "type": "string" }
+                }),
+                &["run_id"],
             ),
         ),
         "view_terminal" => descriptor(

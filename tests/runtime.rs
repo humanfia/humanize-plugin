@@ -1,6 +1,12 @@
-use humanize_plugin::runtime::{
-    ActivationStatus, BoardPatch, EventPayload, FlowLockMode, LocalEventStore, NodeSpec, Runtime,
-    RuntimeState, StopContract, StopValidationError,
+use humanize_plugin::{
+    flow::{
+        FlowCheckMode, FlowDraft, FlowLock, FlowNode, FlowResource, FlowRoute, ResourceKind,
+        flow_lock,
+    },
+    runtime::{
+        ActivationStatus, BoardPatch, EventPayload, FlowLockMode, LocalEventStore, NodeSpec,
+        Runtime, RuntimeState, StopContract, StopValidationError, preview_flow_routes,
+    },
 };
 
 fn node_with_contract(
@@ -28,6 +34,36 @@ fn effect_key(run_id: &str, activation_id: &str, effect_key: &str) -> (String, S
         activation_id.to_owned(),
         effect_key.to_owned(),
     )
+}
+
+fn route_preview_lock(routes: Vec<FlowRoute>) -> FlowLock {
+    let mut node_ids = vec!["root".to_string()];
+    for route in &routes {
+        if !node_ids.contains(&route.activate) {
+            node_ids.push(route.activate.clone());
+        }
+    }
+
+    flow_lock(
+        &FlowDraft {
+            nodes: node_ids
+                .into_iter()
+                .map(|id| FlowNode {
+                    id,
+                    ..FlowNode::default()
+                })
+                .collect(),
+            resources: vec![FlowResource {
+                id: "readme.main".into(),
+                kind: ResourceKind::Readme,
+                source: "inline:Preview local routes.".into(),
+            }],
+            routes,
+            ..FlowDraft::default()
+        },
+        FlowCheckMode::Core,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -434,6 +470,150 @@ fn validate_stop_requires_run_id_for_reused_activation_ids() {
             artifact_key: "brief".into(),
         })
     );
+}
+
+#[test]
+fn preview_flow_routes_returns_plan_without_appending_runtime_events() {
+    let lock = flow_lock(
+        &FlowDraft {
+            nodes: vec![
+                FlowNode {
+                    id: "root".into(),
+                    ..FlowNode::default()
+                },
+                FlowNode {
+                    id: "finish".into(),
+                    ..FlowNode::default()
+                },
+            ],
+            resources: vec![FlowResource {
+                id: "readme.main".into(),
+                kind: ResourceKind::Readme,
+                source: "inline:Preview local routes.".into(),
+            }],
+            routes: vec![FlowRoute {
+                predicate: "exists(artifact.ready)".into(),
+                for_each: None,
+                activate: "finish".into(),
+            }],
+            ..FlowDraft::default()
+        },
+        FlowCheckMode::Core,
+    )
+    .unwrap();
+    let mut runtime = Runtime::default();
+    runtime
+        .start_run("run-a", vec![NodeSpec::new("root")])
+        .unwrap();
+    runtime
+        .deliver_artifact("run-a", "root", "ready", "done")
+        .unwrap();
+    let event_count = runtime.events().len();
+
+    let routes = preview_flow_routes(runtime.state(), "run-a", &lock).unwrap();
+
+    assert_eq!(runtime.events().len(), event_count);
+    assert!(routes[0].matched);
+    assert_eq!(
+        routes[0].planned_activations[0].activation_id,
+        "finish".to_string()
+    );
+    assert!(
+        !runtime
+            .state()
+            .activations
+            .contains_key(&activation_key("run-a", "finish"))
+    );
+}
+
+#[test]
+fn preview_flow_routes_matches_artifact_and_board_keys_containing_event() {
+    let lock = route_preview_lock(vec![
+        FlowRoute {
+            predicate: "artifact.event.status".into(),
+            for_each: None,
+            activate: "artifact_target".into(),
+        },
+        FlowRoute {
+            predicate: "board.event.ready".into(),
+            for_each: None,
+            activate: "board_target".into(),
+        },
+    ]);
+    let mut runtime = Runtime::default();
+    runtime
+        .start_run("run-event-keys", vec![NodeSpec::new("root")])
+        .unwrap();
+    runtime
+        .deliver_artifact("run-event-keys", "root", "event.status", "ready")
+        .unwrap();
+    runtime
+        .patch_board(
+            "run-event-keys",
+            "root",
+            BoardPatch::new("event.ready", "true"),
+        )
+        .unwrap();
+
+    let routes = preview_flow_routes(runtime.state(), "run-event-keys", &lock).unwrap();
+
+    assert_eq!(routes.len(), 2);
+    assert!(routes[0].matched);
+    assert_eq!(routes[0].reason, None);
+    assert_eq!(
+        routes[0].planned_activations[0].activation_id,
+        "artifact_target"
+    );
+    assert!(routes[1].matched);
+    assert_eq!(routes[1].reason, None);
+    assert_eq!(
+        routes[1].planned_activations[0].activation_id,
+        "board_target"
+    );
+}
+
+#[test]
+fn preview_flow_routes_classifies_event_sources_without_matching_event_literals() {
+    let lock = route_preview_lock(vec![
+        FlowRoute {
+            predicate: "exists(event.review_requested)".into(),
+            for_each: None,
+            activate: "event_exists_target".into(),
+        },
+        FlowRoute {
+            predicate: "event.review_requested".into(),
+            for_each: None,
+            activate: "event_bare_target".into(),
+        },
+        FlowRoute {
+            predicate: "artifact.schema == 'event.v1'".into(),
+            for_each: None,
+            activate: "literal_target".into(),
+        },
+    ]);
+    let mut runtime = Runtime::default();
+    runtime
+        .start_run("run-event-source", vec![NodeSpec::new("root")])
+        .unwrap();
+    runtime
+        .deliver_artifact("run-event-source", "root", "schema", "event.v1")
+        .unwrap();
+
+    let routes = preview_flow_routes(runtime.state(), "run-event-source", &lock).unwrap();
+
+    assert_eq!(routes.len(), 3);
+    assert!(!routes[0].matched);
+    assert_eq!(
+        routes[0].reason.as_deref(),
+        Some("event fact source unavailable")
+    );
+    assert!(!routes[1].matched);
+    assert_eq!(
+        routes[1].reason.as_deref(),
+        Some("event fact source unavailable")
+    );
+    assert!(!routes[2].matched);
+    assert_eq!(routes[2].reason.as_deref(), Some("unsupported_predicate"));
 }
 
 #[test]

@@ -20,6 +20,7 @@ fn expected_tool_names() -> Vec<&'static str> {
         "send_message",
         "validate_stop",
         "apply_flow_lock",
+        "preview_flow_routes",
         "view_terminal",
         "view_snapshot",
         "view_browser",
@@ -62,6 +63,55 @@ fn fanout_from_artifact_schema_requires_runtime_arguments() {
     assert_eq!(schema["properties"]["forEach"]["type"], "string");
     assert_eq!(schema["properties"]["required_artifacts"]["type"], "array");
     assert_eq!(schema["properties"]["required_effects"]["type"], "array");
+}
+#[test]
+fn preview_flow_routes_schema_requires_only_run_id() {
+    let surface = McpSurface;
+    let descriptor = surface
+        .lookup("preview_flow_routes")
+        .expect("preview_flow_routes descriptor should be present");
+    let schema = descriptor.input_schema();
+
+    assert_eq!(schema["required"], json!(["run_id"]));
+    assert_eq!(schema["properties"]["run_id"]["type"], "string");
+    assert_eq!(schema["properties"]["flow_lock_id"]["type"], "string");
+    assert_eq!(schema["properties"]["flowLockId"]["type"], "string");
+    assert_eq!(schema["properties"]["lock_id"]["type"], "string");
+    assert_eq!(schema["properties"]["lockId"]["type"], "string");
+    assert_eq!(schema["properties"]["content_hash"]["type"], "string");
+    assert_eq!(schema["properties"]["contentHash"]["type"], "string");
+}
+#[test]
+fn runtime_tool_names_include_preview_flow_routes() {
+    let surface = McpSurface;
+    let names: Vec<_> = surface
+        .runtime_tools()
+        .iter()
+        .map(|tool| tool.name())
+        .collect();
+
+    assert!(names.contains(&"preview_flow_routes"));
+}
+#[test]
+fn tools_list_includes_preview_flow_routes_descriptor() {
+    let mut server = McpServer::new();
+
+    let response = server
+        .handle_json_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }))
+        .expect("tools/list should produce a response");
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "preview_flow_routes")
+    );
 }
 #[test]
 fn start_run_schema_requires_tmux_session_and_window_when_enabled() {

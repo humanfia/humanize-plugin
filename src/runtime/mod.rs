@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+mod route_preview;
+
+pub use route_preview::{PlannedActivationPreview, RoutePreview, preview_flow_routes};
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Event {
     pub sequence: u64,
