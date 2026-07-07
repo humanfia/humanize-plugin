@@ -62,6 +62,8 @@ loaded for that session. This does not write to `~/.codex/config.toml`.
 
 The local runtime maps tmux session to the host coding session, tmux window to a
 workflow run, and tmux pane to a node activation.
+The plugin refuses to use a tmux session named exactly `dev`; use a dedicated
+session such as `humanize-plugin-real-test` for local trials.
 
 ## Real Trial Prompt
 

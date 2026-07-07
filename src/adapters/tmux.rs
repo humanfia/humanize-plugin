@@ -28,6 +28,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
 
     pub fn ensure_session(&self, session_id: impl Into<String>) -> Result<TmuxSession, TmuxError> {
         let session = TmuxSession::new(session_id);
+        validate_session_id(session.id())?;
         let check = self
             .runner
             .run(argv(["tmux", "has-session", "-t"], [session.id()]))?;
@@ -55,6 +56,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         run_id: impl Into<String>,
         window_name: impl Into<String>,
     ) -> Result<TmuxWindow, TmuxError> {
+        validate_session_id(session.id())?;
         let run_id = run_id.into();
         let window_name = window_name.into();
         let output = self.run_checked(argv(
@@ -85,6 +87,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         window: &TmuxWindow,
         activation_id: impl Into<String>,
     ) -> Result<TmuxPane, TmuxError> {
+        validate_session_id(window.session_id())?;
         let activation_id = activation_id.into();
         let output = self.run_checked(argv(
             [
@@ -326,6 +329,9 @@ impl CommandRunner for SystemCommandRunner {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TmuxError {
     EmptyArgv,
+    ReservedSession {
+        session_id: String,
+    },
     EmptyOutput {
         field: &'static str,
     },
@@ -344,6 +350,9 @@ impl fmt::Display for TmuxError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyArgv => write!(formatter, "empty command argv"),
+            Self::ReservedSession { session_id } => {
+                write!(formatter, "tmux session named {session_id} is reserved")
+            }
             Self::EmptyOutput { field } => write!(formatter, "tmux did not return {field}"),
             Self::Io { argv, message } => write!(formatter, "{}: {message}", argv.join(" ")),
             Self::CommandFailed {
@@ -363,6 +372,16 @@ impl Error for TmuxError {}
 
 fn argv<const N: usize, const M: usize>(head: [&str; N], tail: [&str; M]) -> Vec<String> {
     head.into_iter().chain(tail).map(String::from).collect()
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), TmuxError> {
+    if session_id == "dev" {
+        Err(TmuxError::ReservedSession {
+            session_id: session_id.to_string(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn trimmed_stdout(output: &CommandOutput, field: &'static str) -> Result<String, TmuxError> {

@@ -558,6 +558,100 @@ fn start_run_creates_explicit_tmux_window_without_panes() {
 }
 
 #[test]
+fn start_run_rejects_reserved_dev_tmux_session_before_runner_calls() {
+    let runner = RecordingRunner::default();
+    let mut server = McpServer::with_tmux_runner(runner.clone());
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-dev",
+            "nodes": ["root"],
+            "tmux": {
+                "enabled": true,
+                "session": "dev",
+                "window": "audit-run"
+            }
+        }),
+    );
+
+    assert_eq!(started["error"]["code"], -32602);
+    assert!(
+        started["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("tmux session named dev is reserved")
+    );
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let context = call_tool(
+        &mut server,
+        2,
+        "get_context",
+        json!({
+            "run_id": "run-dev"
+        }),
+    );
+    assert_eq!(context["error"]["code"], -32602);
+}
+
+#[test]
+fn start_run_allows_dedicated_real_test_tmux_session() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success(""),
+        CommandOutput::success("%7\n"),
+    ]);
+    let mut server = McpServer::with_tmux_runner(runner.clone());
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-real-test",
+            "nodes": ["root"],
+            "tmux": {
+                "enabled": true,
+                "session": "humanize-plugin-real-test",
+                "window": "audit-run"
+            }
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(
+        runner.calls(),
+        vec![
+            vec!["tmux", "has-session", "-t", "humanize-plugin-real-test"],
+            vec![
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                "humanize-plugin-real-test",
+            ],
+            vec![
+                "tmux",
+                "new-window",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-t",
+                "humanize-plugin-real-test",
+                "-n",
+                "audit-run",
+            ],
+        ]
+        .into_iter()
+        .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn start_run_returns_error_when_tmux_creation_fails_without_starting_runtime() {
     let runner = RecordingRunner::with_outputs(vec![
         CommandOutput::failure("missing session"),
@@ -613,6 +707,110 @@ fn start_run_returns_error_when_tmux_creation_fails_without_starting_runtime() {
         .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
         .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn get_context_keeps_existing_runtime_context_fields() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-context",
+            "nodes": [
+                {
+                    "id": "root",
+                    "required_artifacts": ["brief"],
+                    "required_effects": ["shell"]
+                }
+            ]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+    call_tool(
+        &mut server,
+        2,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-context",
+            "activation_id": "root",
+            "artifact_key": "brief",
+            "payload": "ready"
+        }),
+    );
+    call_tool(
+        &mut server,
+        3,
+        "record_effect",
+        json!({
+            "run_id": "run-context",
+            "activation_id": "root",
+            "effect_key": "shell",
+            "payload": "ok"
+        }),
+    );
+    call_tool(
+        &mut server,
+        4,
+        "patch_board",
+        json!({
+            "run_id": "run-context",
+            "activation_id": "root",
+            "patch": {
+                "summary": "ready"
+            }
+        }),
+    );
+    call_tool(
+        &mut server,
+        5,
+        "send_message",
+        json!({
+            "run_id": "run-context",
+            "message": {
+                "role": "user",
+                "content": "hello"
+            }
+        }),
+    );
+
+    let context = call_tool(
+        &mut server,
+        6,
+        "get_context",
+        json!({
+            "run_id": "run-context"
+        }),
+    );
+    let context = structured(&context)["context"]
+        .as_object()
+        .expect("context should be an object");
+    let keys = context.keys().cloned().collect::<Vec<_>>();
+
+    assert_eq!(
+        keys,
+        vec![
+            "activation_ids",
+            "activations",
+            "artifacts",
+            "board",
+            "board_version",
+            "effects",
+            "flow_lock_applications",
+            "flow_lock_mode",
+            "latest_artifact_by_slot_index",
+            "latest_flow_lock_application",
+            "message_count",
+            "run_id",
+        ]
+    );
+    assert_eq!(context["run_id"], "run-context");
+    assert_eq!(context["activation_ids"], json!(["root"]));
+    assert_eq!(context["board_version"], 1);
+    assert_eq!(context["message_count"], 1);
+    assert_eq!(context["effects"]["root:shell"], "ok");
 }
 
 #[test]

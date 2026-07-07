@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Write};
 use crate::adapters::tmux::{CommandRunner, SystemCommandRunner, TmuxAdapter};
 use crate::flow;
 use crate::runtime::{self, BoardPatch, NodeSpec, Runtime, StopContract};
+use crate::view::VisualizationSnapshot;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -233,19 +234,21 @@ impl<R: CommandRunner> McpServer<R> {
                         },
                     ));
                 }
-                let context = self.state.runtime_context_json(run_id);
+                let snapshot = self.state.runtime_snapshot();
+                let context = snapshot
+                    .run(run_id)
+                    .expect("checked run should be present in view snapshot")
+                    .to_context_json();
                 Ok(ToolCallResult::ok(
                     json!({ "ok": true, "run_id": run_id, "context": context }),
                 ))
             }
             None => {
-                let runs = self
-                    .state
-                    .runtime
-                    .state()
+                let snapshot = self.state.runtime_snapshot();
+                let runs = snapshot
                     .runs
                     .iter()
-                    .map(|run_id| self.state.runtime_context_json(run_id))
+                    .map(|run| run.to_context_json())
                     .collect::<Vec<_>>();
                 Ok(ToolCallResult::ok(json!({ "ok": true, "runs": runs })))
             }
@@ -581,96 +584,15 @@ struct McpServerState {
 }
 
 impl McpServerState {
-    fn runtime_context_json(&self, run_id: &str) -> Value {
-        let state = self.runtime.state();
-        let message_count = self.messages.get(run_id).map(Vec::len).unwrap_or(0);
-        let activations = state
-            .activations
-            .iter()
-            .filter(|((activation_run_id, _), _)| activation_run_id == run_id)
-            .map(|((_, activation_id), activation)| {
-                (
-                    activation_id.clone(),
-                    json!({
-                        "activation_id": activation.activation_id,
-                        "run_id": activation.run_id,
-                        "node_id": activation.node_id,
-                        "stable_key": activation.stable_key,
-                        "context": activation.context,
-                        "required_artifacts": activation.stop_contract.required_artifacts(),
-                        "required_effects": activation.stop_contract.required_effects(),
-                        "flow_lock_mode": activation.flow_lock_mode.map(flow_lock_mode_name)
-                    }),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let activation_ids = activations.keys().cloned().collect::<Vec<_>>();
-        let artifacts = state
-            .artifact_records
-            .iter()
-            .filter(|(_, artifact)| artifact.run_id == run_id)
-            .map(|(artifact_id, artifact)| {
-                (
-                    artifact_id.clone(),
-                    json!({
-                        "artifact_id": artifact.artifact_id,
-                        "run_id": artifact.run_id,
-                        "activation_id": artifact.activation_id,
-                        "artifact_key": artifact.artifact_key,
-                        "content_hash": artifact.content_hash,
-                        "payload": artifact.payload,
-                        "event_sequence": artifact.event_sequence
-                    }),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let latest_artifact_by_slot_index = state
-            .latest_artifact_by_slot_index
-            .iter()
-            .filter(|((slot_run_id, _), _)| slot_run_id == run_id)
-            .map(|((_, artifact_key), artifact_id)| (artifact_key.clone(), artifact_id.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let effects = state
-            .effects
-            .iter()
-            .filter(|((effect_run_id, _, _), _)| effect_run_id == run_id)
-            .map(|((_, activation_id, effect_key), payload)| {
-                (format!("{activation_id}:{effect_key}"), payload.clone())
-            })
-            .collect::<BTreeMap<_, _>>();
-        let flow_lock_applications = state
-            .flow_lock_applications
-            .iter()
-            .filter(|(_, application)| application.run_id == run_id)
-            .map(|(application_id, application)| {
-                (
-                    application_id.clone(),
-                    json!({
-                        "application_id": application.application_id,
-                        "run_id": application.run_id,
-                        "mode": flow_lock_mode_name(application.mode),
-                        "lock_id": application.lock_id,
-                        "content_hash": application.content_hash,
-                        "event_sequence": application.event_sequence
-                    }),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+    fn runtime_snapshot(&self) -> VisualizationSnapshot {
+        VisualizationSnapshot::from_runtime(self.runtime.state(), &self.message_counts())
+    }
 
-        json!({
-            "run_id": run_id,
-            "activation_ids": activation_ids,
-            "activations": activations,
-            "artifacts": artifacts,
-            "latest_artifact_by_slot_index": latest_artifact_by_slot_index,
-            "effects": effects,
-            "board": state.boards.get(run_id).cloned().unwrap_or_default(),
-            "board_version": state.board_versions.get(run_id).copied().unwrap_or(0),
-            "message_count": message_count,
-            "flow_lock_mode": state.flow_lock_mode_by_run.get(run_id).copied().map(flow_lock_mode_name),
-            "latest_flow_lock_application": state.latest_flow_lock_application_by_run.get(run_id),
-            "flow_lock_applications": flow_lock_applications
-        })
+    fn message_counts(&self) -> BTreeMap<String, usize> {
+        self.messages
+            .iter()
+            .map(|(run_id, messages)| (run_id.clone(), messages.len()))
+            .collect()
     }
 }
 
