@@ -44,6 +44,21 @@ After `cargo build`, the binary can also be called directly:
 target/debug/humanize-plugin-mcp --list-tools
 ```
 
+## Client Config Snippets
+
+The MCP binary can print copyable client setup snippets without changing any
+client configuration files:
+
+```bash
+cargo run --bin humanize-plugin-mcp -- \
+  --print-client-config codex-session \
+  --command "$PWD/target/debug/humanize-plugin-mcp"
+```
+
+Supported targets are `codex-session`, `codex-persistent`, `claude-project`,
+and `claude-session-json`. The helper only prints the requested snippet to
+stdout; installation and any persistent config edits remain manual.
+
 ## Local MCP Trial
 
 For a session-scoped Codex CLI trial, build the binary first and pass the MCP

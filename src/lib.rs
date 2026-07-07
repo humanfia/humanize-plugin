@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod client_config;
 pub mod flow;
 pub mod kernel;
 pub mod mcp;
