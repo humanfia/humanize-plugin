@@ -2,20 +2,65 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+mod driver;
 mod route_preview;
 
+pub use driver::{
+    ControlCommand, DriverRender, DriverState, DriverTickInput, DriverTickReport, LoopBudget,
+    RunCompletionMode, TickBudget,
+};
 pub use route_preview::{PlannedActivationPreview, RoutePreview, preview_flow_routes};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Event {
     pub sequence: u64,
+    pub source: EventSource,
+    pub kind: EventKind,
+    pub strength: EventStrength,
+    pub actor: Option<String>,
+    pub correlation: Option<String>,
     pub payload: EventPayload,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct EventSource {
+    pub run_id: Option<String>,
+    pub activation_id: Option<String>,
+    pub source_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EventKind {
+    ActivationStatusChanged,
+    ArtifactDelivered,
+    BoardPatched,
+    EffectRecorded,
+    FlowApplied,
+    FlowUpdate,
+    NodeActivated,
+    RunStarted,
+    RunStatusChanged,
+    StopDecision,
+    StopObserved,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EventStrength {
+    Applied,
+    Checked,
+    Decision,
+    Observed,
+    Proposed,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EventPayload {
     RunStarted {
         run_id: String,
+    },
+    RunStatusChanged {
+        run_id: String,
+        status: RunStatus,
     },
     NodeActivated {
         run_id: String,
@@ -25,6 +70,13 @@ pub enum EventPayload {
         context: BTreeMap<String, String>,
         stop_contract: StopContract,
         flow_lock_mode: Option<FlowLockMode>,
+        flow_lock_id: Option<String>,
+        contract_hash: Option<String>,
+    },
+    ActivationStatusChanged {
+        run_id: String,
+        activation_id: String,
+        status: ActivationStatus,
     },
     ArtifactDelivered {
         run_id: String,
@@ -41,6 +93,16 @@ pub enum EventPayload {
         value: String,
         version: u64,
     },
+    StopObserved {
+        run_id: String,
+        activation_id: String,
+        observation: StopObservation,
+    },
+    StopDecision {
+        run_id: String,
+        activation_id: String,
+        decision: StopDecision,
+    },
     EffectRecorded {
         run_id: String,
         activation_id: String,
@@ -53,12 +115,189 @@ pub enum EventPayload {
         lock_id: String,
         content_hash: String,
     },
+    FlowUpdate {
+        run_id: String,
+        status: FlowUpdateStatus,
+        mode: FlowLockMode,
+        lock_id: String,
+        contract_hash: String,
+    },
+}
+
+impl EventPayload {
+    fn source(&self) -> EventSource {
+        match self {
+            EventPayload::RunStarted { run_id }
+            | EventPayload::RunStatusChanged { run_id, .. }
+            | EventPayload::FlowApplied { run_id, .. }
+            | EventPayload::FlowUpdate { run_id, .. } => EventSource {
+                run_id: Some(run_id.clone()),
+                activation_id: None,
+                source_id: None,
+            },
+            EventPayload::NodeActivated {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::ActivationStatusChanged {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::ArtifactDelivered {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::BoardPatched {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::StopObserved {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::StopDecision {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::EffectRecorded {
+                run_id,
+                activation_id,
+                ..
+            } => EventSource {
+                run_id: Some(run_id.clone()),
+                activation_id: Some(activation_id.clone()),
+                source_id: None,
+            },
+        }
+    }
+
+    fn kind(&self) -> EventKind {
+        match self {
+            EventPayload::RunStarted { .. } => EventKind::RunStarted,
+            EventPayload::RunStatusChanged { .. } => EventKind::RunStatusChanged,
+            EventPayload::NodeActivated { .. } => EventKind::NodeActivated,
+            EventPayload::ActivationStatusChanged { .. } => EventKind::ActivationStatusChanged,
+            EventPayload::ArtifactDelivered { .. } => EventKind::ArtifactDelivered,
+            EventPayload::BoardPatched { .. } => EventKind::BoardPatched,
+            EventPayload::StopObserved { .. } => EventKind::StopObserved,
+            EventPayload::StopDecision { .. } => EventKind::StopDecision,
+            EventPayload::EffectRecorded { .. } => EventKind::EffectRecorded,
+            EventPayload::FlowApplied { .. } => EventKind::FlowApplied,
+            EventPayload::FlowUpdate { .. } => EventKind::FlowUpdate,
+        }
+    }
+
+    fn strength(&self) -> EventStrength {
+        match self {
+            EventPayload::StopObserved { .. } => EventStrength::Observed,
+            EventPayload::StopDecision { .. } => EventStrength::Decision,
+            EventPayload::FlowUpdate { status, .. } => match status {
+                FlowUpdateStatus::Proposed => EventStrength::Proposed,
+                FlowUpdateStatus::Checked => EventStrength::Checked,
+                FlowUpdateStatus::Applied => EventStrength::Applied,
+            },
+            _ => EventStrength::Applied,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FlowLockMode {
     FutureActivations,
     CheckpointRestart,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FlowUpdateStatus {
+    Proposed,
+    Checked,
+    Applied,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StopObservation {
+    pub reason: String,
+}
+
+impl StopObservation {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum StopDecisionKind {
+    Allow,
+    Deny,
+    Block,
+    Yield,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StopDecision {
+    pub kind: StopDecisionKind,
+    pub attempt: u32,
+    pub missing_artifacts: Vec<String>,
+    pub missing_effects: Vec<String>,
+    pub reason: Option<String>,
+}
+
+impl StopDecision {
+    pub fn allow(attempt: u32) -> Self {
+        Self {
+            kind: StopDecisionKind::Allow,
+            attempt,
+            missing_artifacts: Vec::new(),
+            missing_effects: Vec::new(),
+            reason: None,
+        }
+    }
+
+    pub fn deny_until_limit(
+        attempt: u32,
+        missing_artifacts: Vec<String>,
+        missing_effects: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: StopDecisionKind::Deny,
+            attempt,
+            missing_artifacts,
+            missing_effects,
+            reason: Some("missing stop requirements".into()),
+        }
+    }
+
+    pub fn block(
+        attempt: u32,
+        missing_artifacts: Vec<String>,
+        missing_effects: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: StopDecisionKind::Block,
+            attempt,
+            missing_artifacts,
+            missing_effects,
+            reason: Some("stop validation limit reached".into()),
+        }
+    }
+
+    pub fn yield_now(attempt: u32, reason: impl Into<String>) -> Self {
+        Self {
+            kind: StopDecisionKind::Yield,
+            attempt,
+            missing_artifacts: Vec::new(),
+            missing_effects: Vec::new(),
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -70,6 +309,11 @@ impl LocalEventStore {
     pub fn append(&mut self, payload: EventPayload) -> Event {
         let event = Event {
             sequence: self.events.len() as u64 + 1,
+            source: payload.source(),
+            kind: payload.kind(),
+            strength: payload.strength(),
+            actor: Some("runtime".into()),
+            correlation: None,
             payload,
         };
         self.events.push(event.clone());
@@ -163,10 +407,32 @@ impl StopContract {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RunStatus {
+    #[default]
+    PendingReview,
+    Ready,
+    Running,
+    Paused,
+    Blocked,
+    Quiescent,
+    Completed,
+    Failed,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum ActivationStatus {
     #[default]
-    Active,
-    Stopped,
+    Pending,
+    Starting,
+    Running,
+    WaitingForStop,
+    ValidatingStop,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -179,6 +445,8 @@ pub struct Activation {
     pub context: BTreeMap<String, String>,
     pub stop_contract: StopContract,
     pub flow_lock_mode: Option<FlowLockMode>,
+    pub flow_lock_id: Option<String>,
+    pub contract_hash: Option<String>,
 }
 
 impl Default for Activation {
@@ -188,10 +456,12 @@ impl Default for Activation {
             run_id: String::new(),
             node_id: String::new(),
             stable_key: None,
-            status: ActivationStatus::Active,
+            status: ActivationStatus::Pending,
             context: BTreeMap::new(),
             stop_contract: StopContract::default(),
             flow_lock_mode: None,
+            flow_lock_id: None,
+            contract_hash: None,
         }
     }
 }
@@ -227,13 +497,19 @@ pub struct RuntimeState {
     pub boards: BTreeMap<String, BTreeMap<String, String>>,
     pub board_version: u64,
     pub board_versions: BTreeMap<String, u64>,
+    pub run_statuses: BTreeMap<String, RunStatus>,
     pub activations: BTreeMap<(String, String), Activation>,
     pub effects: BTreeMap<(String, String, String), String>,
+    pub stop_observations: BTreeMap<String, StopObservation>,
+    pub stop_decisions: BTreeMap<String, StopDecision>,
+    pub stop_validation_attempts: BTreeMap<(String, String), u32>,
     pub flow_lock_applications: BTreeMap<String, FlowLockApplication>,
     pub latest_flow_lock_application_index: Option<String>,
     pub latest_flow_lock_application_by_run: BTreeMap<String, String>,
     pub flow_lock_mode: Option<FlowLockMode>,
     pub flow_lock_mode_by_run: BTreeMap<String, FlowLockMode>,
+    pub flow_lock_id_by_run: BTreeMap<String, String>,
+    pub contract_hash_by_run: BTreeMap<String, String>,
 }
 
 impl RuntimeState {
@@ -252,6 +528,13 @@ impl RuntimeState {
                 self.runs.insert(run_id.clone());
                 self.boards.entry(run_id.clone()).or_default();
                 self.board_versions.entry(run_id.clone()).or_insert(0);
+                self.run_statuses
+                    .entry(run_id.clone())
+                    .or_insert(RunStatus::Ready);
+            }
+            EventPayload::RunStatusChanged { run_id, status } => {
+                self.runs.insert(run_id.clone());
+                self.run_statuses.insert(run_id.clone(), *status);
             }
             EventPayload::NodeActivated {
                 run_id,
@@ -261,6 +544,8 @@ impl RuntimeState {
                 context,
                 stop_contract,
                 flow_lock_mode,
+                flow_lock_id,
+                contract_hash,
             } => {
                 self.activations.insert(
                     activation_key(run_id, activation_id),
@@ -269,12 +554,26 @@ impl RuntimeState {
                         run_id: run_id.clone(),
                         node_id: node_id.clone(),
                         stable_key: stable_key.clone(),
-                        status: ActivationStatus::Active,
+                        status: ActivationStatus::Pending,
                         context: context.clone(),
                         stop_contract: stop_contract.clone(),
                         flow_lock_mode: *flow_lock_mode,
+                        flow_lock_id: flow_lock_id.clone(),
+                        contract_hash: contract_hash.clone(),
                     },
                 );
+            }
+            EventPayload::ActivationStatusChanged {
+                run_id,
+                activation_id,
+                status,
+            } => {
+                if let Some(activation) = self
+                    .activations
+                    .get_mut(&activation_key(run_id, activation_id))
+                {
+                    activation.status = *status;
+                }
             }
             EventPayload::ArtifactDelivered {
                 run_id,
@@ -331,31 +630,84 @@ impl RuntimeState {
                     payload.clone(),
                 );
             }
+            EventPayload::StopObserved {
+                run_id,
+                activation_id,
+                observation,
+            } => {
+                self.stop_observations.insert(
+                    stop_fact_id(run_id, activation_id, event.sequence),
+                    observation.clone(),
+                );
+            }
+            EventPayload::StopDecision {
+                run_id,
+                activation_id,
+                decision,
+            } => {
+                self.stop_decisions.insert(
+                    stop_fact_id(run_id, activation_id, event.sequence),
+                    decision.clone(),
+                );
+                if decision.attempt > 0 {
+                    self.stop_validation_attempts
+                        .insert(activation_key(run_id, activation_id), decision.attempt);
+                }
+            }
             EventPayload::FlowApplied {
                 run_id,
                 mode,
                 lock_id,
                 content_hash,
             } => {
-                let application_id = flow_lock_application_id(event.sequence);
-                self.flow_lock_applications.insert(
-                    application_id.clone(),
-                    FlowLockApplication {
-                        application_id: application_id.clone(),
-                        run_id: run_id.clone(),
-                        mode: *mode,
-                        lock_id: lock_id.clone(),
-                        content_hash: content_hash.clone(),
-                        event_sequence: event.sequence,
-                    },
-                );
-                self.latest_flow_lock_application_index = Some(application_id.clone());
-                self.latest_flow_lock_application_by_run
-                    .insert(run_id.clone(), application_id);
-                self.flow_lock_mode = Some(*mode);
-                self.flow_lock_mode_by_run.insert(run_id.clone(), *mode);
+                self.apply_flow_update(event.sequence, run_id, *mode, lock_id, content_hash);
             }
+            EventPayload::FlowUpdate {
+                run_id,
+                status: FlowUpdateStatus::Applied,
+                mode,
+                lock_id,
+                contract_hash,
+            } => {
+                self.apply_flow_update(event.sequence, run_id, *mode, lock_id, contract_hash);
+            }
+            EventPayload::FlowUpdate { .. } => {}
         }
+    }
+
+    pub fn run_status(&self, run_id: &str) -> Option<RunStatus> {
+        self.run_statuses.get(run_id).copied()
+    }
+
+    fn apply_flow_update(
+        &mut self,
+        event_sequence: u64,
+        run_id: &str,
+        mode: FlowLockMode,
+        lock_id: &str,
+        content_hash: &str,
+    ) {
+        let application_id = flow_lock_application_id(event_sequence);
+        self.flow_lock_applications.insert(
+            application_id.clone(),
+            FlowLockApplication {
+                application_id: application_id.clone(),
+                run_id: run_id.to_owned(),
+                mode,
+                lock_id: lock_id.to_owned(),
+                content_hash: content_hash.to_owned(),
+                event_sequence,
+            },
+        );
+        self.latest_flow_lock_application_index = Some(application_id.clone());
+        self.latest_flow_lock_application_by_run
+            .insert(run_id.to_owned(), application_id);
+        self.flow_lock_mode = Some(mode);
+        self.flow_lock_mode_by_run.insert(run_id.to_owned(), mode);
+        self.flow_lock_id_by_run
+            .insert(run_id.to_owned(), lock_id.to_owned());
+        self.contract_hash_by_run
+            .insert(run_id.to_owned(), content_hash.to_owned());
     }
 }
 
@@ -595,6 +947,33 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let run_id = run_id.into();
         self.require_run(&run_id)?;
+        let lock_id = lock_id.into();
+        let contract_hash = content_hash.into();
+        for status in [
+            FlowUpdateStatus::Proposed,
+            FlowUpdateStatus::Checked,
+            FlowUpdateStatus::Applied,
+        ] {
+            self.append(EventPayload::FlowUpdate {
+                run_id: run_id.clone(),
+                status,
+                mode,
+                lock_id: lock_id.clone(),
+                contract_hash: contract_hash.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn append_legacy_flow_applied(
+        &mut self,
+        run_id: impl Into<String>,
+        mode: FlowLockMode,
+        lock_id: impl Into<String>,
+        content_hash: impl Into<String>,
+    ) -> Result<(), RuntimeError> {
+        let run_id = run_id.into();
+        self.require_run(&run_id)?;
         self.append(EventPayload::FlowApplied {
             run_id,
             mode,
@@ -643,6 +1022,8 @@ impl Runtime {
             return Err(RuntimeError::DuplicateActivation { activation_id });
         }
         let flow_lock_mode = self.state.flow_lock_mode_by_run.get(&run_id).copied();
+        let flow_lock_id = self.state.flow_lock_id_by_run.get(&run_id).cloned();
+        let contract_hash = self.state.contract_hash_by_run.get(&run_id).cloned();
 
         self.append(EventPayload::NodeActivated {
             run_id,
@@ -652,6 +1033,8 @@ impl Runtime {
             context,
             stop_contract: node.stop_contract().clone(),
             flow_lock_mode,
+            flow_lock_id,
+            contract_hash,
         });
 
         Ok(activation_id)
@@ -870,6 +1253,10 @@ fn effect_index_key(
         activation_id.to_owned(),
         effect_key.to_owned(),
     )
+}
+
+fn stop_fact_id(run_id: &str, activation_id: &str, event_sequence: u64) -> String {
+    format!("{run_id}/{activation_id}/{event_sequence}")
 }
 
 fn artifact_id(event_sequence: u64) -> String {

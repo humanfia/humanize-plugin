@@ -1,114 +1,80 @@
 # humanize-plugin
 
-humanize-plugin is a local, MCP-first workflow runtime plugin written in Rust.
-It is intended to model workflow state with a small kernel while keeping
-execution concerns outside that kernel.
+Humanize turns terse local workflow requests into checked, reviewed, and
+runnable MCP flow packages.
 
-## Thesis
+## Install
 
-The kernel owns only six primitives: Node, Contract, Artifact, Board, Route,
-and Event. Flow authoring, runtime activation, adapters, profiles, views, and
-MCP transport are outer layers that depend on the kernel instead of becoming
-part of it.
-
-## v0 Boundaries
-
-- Runs on one local machine.
-- Uses Rust as the primary implementation language.
-- Exposes an MCP server entrypoint as the main local control surface.
-- Keeps flow authoring and checking separate from runtime execution.
-- Stores runtime events behind an event store boundary.
-- Maps tmux session to host coding session, window to workflow run, and pane to
-  node activation.
-- Does not include distributed execution, remote persistence, or cloud service
-  integration.
-
-## Local Build
-
-Run commands from this directory:
+Install the MCP runtime binary from GitHub:
 
 ```bash
-cargo build
-cargo test
+cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin humanize-plugin-mcp
 ```
 
-List the MCP tool descriptors exposed by the local binary:
+Add the marketplace and plugin to Codex:
 
 ```bash
-cargo run --bin humanize-plugin-mcp -- --list-tools
+codex plugin marketplace add humanfia/humanize-plugin
+codex plugin add humanize-plugin@humanfia
 ```
 
-After `cargo build`, the binary can also be called directly:
+Add the marketplace and plugin to Claude Code:
 
 ```bash
-target/debug/humanize-plugin-mcp --list-tools
+claude plugin marketplace add humanfia/humanize-plugin
+claude plugin install humanize-plugin@humanfia
 ```
 
-## Client Config Snippets
+## Start with natural language
 
-The MCP binary can print copyable client setup snippets without changing any
-client configuration files:
-
-```bash
-cargo run --bin humanize-plugin-mcp -- \
-  --print-client-config codex-session \
-  --command "$PWD/target/debug/humanize-plugin-mcp"
-```
-
-Supported targets are `codex-session`, `codex-persistent`, `claude-project`,
-and `claude-session-json`. The helper only prints the requested snippet to
-stdout; installation and any persistent config edits remain manual.
-
-## Local MCP Trial
-
-For a session-scoped Codex CLI trial, build the binary first and pass the MCP
-server configuration with `-c` overrides:
-
-```bash
-cargo build
-PLUGIN_MCP="$PWD/target/debug/humanize-plugin-mcp"
-codex -C "$PWD" \
-  -c "mcp_servers.humanize_plugin.command=\"$PLUGIN_MCP\"" \
-  -c 'mcp_servers.humanize_plugin.args=[]'
-```
-
-Inside the Codex TUI, use `/mcp` to confirm the `humanize_plugin` server is
-loaded for that session. This does not write to `~/.codex/config.toml`.
-
-The local runtime maps tmux session to the host coding session, tmux window to a
-workflow run, and tmux pane to a node activation.
-The plugin refuses to use a tmux session named exactly `dev`; use a dedicated
-session such as `humanize-plugin-real-test` for local trials.
-Real-test topology is reserved for `humanize-plugin-real-test`: one window per
-flow, one pane per project/tool lease, and explicit cleanup for panes, windows,
-and the session. The real-test allocator creates that dedicated session fresh
-when it has no owned session state; the ordinary MCP runtime path remains
-separate and uses the adapter boundary for host-session and window management.
-
-## Real Trial Prompt
-
-For a real trial, start with a terse natural-language request instead of a
-detailed MCP script:
+Use terse prompts that name Humanize or workflow:
 
 ```text
 Use Humanize to audit this C library without editing files.
+Use Humanize to split this refactor into a reviewed workflow and run it after I approve.
+Use workflow to package this task with a README, check it, lock it, review it, then run.
 ```
 
-A low-capability human-simulator can drive tmux with send/capture operations for
-realistic tests while additional panes are created only when a lease is needed.
+Humanize authoring normally starts with `flow_suggest`, then uses `flow_check`,
+`flow_lock`, `prepare_flow_review`, `approve_flow_review`, and `run_flow`.
 
-## v0 Limitations
+## Details
 
-- Runtime state is local and in-memory.
-- MCP authoring tools return minimal local responses suitable for smoke tests.
-- Flow locks model local check results and lock provenance, not a distributed
-  registry.
-- Flow application records lock id, content hash, run id, and application mode;
-  it does not migrate active work across machines.
-- Tmux integration is an adapter boundary, not a remote scheduler.
+- Requires Rust and Cargo for the runtime install.
+- Requires Codex or Claude Code with plugin support enabled.
+- Includes `.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json`,
+  `.claude-plugin/`, `.mcp.json`, and `skills/` metadata.
+- Keeps architecture and repository layout docs in `docs/architecture.md`.
 
-## Current Shape
+## Update Or Remove
 
-The repository starts as one Rust package in a Cargo workspace. The library
-crate defines the kernel, flow, runtime, MCP, and tmux adapter module
-boundaries. The binary crate is a minimal MCP entrypoint stub.
+```bash
+cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin humanize-plugin-mcp --force
+codex plugin marketplace upgrade humanfia
+codex plugin add humanize-plugin@humanfia
+claude plugin marketplace update humanfia
+claude plugin update humanize-plugin
+```
+
+```bash
+codex plugin remove humanize-plugin@humanfia
+codex plugin marketplace remove humanfia
+claude plugin uninstall humanize-plugin
+claude plugin marketplace remove humanfia
+cargo uninstall humanize-plugin
+```
+
+## Development Build
+
+```bash
+git clone https://github.com/humanfia/humanize-plugin
+cd humanize-plugin
+cargo build
+cargo test
+cargo run --bin humanize-plugin-mcp -- --list-tools
+```
+
+For local plugin packaging tests from a checkout, use the same commands with
+`"$PWD"` instead of `humanfia/humanize-plugin`.
+
+See `docs/architecture.md` for design boundaries and repository layout.

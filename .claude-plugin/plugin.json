@@ -1,0 +1,11 @@
+{
+  "name": "humanize-plugin",
+  "version": "0.1.0",
+  "description": "Claude Code plugin metadata for Humanize workflow MCP tools.",
+  "author": {
+    "name": "humanfia",
+    "url": "https://github.com/humanfia"
+  },
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/"
+}

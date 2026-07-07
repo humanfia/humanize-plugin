@@ -1,0 +1,19 @@
+{
+  "name": "humanfia",
+  "owner": {
+    "name": "humanfia",
+    "url": "https://github.com/humanfia"
+  },
+  "metadata": {
+    "description": "Claude Code plugin marketplace metadata for Humanize.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "humanize-plugin",
+      "source": "./",
+      "description": "Humanize workflow MCP tools for Claude Code.",
+      "version": "0.1.0"
+    }
+  ]
+}

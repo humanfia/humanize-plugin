@@ -1,12 +1,11 @@
 mod support;
 
-use humanize_plugin::adapters::tmux::CommandOutput;
 use humanize_plugin::mcp::McpServer;
 use serde_json::{Value, json};
 
 use support::mcp::{
-    RecordingRunner, assert_tool_error, call_tool, lock_flow, lock_valid_flow, readme_resource,
-    structured,
+    assert_tool_error, call_tool, lock_flow, lock_valid_flow, readme_resource, structured,
+    valid_flow,
 };
 
 fn flow_for_each_preview() -> Value {
@@ -68,257 +67,46 @@ fn flow_with_event_named_fact_routes() -> Value {
     })
 }
 
-fn flow_with_unsupported_routes() -> Value {
+fn flow_with_locked_root_contract() -> Value {
     json!({
         "nodes": [
-            { "id": "root" },
-            { "id": "event_target" },
-            { "id": "exists_event_target" },
-            { "id": "equality_target" }
+            { "id": "locked_root", "contract_id": "contract.locked_root" },
+            { "id": "locked_review", "contract_id": "contract.locked_review" }
         ],
-        "resources": [readme_resource()],
+        "contracts": [
+            {
+                "id": "contract.locked_root",
+                "completion": "all_artifacts",
+                "artifacts": [
+                    {
+                        "id": "brief",
+                        "schema_resource_id": "schema.brief"
+                    }
+                ]
+            },
+            {
+                "id": "contract.locked_review",
+                "completion": "manual",
+                "artifacts": []
+            }
+        ],
+        "resources": [
+            readme_resource(),
+            {
+                "id": "schema.brief",
+                "kind": "schema",
+                "source": "inline:brief"
+            }
+        ],
         "routes": [
             {
-                "predicate": "event.completed",
-                "activate": "event_target"
-            },
-            {
-                "predicate": "exists(event.review_requested)",
-                "activate": "exists_event_target"
-            },
-            {
-                "predicate": "artifact.schema == 'event.v1'",
-                "activate": "equality_target"
+                "predicate": "exists(artifact.brief)",
+                "activate": "locked_review"
             }
         ]
     })
 }
 
-#[test]
-fn start_run_reports_tmux_disabled_without_static_creation_claim() {
-    let mut server = McpServer::new();
-
-    let started = call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-tmux",
-            "nodes": ["root"]
-        }),
-    );
-
-    assert_eq!(structured(&started)["ok"], true);
-    assert_eq!(structured(&started)["tmux"]["enabled"], false);
-    assert_eq!(structured(&started)["tmux"]["created"], false);
-    assert!(structured(&started).get("tmux_mapping").is_none());
-}
-#[test]
-fn start_run_creates_explicit_tmux_window_without_panes() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::failure("missing session"),
-        CommandOutput::success(""),
-        CommandOutput::success("%9\n"),
-    ]);
-    let mut server = McpServer::with_tmux_runner(runner.clone());
-
-    let started = call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-tmux-created",
-            "nodes": ["root", "reviewer"],
-            "tmux": {
-                "enabled": true,
-                "session": "host-a",
-                "window": "audit-run"
-            }
-        }),
-    );
-
-    assert_eq!(structured(&started)["ok"], true);
-    assert_eq!(
-        structured(&started)["activation_ids"],
-        json!(["root", "reviewer"])
-    );
-    assert_eq!(structured(&started)["tmux"]["enabled"], true);
-    assert_eq!(structured(&started)["tmux"]["created"], true);
-    assert_eq!(structured(&started)["tmux"]["session_id"], "host-a");
-    assert_eq!(structured(&started)["tmux"]["window_id"], "%9");
-    assert_eq!(structured(&started)["tmux"]["window_name"], "audit-run");
-    assert_eq!(structured(&started)["tmux"]["run_id"], "run-tmux-created");
-    assert_eq!(
-        runner.calls(),
-        vec![
-            vec!["tmux", "has-session", "-t", "host-a"],
-            vec!["tmux", "new-session", "-d", "-s", "host-a"],
-            vec![
-                "tmux",
-                "new-window",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-t",
-                "host-a",
-                "-n",
-                "audit-run",
-            ],
-        ]
-        .into_iter()
-        .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
-        .collect::<Vec<_>>()
-    );
-}
-#[test]
-fn start_run_rejects_reserved_dev_tmux_session_before_runner_calls() {
-    let runner = RecordingRunner::default();
-    let mut server = McpServer::with_tmux_runner(runner.clone());
-
-    let started = call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-dev",
-            "nodes": ["root"],
-            "tmux": {
-                "enabled": true,
-                "session": "dev",
-                "window": "audit-run"
-            }
-        }),
-    );
-
-    assert_eq!(started["error"]["code"], -32602);
-    assert!(
-        started["error"]["message"]
-            .as_str()
-            .expect("error should include a message")
-            .contains("tmux session named dev is reserved")
-    );
-    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
-
-    let context = call_tool(
-        &mut server,
-        2,
-        "get_context",
-        json!({
-            "run_id": "run-dev"
-        }),
-    );
-    assert_eq!(context["error"]["code"], -32602);
-}
-#[test]
-fn start_run_allows_dedicated_real_test_tmux_session() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::failure("missing session"),
-        CommandOutput::success(""),
-        CommandOutput::success("%7\n"),
-    ]);
-    let mut server = McpServer::with_tmux_runner(runner.clone());
-
-    let started = call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-real-test",
-            "nodes": ["root"],
-            "tmux": {
-                "enabled": true,
-                "session": "humanize-plugin-real-test",
-                "window": "audit-run"
-            }
-        }),
-    );
-
-    assert_eq!(structured(&started)["ok"], true);
-    assert_eq!(
-        runner.calls(),
-        vec![
-            vec!["tmux", "has-session", "-t", "humanize-plugin-real-test"],
-            vec![
-                "tmux",
-                "new-session",
-                "-d",
-                "-s",
-                "humanize-plugin-real-test",
-            ],
-            vec![
-                "tmux",
-                "new-window",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-t",
-                "humanize-plugin-real-test",
-                "-n",
-                "audit-run",
-            ],
-        ]
-        .into_iter()
-        .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
-        .collect::<Vec<_>>()
-    );
-}
-#[test]
-fn start_run_returns_error_when_tmux_creation_fails_without_starting_runtime() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::failure("missing session"),
-        CommandOutput::failure("new-session failed"),
-    ]);
-    let mut server = McpServer::with_tmux_runner(runner.clone());
-
-    let started = call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-tmux-failed",
-            "nodes": ["root"],
-            "tmux": {
-                "enabled": true,
-                "session": "host-a",
-                "window": "audit-run"
-            }
-        }),
-    );
-
-    assert_eq!(started["error"]["code"], -32602);
-    assert!(
-        started["error"]["message"]
-            .as_str()
-            .expect("error should include a message")
-            .contains("tmux")
-    );
-
-    let context = call_tool(
-        &mut server,
-        2,
-        "get_context",
-        json!({
-            "run_id": "run-tmux-failed"
-        }),
-    );
-    assert_eq!(context["error"]["code"], -32602);
-    assert!(
-        context["error"]["message"]
-            .as_str()
-            .expect("error should include a message")
-            .contains("run-tmux-failed")
-    );
-    assert_eq!(
-        runner.calls(),
-        vec![
-            vec!["tmux", "has-session", "-t", "host-a"],
-            vec!["tmux", "new-session", "-d", "-s", "host-a"],
-        ]
-        .into_iter()
-        .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
-        .collect::<Vec<_>>()
-    );
-}
 #[test]
 fn get_context_keeps_existing_runtime_context_fields() {
     let mut server = McpServer::new();
@@ -397,31 +185,101 @@ fn get_context_keeps_existing_runtime_context_fields() {
     let context = structured(&context)["context"]
         .as_object()
         .expect("context should be an object");
-    let keys = context.keys().cloned().collect::<Vec<_>>();
-
-    assert_eq!(
-        keys,
-        vec![
-            "activation_ids",
-            "activations",
-            "artifacts",
-            "board",
-            "board_version",
-            "effects",
-            "flow_lock_applications",
-            "flow_lock_mode",
-            "latest_artifact_by_slot_index",
-            "latest_flow_lock_application",
-            "message_count",
-            "run_id",
-        ]
-    );
+    for key in [
+        "activation_ids",
+        "activations",
+        "artifacts",
+        "board",
+        "board_version",
+        "effects",
+        "flow_lock_applications",
+        "flow_lock_mode",
+        "latest_artifact_by_slot_index",
+        "latest_flow_lock_application",
+        "message_count",
+        "run_id",
+    ] {
+        assert!(
+            context.contains_key(key),
+            "context should retain existing field {key}"
+        );
+    }
+    for key in [
+        "event_timeline",
+        "last_decision",
+        "pane_mappings",
+        "run_status",
+        "runtime_budgets",
+        "why",
+    ] {
+        assert!(
+            context.contains_key(key),
+            "context should expose runtime view field {key}"
+        );
+    }
     assert_eq!(context["run_id"], "run-context");
     assert_eq!(context["activation_ids"], json!(["root"]));
     assert_eq!(context["board_version"], 1);
     assert_eq!(context["message_count"], 1);
     assert_eq!(context["effects"]["root:shell"], "ok");
 }
+
+#[test]
+fn get_context_includes_stop_contract_summary() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "run_flow",
+        json!({
+            "runId": "run-context-stop-summary",
+            "nodes": [
+                {
+                    "id": "root",
+                    "required_artifacts": ["brief"],
+                    "required_effects": ["shell"]
+                }
+            ]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let status = call_tool(
+        &mut server,
+        2,
+        "run_status",
+        json!({
+            "runId": "run-context-stop-summary"
+        }),
+    );
+    assert_eq!(
+        structured(&status)["context"]["missing_stop_contract_count"],
+        2
+    );
+    assert_eq!(
+        structured(&status)["context"]["missing_stop_contracts"]["root"],
+        json!(["artifact:brief", "effect:shell"])
+    );
+
+    let context = call_tool(
+        &mut server,
+        3,
+        "get_context",
+        json!({
+            "runId": "run-context-stop-summary"
+        }),
+    );
+    assert_eq!(
+        structured(&context)["context"]["missing_stop_contract_count"],
+        structured(&status)["context"]["missing_stop_contract_count"]
+    );
+    assert_eq!(
+        structured(&context)["context"]["missing_stop_contracts"],
+        structured(&status)["context"]["missing_stop_contracts"]
+    );
+}
+
 #[test]
 fn mcp_rejects_cross_run_deliver_and_validate_stop() {
     let mut server = McpServer::new();
@@ -547,6 +405,581 @@ fn validate_stop_uses_activation_contract_before_and_after_artifact_delivery() {
     );
     assert_eq!(structured(&allowed)["valid"], true);
     assert_eq!(structured(&allowed)["missing"], json!([]));
+}
+
+#[test]
+fn run_flow_requires_prepared_review_when_review_is_required() {
+    let mut server = McpServer::new();
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+
+    let blocked = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-review-gated",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": true,
+            "nodes": ["root"]
+        }),
+    );
+
+    assert_tool_error(&blocked);
+    assert_eq!(structured(&blocked)["ok"], false);
+    assert_eq!(structured(&blocked)["error"], "flow review required");
+    assert_eq!(structured(&blocked)["next_tool"], "prepare_flow_review");
+    assert_eq!(
+        structured(&blocked)["after_next_tool"],
+        "approve_flow_review"
+    );
+}
+
+#[test]
+fn run_flow_starts_reviewed_run_and_exposes_status_and_cause() {
+    let mut server = McpServer::new();
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, flow_with_locked_root_contract());
+    let prepared = call_tool(
+        &mut server,
+        2,
+        "prepare_flow_review",
+        json!({
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(structured(&prepared)["ok"], true);
+    let review_id = structured(&prepared)["review_id"]
+        .as_str()
+        .expect("review should include id");
+    let approved = call_tool(
+        &mut server,
+        3,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "approved"
+        }),
+    );
+    assert_eq!(structured(&approved)["review_status"], "approved");
+
+    let started = call_tool(
+        &mut server,
+        4,
+        "run_flow",
+        json!({
+            "run_id": "run-reviewed",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": true
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(structured(&started)["run_id"], "run-reviewed");
+    assert_eq!(structured(&started)["run_status"], "running");
+    assert_eq!(structured(&started)["flow_lock_id"], lock_id);
+
+    let status = call_tool(
+        &mut server,
+        5,
+        "run_status",
+        json!({
+            "run_id": "run-reviewed"
+        }),
+    );
+    assert_eq!(structured(&status)["ok"], true);
+    assert_eq!(structured(&status)["run_status"], "running");
+    assert_eq!(
+        structured(&status)["context"]["activation_ids"],
+        json!(["locked_root"])
+    );
+    assert_eq!(
+        structured(&status)["context"]["missing_stop_contracts"]["locked_root"],
+        json!(["artifact:brief"])
+    );
+    let activation = &structured(&status)["context"]["activations"]["locked_root"];
+    assert_eq!(activation["status"], "running");
+    assert_eq!(activation["flow_lock_mode"], "future_activations");
+    assert_eq!(activation["flow_lock_id"], lock_id);
+    assert_eq!(activation["contract_hash"], content_hash);
+
+    let why = call_tool(
+        &mut server,
+        6,
+        "run_why",
+        json!({
+            "run_id": "run-reviewed"
+        }),
+    );
+    assert_eq!(structured(&why)["ok"], true);
+    assert_eq!(structured(&why)["cause"], "missing stop requirements");
+}
+
+#[test]
+fn run_flow_uses_locked_draft_nodes_and_contracts_when_lock_supplied() {
+    let mut server = McpServer::new();
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, flow_with_locked_root_contract());
+    let prepared = call_tool(
+        &mut server,
+        2,
+        "prepare_flow_review",
+        json!({
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(structured(&prepared)["ok"], true);
+    let review_id = structured(&prepared)["review_id"]
+        .as_str()
+        .expect("review should include id");
+    let approved = call_tool(
+        &mut server,
+        3,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "approved"
+        }),
+    );
+    assert_eq!(structured(&approved)["review_status"], "approved");
+
+    let started = call_tool(
+        &mut server,
+        4,
+        "run_flow",
+        json!({
+            "run_id": "run-locked-nodes",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": true,
+            "nodes": [
+                {
+                    "id": "unrelated",
+                    "required_artifacts": ["intruder"]
+                }
+            ]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(
+        structured(&started)["activation_ids"],
+        json!(["locked_root"])
+    );
+
+    let status = call_tool(
+        &mut server,
+        5,
+        "run_status",
+        json!({
+            "run_id": "run-locked-nodes"
+        }),
+    );
+    assert_eq!(
+        structured(&status)["context"]["activation_ids"],
+        json!(["locked_root"])
+    );
+    assert_eq!(
+        structured(&status)["context"]["missing_stop_contracts"]["locked_root"],
+        json!(["artifact:brief"])
+    );
+    let activation = &structured(&status)["context"]["activations"]["locked_root"];
+    assert_eq!(activation["status"], "running");
+    assert_eq!(activation["flow_lock_mode"], "future_activations");
+    assert_eq!(activation["flow_lock_id"], lock_id);
+    assert_eq!(activation["contract_hash"], content_hash);
+    assert!(
+        structured(&status)["context"]["missing_stop_contracts"]
+            .get("unrelated")
+            .is_none()
+    );
+}
+
+#[test]
+fn pause_resume_and_stop_run_use_runtime_control_statuses() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "run_flow",
+        json!({
+            "run_id": "run-control",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["run_status"], "running");
+
+    let paused = call_tool(
+        &mut server,
+        2,
+        "pause_run",
+        json!({
+            "run_id": "run-control"
+        }),
+    );
+    assert_eq!(structured(&paused)["ok"], true);
+    assert_eq!(structured(&paused)["run_status"], "paused");
+
+    let resumed = call_tool(
+        &mut server,
+        3,
+        "resume_run",
+        json!({
+            "run_id": "run-control"
+        }),
+    );
+    assert_eq!(structured(&resumed)["ok"], true);
+    assert_eq!(structured(&resumed)["run_status"], "running");
+
+    let stopped = call_tool(
+        &mut server,
+        4,
+        "stop_run",
+        json!({
+            "run_id": "run-control"
+        }),
+    );
+    assert_eq!(structured(&stopped)["ok"], true);
+    assert_eq!(structured(&stopped)["run_status"], "stopped");
+}
+
+#[test]
+fn observe_stop_records_observation_and_advances_driver() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "run_flow",
+        json!({
+            "run_id": "run-observed-stop",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["run_status"], "running");
+
+    let observed = call_tool(
+        &mut server,
+        2,
+        "observe_stop",
+        json!({
+            "run_id": "run-observed-stop",
+            "activation_id": "root",
+            "reason": "pane exited"
+        }),
+    );
+
+    assert_eq!(structured(&observed)["ok"], true);
+    assert_eq!(structured(&observed)["run_id"], "run-observed-stop");
+    assert_eq!(structured(&observed)["activation_id"], "root");
+    assert_eq!(structured(&observed)["run_status"], "completed");
+    assert_eq!(
+        structured(&observed)["stop_decisions"],
+        json!([
+            {
+                "activation_id": "root",
+                "decision": "allow",
+                "attempt": 1,
+                "reason": null,
+                "missing": []
+            }
+        ])
+    );
+
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": "run-observed-stop"
+        }),
+    );
+    assert_eq!(structured(&status)["run_status"], "completed");
+}
+
+#[test]
+fn mcp_locked_flow_routes_activate_after_stop_observation() {
+    let mut server = McpServer::new();
+    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
+    let prepared = call_tool(
+        &mut server,
+        2,
+        "prepare_flow_review",
+        json!({
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(structured(&prepared)["ok"], true);
+    let review_id = structured(&prepared)["review_id"]
+        .as_str()
+        .expect("review should include id");
+    let approved = call_tool(
+        &mut server,
+        3,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "approved"
+        }),
+    );
+    assert_eq!(structured(&approved)["review_status"], "approved");
+
+    let started = call_tool(
+        &mut server,
+        4,
+        "run_flow",
+        json!({
+            "run_id": "run-mcp-routed",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": true
+        }),
+    );
+    assert_eq!(structured(&started)["activation_ids"], json!(["root"]));
+
+    let delivered = call_tool(
+        &mut server,
+        5,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-mcp-routed",
+            "activation_id": "root",
+            "artifact_key": "ready",
+            "payload": "true"
+        }),
+    );
+    assert_eq!(structured(&delivered)["ok"], true);
+
+    let observed = call_tool(
+        &mut server,
+        6,
+        "observe_stop",
+        json!({
+            "run_id": "run-mcp-routed",
+            "activation_id": "root",
+            "reason": "pane exited"
+        }),
+    );
+    assert_eq!(structured(&observed)["ok"], true);
+    assert_eq!(structured(&observed)["run_status"], "running");
+
+    let status = call_tool(
+        &mut server,
+        7,
+        "run_status",
+        json!({
+            "run_id": "run-mcp-routed"
+        }),
+    );
+    assert_eq!(
+        structured(&status)["context"]["activation_ids"],
+        json!(["finish", "root"])
+    );
+    assert_eq!(
+        structured(&status)["context"]["activations"]["finish"]["status"],
+        "running"
+    );
+}
+
+#[test]
+fn apply_flow_update_records_runtime_application() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-update",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let proposed = call_tool(
+        &mut server,
+        2,
+        "propose_flow_update",
+        json!({
+            "flow": valid_flow(),
+            "apply_mode": "checkpoint_restart",
+            "summary": "Switch to locked update flow."
+        }),
+    );
+    assert_eq!(structured(&proposed)["ok"], true);
+    let lock_id = structured(&proposed)["flow_lock_id"]
+        .as_str()
+        .expect("proposal should include lock")
+        .to_string();
+    let content_hash = structured(&proposed)["content_hash"]
+        .as_str()
+        .expect("proposal should include hash")
+        .to_string();
+    let prepared = call_tool(
+        &mut server,
+        3,
+        "prepare_flow_review",
+        json!({
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(structured(&prepared)["ok"], true);
+    let review_id = structured(&prepared)["review_id"]
+        .as_str()
+        .expect("review should include id");
+    let approved = call_tool(
+        &mut server,
+        4,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "approved"
+        }),
+    );
+    assert_eq!(structured(&approved)["review_status"], "approved");
+
+    let applied = call_tool(
+        &mut server,
+        5,
+        "apply_flow_update",
+        json!({
+            "run_id": "run-update",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(structured(&applied)["ok"], true);
+    assert_eq!(structured(&applied)["applied"], true);
+    assert_eq!(structured(&applied)["apply_mode"], "checkpoint_restart");
+
+    let status = call_tool(
+        &mut server,
+        6,
+        "run_status",
+        json!({
+            "run_id": "run-update"
+        }),
+    );
+    assert!(
+        structured(&status)["context"]["latest_flow_lock_application"]
+            .as_str()
+            .expect("application id should be present")
+            .starts_with("flow-lock-application:")
+    );
+}
+
+#[test]
+fn apply_flow_update_enforces_required_review_status() {
+    let mut server = McpServer::new();
+
+    let started = call_tool(
+        &mut server,
+        1,
+        "start_run",
+        json!({
+            "run_id": "run-update-review",
+            "nodes": ["root"]
+        }),
+    );
+    assert_eq!(structured(&started)["ok"], true);
+
+    let proposed = call_tool(
+        &mut server,
+        2,
+        "propose_flow_update",
+        json!({
+            "flow": valid_flow()
+        }),
+    );
+    assert_eq!(structured(&proposed)["ok"], true);
+    assert_eq!(structured(&proposed)["review_required"], true);
+    let lock_id = structured(&proposed)["flow_lock_id"]
+        .as_str()
+        .expect("proposal should include lock")
+        .to_string();
+    let content_hash = structured(&proposed)["content_hash"]
+        .as_str()
+        .expect("proposal should include hash")
+        .to_string();
+
+    let missing_review = call_tool(
+        &mut server,
+        3,
+        "apply_flow_update",
+        json!({
+            "run_id": "run-update-review",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(missing_review["result"]["isError"], true);
+    assert_eq!(structured(&missing_review)["ok"], false);
+    assert_eq!(structured(&missing_review)["review_status"], "missing");
+    assert_eq!(
+        structured(&missing_review)["error"],
+        "flow update review required"
+    );
+    assert_eq!(
+        structured(&missing_review)["next_tool"],
+        "prepare_flow_review"
+    );
+
+    let prepared = call_tool(
+        &mut server,
+        4,
+        "prepare_flow_review",
+        json!({
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(structured(&prepared)["review_status"], "pending");
+    let review_id = structured(&prepared)["review_id"]
+        .as_str()
+        .expect("review should include id");
+
+    let pending_review = call_tool(
+        &mut server,
+        5,
+        "apply_flow_update",
+        json!({
+            "run_id": "run-update-review",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(pending_review["result"]["isError"], true);
+    assert_eq!(structured(&pending_review)["review_status"], "pending");
+
+    let rejected = call_tool(
+        &mut server,
+        6,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "rejected"
+        }),
+    );
+    assert_eq!(structured(&rejected)["review_status"], "rejected");
+
+    let rejected_review = call_tool(
+        &mut server,
+        7,
+        "apply_flow_update",
+        json!({
+            "run_id": "run-update-review",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash
+        }),
+    );
+    assert_eq!(rejected_review["result"]["isError"], true);
+    assert_eq!(structured(&rejected_review)["review_status"], "rejected");
+    assert_eq!(
+        structured(&rejected_review)["error"],
+        "flow update review rejected"
+    );
 }
 
 #[test]
@@ -1101,62 +1534,6 @@ fn preview_flow_routes_matches_artifact_and_board_paths_containing_event() {
                 "stable_key": null
             }
         ])
-    );
-}
-
-#[test]
-fn preview_flow_routes_reports_event_and_unsupported_predicates_per_route() {
-    let mut server = McpServer::new();
-
-    let (lock_id, _) = lock_flow(&mut server, 1, flow_with_unsupported_routes());
-    let started = call_tool(
-        &mut server,
-        2,
-        "start_run",
-        json!({
-            "run_id": "run-preview-unsupported",
-            "nodes": ["root"]
-        }),
-    );
-    assert_eq!(structured(&started)["ok"], true);
-    let delivered = call_tool(
-        &mut server,
-        3,
-        "deliver_artifact",
-        json!({
-            "run_id": "run-preview-unsupported",
-            "activation_id": "root",
-            "artifact_key": "schema",
-            "payload": "x"
-        }),
-    );
-    assert_eq!(structured(&delivered)["ok"], true);
-
-    let preview = call_tool(
-        &mut server,
-        4,
-        "preview_flow_routes",
-        json!({
-            "run_id": "run-preview-unsupported",
-            "lock_id": lock_id
-        }),
-    );
-
-    assert_eq!(structured(&preview)["ok"], true);
-    assert_eq!(structured(&preview)["routes"][0]["matched"], false);
-    assert_eq!(
-        structured(&preview)["routes"][0]["reason"],
-        "event fact source unavailable"
-    );
-    assert_eq!(structured(&preview)["routes"][1]["matched"], false);
-    assert_eq!(
-        structured(&preview)["routes"][1]["reason"],
-        "event fact source unavailable"
-    );
-    assert_eq!(structured(&preview)["routes"][2]["matched"], false);
-    assert_eq!(
-        structured(&preview)["routes"][2]["reason"],
-        "unsupported_predicate"
     );
 }
 

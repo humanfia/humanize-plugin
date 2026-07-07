@@ -1,0 +1,38 @@
+{
+  "name": "humanize-plugin",
+  "version": "0.1.0",
+  "description": "Humanize workflow authoring and runtime tools for local MCP clients.",
+  "author": {
+    "name": "humanfia",
+    "url": "https://github.com/humanfia"
+  },
+  "homepage": "https://github.com/humanfia/humanize-plugin#readme",
+  "repository": "https://github.com/humanfia/humanize-plugin",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "humanize",
+    "workflow",
+    "mcp",
+    "runtime"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Humanize Plugin",
+    "shortDescription": "Author, check, review, and run Humanize flows.",
+    "longDescription": "Turn terse natural-language workflow requests into checked, locked, reviewed, and runnable Humanize flow packages.",
+    "developerName": "humanfia",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/humanfia/humanize-plugin",
+    "defaultPrompt": [
+      "Use Humanize to audit this repository.",
+      "Use workflow to prepare and run a reviewed flow.",
+      "Use Humanize to package this task with a README."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

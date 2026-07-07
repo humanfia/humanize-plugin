@@ -2,8 +2,15 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use humanize_plugin::adapters::hooks::{
+    DriverDecision, HookAction, StopHookInput, build_stop_hook_payload,
+};
+use humanize_plugin::adapters::lifecycle::{
+    AgentLifecycleAdapter, LifecycleCleanupAction, LifecycleStatus,
+};
 use humanize_plugin::adapters::tmux::{
-    CommandOutput, CommandRunner, TmuxAdapter, TmuxError, TmuxPane, TmuxSession, TmuxWindow,
+    CommandOutput, CommandRunner, TmuxActivationRequest, TmuxAdapter, TmuxError, TmuxPane,
+    TmuxSession, TmuxWindow,
 };
 
 #[derive(Clone, Default)]
@@ -36,6 +43,35 @@ fn argv(rows: Vec<Vec<&str>>) -> Vec<Vec<String>> {
     rows.into_iter()
         .map(|row| row.into_iter().map(String::from).collect())
         .collect()
+}
+
+fn assert_creation_path_rejects_session_name(session_id: &str, expected_error: &str) {
+    let runner = RecordingRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let err = adapter.ensure_session(session_id).unwrap_err();
+    assert_eq!(err.to_string(), expected_error);
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let runner = RecordingRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let err = adapter
+        .create_session_with_window_pane(session_id, "run-a", "window-a", "activation-a")
+        .unwrap_err();
+    assert_eq!(err.to_string(), expected_error);
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let runner = RecordingRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let err = adapter
+        .prepare_activation(TmuxActivationRequest::new(
+            session_id,
+            "run-a",
+            "window-a",
+            "activation-a",
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), expected_error);
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
 }
 
 #[test]
@@ -106,6 +142,21 @@ fn tmux_adapter_builds_argv_for_session_window_and_pane_mapping() {
         .map(|argv| argv.into_iter().map(String::from).collect::<Vec<_>>())
         .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn tmux_creation_rejects_empty_session_name_before_runner_calls() {
+    assert_creation_path_rejects_session_name("", "tmux session name must not be empty");
+}
+
+#[test]
+fn tmux_creation_rejects_ambiguous_session_names_before_runner_calls() {
+    for session_id in ["host:a", "host.a"] {
+        assert_creation_path_rejects_session_name(
+            session_id,
+            "tmux session name must not contain tmux target delimiters ':' or '.'",
+        );
+    }
 }
 
 #[test]
@@ -323,4 +374,283 @@ fn tmux_cleanup_reports_runner_failures_without_real_tmux() {
         runner.calls(),
         argv(vec![vec!["tmux", "kill-pane", "-t", "host-a:%1.%2"]])
     );
+}
+
+#[test]
+fn tmux_lifecycle_capabilities_advertise_tmux_observation_without_mcp_events() {
+    let adapter = TmuxAdapter::with_runner(RecordingRunner::default());
+
+    let capabilities = adapter.capabilities();
+
+    assert!(capabilities.interactive_pane);
+    assert!(!capabilities.mcp_tools);
+    assert!(!capabilities.mcp_artifact_delivery);
+    assert!(!capabilities.stop_hook);
+    assert!(!capabilities.tool_events);
+    assert!(!capabilities.permission_events);
+    assert!(!capabilities.notification_events);
+    assert!(!capabilities.jsonl_events);
+    assert!(!capabilities.session_resume);
+    assert!(capabilities.process_exit);
+    assert!(capabilities.tmux_observation);
+    assert!(!capabilities.structured_output);
+}
+
+#[test]
+fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activation() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\n"),
+        CommandOutput::success("%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("ready\n"),
+        CommandOutput::success(""),
+    ]);
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let request = TmuxActivationRequest::new("host-a", "run-a", "window-a", "activation-a");
+
+    let activation = adapter.prepare_activation(request).unwrap();
+    let handle = adapter
+        .start_agent(&activation, "humanize-plugin-mcp --stdio")
+        .unwrap();
+    adapter.send_prompt(&handle, "inspect the repo").unwrap();
+    let observation = adapter.observe_lifecycle(&handle).unwrap();
+    let cleanup = adapter
+        .cleanup_activation(&handle, LifecycleStatus::ContractSatisfied)
+        .unwrap();
+
+    assert_eq!(activation.metadata().session_id(), "host-a");
+    assert_eq!(activation.metadata().window_id(), "%7");
+    assert_eq!(activation.metadata().pane_id(), "%8");
+    assert_eq!(activation.metadata().run_id(), "run-a");
+    assert_eq!(activation.metadata().window_name(), "window-a");
+    assert_eq!(activation.metadata().activation_id(), "activation-a");
+    assert_eq!(handle.pane().id(), "%8");
+    assert_eq!(observation.captured_text(), "ready\n");
+    assert_eq!(cleanup.action(), LifecycleCleanupAction::KillPane);
+    assert_eq!(
+        runner.calls(),
+        argv(vec![
+            vec!["tmux", "has-session", "-t", "host-a"],
+            vec![
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                "host-a",
+                "-n",
+                "window-a",
+            ],
+            vec![
+                "tmux",
+                "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "host-a:%7",
+                "-v",
+            ],
+            vec![
+                "tmux",
+                "send-keys",
+                "-t",
+                "host-a:%7.%8",
+                "-l",
+                "humanize-plugin-mcp --stdio",
+            ],
+            vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
+            vec![
+                "tmux",
+                "send-keys",
+                "-t",
+                "host-a:%7.%8",
+                "-l",
+                "inspect the repo",
+            ],
+            vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
+            vec!["tmux", "capture-pane", "-p", "-t", "host-a:%7.%8"],
+            vec!["tmux", "kill-pane", "-t", "host-a:%7.%8"],
+        ])
+    );
+}
+
+#[test]
+fn tmux_lifecycle_rejects_reserved_dev_prepare_before_runner_calls() {
+    let runner = RecordingRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+
+    let err = adapter
+        .prepare_activation(TmuxActivationRequest::new(
+            "dev",
+            "run-a",
+            "window-a",
+            "activation-a",
+        ))
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        TmuxError::ReservedSession {
+            session_id: "dev".to_string()
+        }
+    );
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+}
+
+#[test]
+fn tmux_lifecycle_reuses_workflow_window_for_repeated_activations() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\n"),
+        CommandOutput::success("%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("window-a\t%7\n"),
+        CommandOutput::success("%9\n"),
+    ]);
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+
+    let first = adapter
+        .prepare_activation(TmuxActivationRequest::new(
+            "host-a",
+            "run-a",
+            "window-a",
+            "activation-a",
+        ))
+        .unwrap();
+    let second = adapter
+        .prepare_activation(TmuxActivationRequest::new(
+            "host-a",
+            "run-a",
+            "window-a",
+            "activation-b",
+        ))
+        .unwrap();
+
+    assert_eq!(first.metadata().window_id(), "%7");
+    assert_eq!(first.metadata().pane_id(), "%8");
+    assert_eq!(second.metadata().window_id(), "%7");
+    assert_eq!(second.metadata().pane_id(), "%9");
+    assert_eq!(
+        runner.calls(),
+        argv(vec![
+            vec!["tmux", "has-session", "-t", "host-a"],
+            vec![
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                "host-a",
+                "-n",
+                "window-a",
+            ],
+            vec![
+                "tmux",
+                "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "host-a:%7",
+                "-v",
+            ],
+            vec!["tmux", "has-session", "-t", "host-a"],
+            vec![
+                "tmux",
+                "list-windows",
+                "-t",
+                "host-a",
+                "-F",
+                "#{window_name}\t#{window_id}",
+            ],
+            vec![
+                "tmux",
+                "split-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "host-a:%7",
+                "-v",
+            ],
+        ])
+    );
+}
+
+#[test]
+fn tmux_lifecycle_preserves_blocked_or_failed_activation_by_default() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\n"),
+        CommandOutput::success("%8\n"),
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%9\n"),
+        CommandOutput::success("%10\n"),
+    ]);
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let blocked = adapter
+        .prepare_activation(TmuxActivationRequest::new(
+            "host-a",
+            "run-a",
+            "window-a",
+            "activation-a",
+        ))
+        .unwrap();
+    let failed = adapter
+        .prepare_activation(TmuxActivationRequest::new(
+            "host-b",
+            "run-b",
+            "window-b",
+            "activation-b",
+        ))
+        .unwrap();
+    let calls_after_allocation = runner.calls();
+
+    let blocked_cleanup = adapter
+        .cleanup_activation(&blocked.into_handle(), LifecycleStatus::Blocked)
+        .unwrap();
+    let failed_cleanup = adapter
+        .cleanup_activation(&failed.into_handle(), LifecycleStatus::Failed)
+        .unwrap();
+
+    assert_eq!(
+        blocked_cleanup.action(),
+        LifecycleCleanupAction::PreservePane
+    );
+    assert_eq!(
+        failed_cleanup.action(),
+        LifecycleCleanupAction::PreservePane
+    );
+    assert_eq!(runner.calls(), calls_after_allocation);
+}
+
+#[test]
+fn stop_hook_helper_maps_driver_decision_to_neutral_allow_and_block_payloads() {
+    let input = StopHookInput::new("session-a", "activation-a");
+
+    let allow = build_stop_hook_payload(&input, DriverDecision::Allow);
+    let block = build_stop_hook_payload(
+        &input,
+        DriverDecision::Block {
+            reason: "contract is not satisfied".to_string(),
+        },
+    );
+
+    assert_eq!(allow.action(), HookAction::Allow);
+    assert_eq!(allow.reason(), None);
+    assert_eq!(allow.session_id(), "session-a");
+    assert_eq!(allow.activation_id(), "activation-a");
+    assert_eq!(block.action(), HookAction::Block);
+    assert_eq!(block.reason(), Some("contract is not satisfied"));
+    assert_eq!(block.session_id(), "session-a");
+    assert_eq!(block.activation_id(), "activation-a");
 }

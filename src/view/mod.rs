@@ -10,6 +10,14 @@ use serde_json::{Value, json};
 
 use crate::runtime::{self, RuntimeState};
 
+mod review;
+
+pub use review::{
+    AdapterCapabilityReview, DiffEntry, FlowGraph, FlowGraphEdge, FlowGraphNode,
+    FlowReviewContract, FlowReviewNode, FlowReviewRoute, FlowReviewSnapshot, FlowValueFlow,
+    FlowVisualDiff, ReviewRisk, render_flow_review_document,
+};
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct VisualizationSnapshot {
     pub runs: Vec<RunSnapshot>,
@@ -29,11 +37,16 @@ impl VisualizationSnapshot {
     pub fn run(&self, run_id: &str) -> Option<&RunSnapshot> {
         self.runs.iter().find(|run| run.run_id == run_id)
     }
+
+    pub fn run_mut(&mut self, run_id: &str) -> Option<&mut RunSnapshot> {
+        self.runs.iter_mut().find(|run| run.run_id == run_id)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RunSnapshot {
     pub run_id: String,
+    pub run_status: String,
     pub activation_count: usize,
     pub artifact_count: usize,
     pub effect_count: usize,
@@ -50,6 +63,11 @@ pub struct RunSnapshot {
     pub latest_flow_lock_application: Option<String>,
     pub flow_lock_applications: BTreeMap<String, FlowLockApplicationSnapshot>,
     pub missing_stop_contracts: BTreeMap<String, Vec<String>>,
+    pub runtime_budgets: Vec<RuntimeBudgetSnapshot>,
+    pub pane_mappings: Vec<PaneMappingSnapshot>,
+    pub event_timeline: Vec<RuntimeEventSnapshot>,
+    pub last_decision: Option<RuntimeDecisionSnapshot>,
+    pub why: Option<String>,
 }
 
 impl RunSnapshot {
@@ -132,9 +150,24 @@ impl RunSnapshot {
             .collect::<BTreeMap<_, _>>();
         let missing_stop_contract_count =
             missing_stop_contracts.values().map(Vec::len).sum::<usize>();
+        let run_status = if activations
+            .values()
+            .any(|activation| activation.status == "running")
+        {
+            "running"
+        } else {
+            "stopped"
+        };
+        let run_status = state
+            .run_statuses
+            .get(run_id)
+            .copied()
+            .map(run_status_name)
+            .unwrap_or(run_status);
 
         Self {
             run_id: run_id.to_string(),
+            run_status: run_status.to_string(),
             activation_count: activations.len(),
             artifact_count: artifacts.len(),
             effect_count: effects.len(),
@@ -159,6 +192,11 @@ impl RunSnapshot {
                 .cloned(),
             flow_lock_applications,
             missing_stop_contracts,
+            runtime_budgets: Vec::new(),
+            pane_mappings: Vec::new(),
+            event_timeline: Vec::new(),
+            last_decision: None,
+            why: None,
         }
     }
 
@@ -183,9 +221,46 @@ impl RunSnapshot {
             "message_count": self.message_count,
             "flow_lock_mode": self.flow_lock_mode,
             "latest_flow_lock_application": self.latest_flow_lock_application,
-            "flow_lock_applications": self.flow_lock_applications
+            "flow_lock_applications": self.flow_lock_applications,
+            "missing_stop_contract_count": self.missing_stop_contract_count,
+            "missing_stop_contracts": self.missing_stop_contracts,
+            "run_status": self.run_status,
+            "runtime_budgets": self.runtime_budgets,
+            "pane_mappings": self.pane_mappings,
+            "event_timeline": self.event_timeline,
+            "last_decision": self.last_decision,
+            "why": self.why
         })
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RuntimeBudgetSnapshot {
+    pub name: String,
+    pub used: u64,
+    pub limit: u64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct PaneMappingSnapshot {
+    pub activation_id: String,
+    pub pane: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RuntimeEventSnapshot {
+    pub sequence: u64,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RuntimeDecisionSnapshot {
+    pub decision_id: String,
+    pub summary: String,
+    pub why: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -194,11 +269,15 @@ pub struct ActivationSnapshot {
     pub run_id: String,
     pub node_id: String,
     pub stable_key: Option<String>,
+    pub status: String,
     pub context: BTreeMap<String, String>,
     pub required_artifacts: Vec<String>,
     pub required_effects: Vec<String>,
     pub flow_lock_mode: Option<String>,
+    pub flow_lock_id: Option<String>,
+    pub contract_hash: Option<String>,
     pub missing_stop_contract: Vec<String>,
+    pub pane: Option<PaneMappingSnapshot>,
 }
 
 impl ActivationSnapshot {
@@ -212,6 +291,7 @@ impl ActivationSnapshot {
             run_id: activation.run_id.clone(),
             node_id: activation.node_id.clone(),
             stable_key: activation.stable_key.clone(),
+            status: activation_status_name(activation.status).to_string(),
             context: activation.context.clone(),
             required_artifacts,
             required_effects,
@@ -219,7 +299,10 @@ impl ActivationSnapshot {
                 .flow_lock_mode
                 .map(flow_lock_mode_name)
                 .map(str::to_string),
+            flow_lock_id: activation.flow_lock_id.clone(),
+            contract_hash: activation.contract_hash.clone(),
             missing_stop_contract,
+            pane: None,
         }
     }
 
@@ -229,10 +312,14 @@ impl ActivationSnapshot {
             "run_id": self.run_id,
             "node_id": self.node_id,
             "stable_key": self.stable_key,
+            "status": self.status,
             "context": self.context,
             "required_artifacts": self.required_artifacts,
             "required_effects": self.required_effects,
-            "flow_lock_mode": self.flow_lock_mode
+            "flow_lock_mode": self.flow_lock_mode,
+            "flow_lock_id": self.flow_lock_id,
+            "contract_hash": self.contract_hash,
+            "pane": self.pane
         })
     }
 }
@@ -264,18 +351,65 @@ pub fn render_terminal_dashboard(snapshot: &VisualizationSnapshot) -> String {
     writeln!(output, "runs {}", snapshot.runs.len()).expect("writing to a string should not fail");
 
     for run in &snapshot.runs {
+        let pane_count = if run.pane_mappings.is_empty() {
+            "none".to_string()
+        } else {
+            run.pane_mappings.len().to_string()
+        };
         writeln!(
             output,
-            "run {} | activations {} | board v{} | messages {} | artifacts {} | effects {} | missing {}",
+            "run {} | activations {} | board version {} | messages {} | artifacts {} | effects {} | missing {} | status {} | panes {}",
             run.run_id,
             run.activation_count,
             run.board_version,
             run.message_count,
             run.artifact_count,
             run.effect_count,
-            run.missing_stop_contract_count
+            run.missing_stop_contract_count,
+            run.run_status,
+            pane_count
         )
         .expect("writing to a string should not fail");
+
+        if let Some(why) = &run.why {
+            writeln!(output, "  why {why}").expect("writing to a string should not fail");
+        }
+
+        if let Some(decision) = &run.last_decision {
+            writeln!(
+                output,
+                "  last decision {} | {} | why {}",
+                decision.decision_id, decision.summary, decision.why
+            )
+            .expect("writing to a string should not fail");
+        }
+
+        for event in &run.event_timeline {
+            writeln!(
+                output,
+                "  event {} | {} | {}",
+                event.sequence, event.label, event.detail
+            )
+            .expect("writing to a string should not fail");
+        }
+
+        for pane in &run.pane_mappings {
+            writeln!(
+                output,
+                "  pane {} | {} | {}",
+                pane.activation_id, pane.pane, pane.status
+            )
+            .expect("writing to a string should not fail");
+        }
+
+        for budget in &run.runtime_budgets {
+            writeln!(
+                output,
+                "  budget {} | {}/{} {}",
+                budget.name, budget.used, budget.limit, budget.unit
+            )
+            .expect("writing to a string should not fail");
+        }
 
         for activation_id in &run.activation_ids {
             let activation = run
@@ -287,10 +421,15 @@ pub fn render_terminal_dashboard(snapshot: &VisualizationSnapshot) -> String {
             } else {
                 activation.missing_stop_contract.join(", ")
             };
+            let pane = activation
+                .pane
+                .as_ref()
+                .map(|pane| pane.pane.as_str())
+                .unwrap_or("none");
             writeln!(
                 output,
-                "  {} | node {} | missing {}",
-                activation.activation_id, activation.node_id, missing
+                "  {} | node {} | missing {} | status {} | pane {}",
+                activation.activation_id, activation.node_id, missing, activation.status, pane
             )
             .expect("writing to a string should not fail");
         }
@@ -453,11 +592,40 @@ fn flow_lock_mode_name(mode: runtime::FlowLockMode) -> &'static str {
     }
 }
 
-fn escape_script_json(json: &str) -> String {
+fn activation_status_name(status: runtime::ActivationStatus) -> &'static str {
+    match status {
+        runtime::ActivationStatus::Pending => "pending",
+        runtime::ActivationStatus::Starting => "starting",
+        runtime::ActivationStatus::Running => "running",
+        runtime::ActivationStatus::WaitingForStop => "waiting_for_stop",
+        runtime::ActivationStatus::ValidatingStop => "validating_stop",
+        runtime::ActivationStatus::Blocked => "blocked",
+        runtime::ActivationStatus::Completed => "completed",
+        runtime::ActivationStatus::Failed => "failed",
+        runtime::ActivationStatus::Cancelled => "cancelled",
+    }
+}
+
+fn run_status_name(status: runtime::RunStatus) -> &'static str {
+    match status {
+        runtime::RunStatus::PendingReview => "pending_review",
+        runtime::RunStatus::Ready => "ready",
+        runtime::RunStatus::Running => "running",
+        runtime::RunStatus::Paused => "paused",
+        runtime::RunStatus::Blocked => "blocked",
+        runtime::RunStatus::Quiescent => "quiescent",
+        runtime::RunStatus::Completed => "completed",
+        runtime::RunStatus::Failed => "failed",
+        runtime::RunStatus::Stopping => "stopping",
+        runtime::RunStatus::Stopped => "stopped",
+    }
+}
+
+pub(crate) fn escape_script_json(json: &str) -> String {
     json.replace("</", "<\\/")
 }
 
-fn escape_html(input: &str) -> String {
+pub(crate) fn escape_html(input: &str) -> String {
     input
         .replace('&', "&amp;")
         .replace('<', "&lt;")

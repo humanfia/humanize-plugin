@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+mod export;
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct FlowDraft {
     pub nodes: Vec<FlowNode>,
@@ -94,6 +96,57 @@ pub struct FlowPolicies {
     pub write_scopes: Vec<WriteScope>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterCapability {
+    pub node_id: String,
+    pub driver: NodeDriver,
+    pub requires: Vec<String>,
+    pub prefers: Vec<String>,
+    pub accepts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NodeContract {
+    pub node_id: String,
+    pub contract_id: Option<String>,
+    pub requires: Vec<String>,
+    pub prefers: Vec<String>,
+    pub accepts: Vec<String>,
+    pub completion_policy: CompletionPolicy,
+    pub artifact_requirements: Vec<ArtifactRequirement>,
+    pub effect_requirements: Vec<EffectRequirement>,
+    pub stop_gate: StopGate,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum CompletionPolicy {
+    #[default]
+    None,
+    Manual,
+    AllArtifacts,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ArtifactRequirement {
+    pub id: String,
+    pub schema_resource_id: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct EffectRequirement {
+    pub id: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum StopGate {
+    Required,
+    Preferred,
+    #[default]
+    None,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum WriteScope {
     Artifact(String),
@@ -112,16 +165,62 @@ pub enum FlowCheckMode {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Diagnostic {
     pub code: String,
+    pub domain: DiagnosticDomain,
     pub severity: Severity,
+    pub severity_level: DiagnosticSeverity,
+    pub repairability: Repairability,
     pub location: String,
     pub message: String,
     pub fix_hint: Option<String>,
+    pub why_it_matters: Option<String>,
+    pub repair_kinds: Vec<RepairKind>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum DiagnosticDomain {
+    Package,
+    Contract,
+    Resource,
+    Route,
+    Policy,
+    RuntimeCompat,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum DiagnosticSeverity {
+    Fatal,
+    Error,
+    Warning,
+    Note,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Severity {
     Error,
     Warning,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Repairability {
+    Automatic,
+    Candidate,
+    GuidanceOnly,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RepairKind {
+    RouteWhenToPredicate,
+    RouteToToActivate,
+    RouteArtifactObjectToExists,
+    RouteBareArtifactDeliveredToExists,
+    AddRouteTarget,
+    AddReadmeResource,
+    GenerateReadme,
+    AddArtifactSchema,
+    AddContractCompletion,
+    NarrowWriteScope,
+    ProvideRuntimeResource,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -132,9 +231,12 @@ pub struct CheckReport {
 
 impl CheckReport {
     pub fn has_errors(&self) -> bool {
-        self.diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == Severity::Error)
+        self.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.severity_level,
+                DiagnosticSeverity::Fatal | DiagnosticSeverity::Error
+            )
+        })
     }
 }
 
@@ -183,6 +285,50 @@ impl FlowLock {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FlowLockError {
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct FlowRepairInput {
+    pub draft: FlowDraft,
+    pub mode: FlowCheckMode,
+    pub route_authoring: Vec<RouteAuthoring>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RouteAuthoring {
+    pub when: Option<String>,
+    pub predicate: Option<RoutePredicateDraft>,
+    pub to: Option<String>,
+    pub activate: Option<String>,
+    pub for_each: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum RoutePredicateDraft {
+    Text(String),
+    Artifact(String),
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct FlowRepairReport {
+    pub diagnostics: Vec<Diagnostic>,
+    pub patches: Vec<FlowRepairPatch>,
+    pub candidates: Vec<FlowRepairCandidate>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FlowRepairPatch {
+    pub repair_kind: RepairKind,
+    pub location: String,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FlowRepairCandidate {
+    pub repair_kind: RepairKind,
+    pub location: String,
+    pub replacement: String,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -270,11 +416,199 @@ pub fn flow_suggest(input: FlowSuggestInput) -> Result<FlowDraft, FlowSuggestErr
     })
 }
 
+impl AdapterCapability {
+    pub fn from_action(node_id: impl Into<String>, action: &NodeAction) -> Self {
+        let (requires, prefers, accepts) = action_contract_fields(action);
+
+        Self {
+            node_id: node_id.into(),
+            driver: action.driver,
+            requires,
+            prefers,
+            accepts,
+        }
+    }
+
+    pub fn from_draft(draft: &FlowDraft) -> Vec<Self> {
+        draft
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                node.action
+                    .as_ref()
+                    .map(|action| Self::from_action(node.id.clone(), action))
+            })
+            .collect()
+    }
+}
+
+impl NodeContract {
+    pub fn from_draft(draft: &FlowDraft) -> Vec<Self> {
+        let contracts_by_id = draft
+            .contracts
+            .iter()
+            .map(|contract| (contract.id.as_str(), contract))
+            .collect::<HashMap<_, _>>();
+
+        draft
+            .nodes
+            .iter()
+            .map(|node| {
+                let contract = node
+                    .contract_id
+                    .as_deref()
+                    .and_then(|contract_id| contracts_by_id.get(contract_id).copied());
+                let (requires, prefers, accepts) = node
+                    .action
+                    .as_ref()
+                    .map(action_contract_fields)
+                    .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
+                let artifact_requirements = contract
+                    .map(|contract| {
+                        contract
+                            .artifacts
+                            .iter()
+                            .map(|artifact| ArtifactRequirement {
+                                id: artifact.id.clone(),
+                                schema_resource_id: artifact.schema_resource_id.clone(),
+                                required: true,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let completion_policy = contract
+                    .and_then(|contract| contract.completion.as_ref())
+                    .map(CompletionPolicy::from_contract_completion)
+                    .unwrap_or_default();
+                let stop_gate = match completion_policy {
+                    CompletionPolicy::AllArtifacts => StopGate::Required,
+                    CompletionPolicy::Manual => StopGate::Preferred,
+                    CompletionPolicy::None => StopGate::None,
+                };
+
+                Self {
+                    node_id: node.id.clone(),
+                    contract_id: node.contract_id.clone(),
+                    requires,
+                    prefers,
+                    accepts,
+                    completion_policy,
+                    artifact_requirements,
+                    effect_requirements: Vec::new(),
+                    stop_gate,
+                }
+            })
+            .collect()
+    }
+}
+
+impl CompletionPolicy {
+    fn from_contract_completion(completion: &ContractCompletion) -> Self {
+        match completion {
+            ContractCompletion::Manual => Self::Manual,
+            ContractCompletion::AllArtifacts => Self::AllArtifacts,
+        }
+    }
+}
+
+impl FlowRepairInput {
+    pub fn from_draft(draft: FlowDraft, mode: FlowCheckMode) -> Self {
+        Self {
+            draft,
+            mode,
+            route_authoring: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+pub fn flow_repair(input: &FlowRepairInput) -> FlowRepairReport {
+    let mut diagnostics = flow_check(&input.draft, input.mode).diagnostics;
+    diagnostics.extend(input.diagnostics.clone());
+
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity_level == DiagnosticSeverity::Fatal)
+    {
+        return FlowRepairReport {
+            diagnostics,
+            patches: Vec::new(),
+            candidates: Vec::new(),
+        };
+    }
+
+    let mut patches = Vec::new();
+    let mut candidates = Vec::new();
+
+    for (index, route) in input.route_authoring.iter().enumerate() {
+        if route.predicate.is_none() {
+            if let Some(when) = non_empty(route.when.as_deref()) {
+                patches.push(FlowRepairPatch {
+                    repair_kind: RepairKind::RouteWhenToPredicate,
+                    location: format!("routes[{}].when", index),
+                    replacement: format!("predicate: {when}"),
+                });
+            }
+        }
+
+        match route.predicate.as_ref() {
+            Some(RoutePredicateDraft::Artifact(value)) => {
+                if let Some(predicate) = artifact_exists_predicate(value) {
+                    patches.push(FlowRepairPatch {
+                        repair_kind: RepairKind::RouteArtifactObjectToExists,
+                        location: format!("routes[{}].predicate.artifact", index),
+                        replacement: format!("predicate: {predicate}"),
+                    });
+                }
+            }
+            Some(RoutePredicateDraft::Text(value)) => {
+                if let Some(predicate) = delivered_artifact_predicate(value) {
+                    candidates.push(FlowRepairCandidate {
+                        repair_kind: RepairKind::RouteBareArtifactDeliveredToExists,
+                        location: format!("routes[{}].predicate", index),
+                        replacement: format!("predicate: {predicate}"),
+                    });
+                }
+            }
+            None => {}
+        }
+
+        if route_activate_missing(route) {
+            if let Some(to) = non_empty(route.to.as_deref()) {
+                patches.push(FlowRepairPatch {
+                    repair_kind: RepairKind::RouteToToActivate,
+                    location: format!("routes[{}].to", index),
+                    replacement: format!("activate: {to}"),
+                });
+            } else {
+                for node in &input.draft.nodes {
+                    candidates.push(FlowRepairCandidate {
+                        repair_kind: RepairKind::AddRouteTarget,
+                        location: format!("routes[{}].activate", index),
+                        replacement: format!("activate: {}", node.id),
+                    });
+                }
+            }
+        }
+    }
+
+    FlowRepairReport {
+        diagnostics,
+        patches,
+        candidates,
+    }
+}
+
 pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
     let node_ids = draft
         .nodes
         .iter()
         .map(|node| node.id.as_str())
+        .collect::<HashSet<_>>();
+    let contract_ids = draft
+        .contracts
+        .iter()
+        .map(|contract| contract.id.as_str())
         .collect::<HashSet<_>>();
     let schema_ids = draft
         .resources
@@ -292,17 +626,24 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
     if draft_is_non_empty_package(draft) {
         if !draft_has_readme(draft) {
             diagnostics.push(Diagnostic::error(
+                DiagnosticDomain::Package,
                 "FLOW_MISSING_README",
                 "resources",
                 "non-empty flow packages must include a README resource",
                 "Add a resource with kind 'readme' that describes the package.",
+                "Packages need human-readable context before they can be shared or executed safely.",
+                DiagnosticRepair::new(Repairability::GuidanceOnly,
+                vec![RepairKind::AddReadmeResource]),
             ));
         } else if !draft_has_readme_content(draft) {
             diagnostics.push(Diagnostic::error(
+                DiagnosticDomain::Package,
                 "FLOW_EMPTY_README",
                 "resources",
                 "README resources must include explanatory content",
                 "Add non-empty content to at least one README resource.",
+                "README content is descriptive substance and cannot be inferred mechanically.",
+                DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
             ));
         }
     }
@@ -310,6 +651,7 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
     for (index, route) in draft.routes.iter().enumerate() {
         if !node_ids.contains(route.activate.as_str()) {
             diagnostics.push(Diagnostic::error(
+                DiagnosticDomain::Route,
                 "FLOW_UNKNOWN_ROUTE_TARGET",
                 format!("routes[{}].activate", index),
                 format!(
@@ -317,14 +659,20 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
                     route.activate
                 ),
                 "Add the target node or update the route target.",
+                "Routes can only activate nodes that exist in the draft.",
+                DiagnosticRepair::new(Repairability::Candidate, vec![RepairKind::AddRouteTarget]),
             ));
         }
-        if !route_predicate_is_fact_driven(&route.predicate) {
+        if !route_predicate_is_runtime_supported(&route.predicate) {
             diagnostics.push(Diagnostic::error(
+                DiagnosticDomain::Route,
                 "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
                 format!("routes[{}].predicate", index),
-                "route predicate must read only artifact.*, board.*, event.* facts or exists(...)",
-                "Move effects into runtime tools and keep the route predicate fact-driven.",
+                "route predicate must be a runtime-supported fact predicate",
+                "Use exists(artifact.key), exists(board.key), or one bare artifact or board fact path.",
+                "Route predicates must be executable by preview and activation.",
+                DiagnosticRepair::new(Repairability::Candidate,
+                vec![RepairKind::RouteBareArtifactDeliveredToExists]),
             ));
         }
         if route
@@ -333,10 +681,13 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
             .is_some_and(|expression| !route_for_each_is_artifact_driven(expression))
         {
             diagnostics.push(Diagnostic::error(
+                DiagnosticDomain::Route,
                 "FLOW_ROUTE_FOR_EACH_NOT_ARTIFACT_DRIVEN",
                 format!("routes[{}].for_each", index),
                 "route fanout must iterate artifact facts",
                 "Use an artifact.* expression for route fanout.",
+                "Fanout needs stable artifact data rather than mutable runtime state.",
+                DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
             ));
         }
     }
@@ -344,10 +695,16 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
     for contract in &draft.contracts {
         if contract.completion.is_none() {
             diagnostics.push(Diagnostic::error(
+                DiagnosticDomain::Contract,
                 "FLOW_MISSING_CONTRACT_COMPLETION",
                 format!("contracts[{}].completion", contract.id),
                 format!("contract '{}' has no completion rule", contract.id),
                 "Set a completion rule such as Manual or AllArtifacts.",
+                "Completion policy defines when a node contract can be considered satisfied.",
+                DiagnosticRepair::new(
+                    Repairability::GuidanceOnly,
+                    vec![RepairKind::AddContractCompletion],
+                ),
             ));
         }
 
@@ -355,6 +712,7 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
             match artifact.schema_resource_id.as_deref() {
                 Some(schema_id) if schema_ids.contains(schema_id) => {}
                 Some(schema_id) => diagnostics.push(Diagnostic::error(
+                    DiagnosticDomain::Resource,
                     "FLOW_MISSING_ARTIFACT_SCHEMA",
                     format!(
                         "contracts[{}].artifacts[{}].schema_resource_id",
@@ -365,12 +723,23 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
                         artifact.id, schema_id
                     ),
                     "Add a schema resource or update the artifact schema reference.",
+                    "Artifact schemas make delivered data inspectable across nodes.",
+                    DiagnosticRepair::new(
+                        Repairability::GuidanceOnly,
+                        vec![RepairKind::AddArtifactSchema],
+                    ),
                 )),
                 None => diagnostics.push(Diagnostic::error(
+                    DiagnosticDomain::Resource,
                     "FLOW_MISSING_ARTIFACT_SCHEMA",
                     format!("contracts[{}].artifacts[{}]", contract.id, artifact.id),
                     format!("artifact '{}' has no schema resource", artifact.id),
                     "Attach the artifact to a schema resource.",
+                    "Artifact schemas make delivered data inspectable across nodes.",
+                    DiagnosticRepair::new(
+                        Repairability::GuidanceOnly,
+                        vec![RepairKind::AddArtifactSchema],
+                    ),
                 )),
             }
         }
@@ -378,20 +747,41 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
 
     for (index, extension) in draft.extensions.iter().enumerate() {
         if !is_authoring_extension_kind(extension) {
-            diagnostics.push(Diagnostic::error(
+            diagnostics.push(Diagnostic::fatal(
+                DiagnosticDomain::Policy,
                 "FLOW_AUTHORING_PRIMITIVE_MISUSE",
                 format!("extensions[{}]", index),
                 format!("'{}' is not a flow authoring primitive", extension),
                 "Represent execution details outside FlowDraft authoring data.",
+                "Runtime primitives in authoring data can change execution semantics.",
+                DiagnosticRepair::new(Repairability::None, Vec::new()),
             ));
         }
     }
     for node in &draft.nodes {
+        if let Some(contract_id) = node.contract_id.as_deref() {
+            if !contract_ids.contains(contract_id) {
+                diagnostics.push(Diagnostic::error(
+                    DiagnosticDomain::Contract,
+                    "FLOW_UNKNOWN_NODE_CONTRACT",
+                    format!("nodes[{}].contract_id", node.id),
+                    format!(
+                        "node '{}' references missing contract '{}'",
+                        node.id, contract_id
+                    ),
+                    "Add the contract or update the node contract_id.",
+                    "Node contract references must resolve before runtime stop contracts can be derived.",
+                    DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
+                ));
+            }
+        }
+
         if let Some(action) = &node.action {
             if let Some(prompt_ref) = &action.prompt_ref {
                 match resource_by_id.get(prompt_ref.as_str()) {
                     Some(ResourceKind::Prompt) => {}
                     Some(_) => diagnostics.push(Diagnostic::error(
+                        DiagnosticDomain::Resource,
                         "FLOW_INVALID_ACTION_PROMPT",
                         format!("nodes[{}].action.prompt_ref", node.id),
                         format!(
@@ -399,8 +789,12 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
                             prompt_ref
                         ),
                         "Use a resource with kind 'prompt' for prompt_ref.",
+                        "Prompt references need a prompt resource so adapters receive the intended instruction.",
+                        DiagnosticRepair::new(Repairability::GuidanceOnly,
+                        Vec::new()),
                     )),
                     None => diagnostics.push(Diagnostic::error(
+                        DiagnosticDomain::Resource,
                         "FLOW_UNKNOWN_ACTION_PROMPT",
                         format!("nodes[{}].action.prompt_ref", node.id),
                         format!(
@@ -408,6 +802,9 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
                             prompt_ref
                         ),
                         "Add the prompt resource or update the action prompt reference.",
+                        "Prompt references need a resolvable resource before the node can run.",
+                        DiagnosticRepair::new(Repairability::GuidanceOnly,
+                        Vec::new()),
                     )),
                 }
             }
@@ -415,10 +812,13 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
             for (index, resource_id) in action.resource_refs.iter().enumerate() {
                 if !resource_by_id.contains_key(resource_id.as_str()) {
                     diagnostics.push(Diagnostic::error(
+                        DiagnosticDomain::Resource,
                         "FLOW_UNKNOWN_ACTION_RESOURCE",
                         format!("nodes[{}].action.resource_refs[{}]", node.id, index),
                         format!("node action references missing resource '{}'", resource_id),
                         "Add the resource or update the action resource reference.",
+                        "Action resources must exist before adapters can mount or read them.",
+                        DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
                     ));
                 }
             }
@@ -426,10 +826,14 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
             for (index, fact_path) in action.reads.iter().enumerate() {
                 if !is_fact_path(fact_path) {
                     diagnostics.push(Diagnostic::error(
+                        DiagnosticDomain::Contract,
                         "FLOW_INVALID_ACTION_READ",
                         format!("nodes[{}].action.reads[{}]", node.id, index),
                         format!("action read path '{}' is not a fact path", fact_path),
                         "Use artifact.*, board.*, or event.* fact paths.",
+                        "Reads define the data contract between runtime state and the node adapter.",
+                        DiagnosticRepair::new(Repairability::GuidanceOnly,
+                        Vec::new()),
                     ));
                 }
             }
@@ -437,10 +841,13 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
             for (index, fact_path) in action.writes.iter().enumerate() {
                 if !is_fact_path(fact_path) {
                     diagnostics.push(Diagnostic::error(
+                        DiagnosticDomain::Contract,
                         "FLOW_INVALID_ACTION_WRITE",
                         format!("nodes[{}].action.writes[{}]", node.id, index),
                         format!("action write path '{}' is not a fact path", fact_path),
                         "Use artifact.*, board.*, or event.* fact paths.",
+                        "Writes define which runtime facts the node may produce.",
+                        DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
                     ));
                 }
             }
@@ -451,21 +858,28 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
                 .is_some_and(|value| value.trim().is_empty())
             {
                 diagnostics.push(Diagnostic::error(
+                    DiagnosticDomain::Contract,
                     "FLOW_EMPTY_ACTION_VERDICT_ARTIFACT",
                     format!("nodes[{}].action.verdict_artifact", node.id),
                     "action verdict artifact must not be empty",
                     "Use a non-empty artifact-like id such as artifact.verdict.",
+                    "Verdict artifacts need stable ids so downstream routes and contracts can reference them.",
+                    DiagnosticRepair::new(Repairability::GuidanceOnly,
+                    Vec::new()),
                 ));
             }
         }
 
         for (index, extension) in node.extensions.iter().enumerate() {
             if !is_authoring_extension_kind(extension) {
-                diagnostics.push(Diagnostic::error(
+                diagnostics.push(Diagnostic::fatal(
+                    DiagnosticDomain::Policy,
                     "FLOW_AUTHORING_PRIMITIVE_MISUSE",
                     format!("nodes[{}].extensions[{}]", node.id, index),
                     format!("'{}' is not a flow authoring primitive", extension),
                     "Represent execution details outside FlowDraft authoring data.",
+                    "Runtime primitives in authoring data can change execution semantics.",
+                    DiagnosticRepair::new(Repairability::None, Vec::new()),
                 ));
             }
         }
@@ -524,10 +938,16 @@ pub fn flow_check_run_compatibility(
         .filter(|resource| !available.contains(resource.id.as_str()))
         .map(|resource| {
             Diagnostic::error(
+                DiagnosticDomain::RuntimeCompat,
                 "FLOW_RUN_RESOURCE_UNAVAILABLE",
                 format!("resources[{}]", resource.id),
                 format!("resource '{}' is not available to the run", resource.id),
                 "Provide the resource to the run or remove it from the draft.",
+                "Runs can only execute drafts whose resources are present in the runtime context.",
+                DiagnosticRepair::new(
+                    Repairability::GuidanceOnly,
+                    vec![RepairKind::ProvideRuntimeResource],
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -546,15 +966,11 @@ pub fn flow_lock(draft: &FlowDraft, mode: FlowCheckMode) -> Result<FlowLock, Flo
         });
     }
 
-    let normalized_draft = normalize_draft(draft);
-    let normalized_diagnostics = normalize_diagnostics(&report.diagnostics);
-    let normalized_content = format!(
-        "{{\"mode\":{},\"draft\":{},\"diagnostics\":{}}}",
-        quote(mode.as_str()),
-        normalized_draft,
-        normalized_diagnostics
+    let normalized_content = export::normalized_lock_content(draft, mode, &report.diagnostics);
+    let id = format!(
+        "flk_{:016x}",
+        export::stable_hash(normalized_content.as_bytes())
     );
-    let id = format!("flk_{:016x}", stable_hash(normalized_content.as_bytes()));
 
     Ok(FlowLock {
         id,
@@ -566,10 +982,7 @@ pub fn flow_lock(draft: &FlowDraft, mode: FlowCheckMode) -> Result<FlowLock, Flo
 }
 
 pub fn flow_export(lock: &FlowLock, format: FlowExportFormat) -> String {
-    match format {
-        FlowExportFormat::Json => export_lock_json(lock),
-        FlowExportFormat::Yaml => export_lock_yaml(lock),
-    }
+    export::flow_export(lock, format)
 }
 
 impl FlowCheckMode {
@@ -590,6 +1003,66 @@ impl Severity {
     }
 }
 
+impl DiagnosticDomain {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Package => "package",
+            Self::Contract => "contract",
+            Self::Resource => "resource",
+            Self::Route => "route",
+            Self::Policy => "policy",
+            Self::RuntimeCompat => "runtime_compat",
+        }
+    }
+}
+
+impl DiagnosticSeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fatal => "fatal",
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Note => "note",
+        }
+    }
+
+    fn legacy_severity(self) -> Severity {
+        match self {
+            Self::Fatal | Self::Error => Severity::Error,
+            Self::Warning | Self::Note => Severity::Warning,
+        }
+    }
+}
+
+impl Repairability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Candidate => "candidate",
+            Self::GuidanceOnly => "guidance_only",
+            Self::None => "none",
+        }
+    }
+}
+
+impl RepairKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RouteWhenToPredicate => "route_when_to_predicate",
+            Self::RouteToToActivate => "route_to_to_activate",
+            Self::RouteArtifactObjectToExists => "route_artifact_object_to_exists",
+            Self::RouteBareArtifactDeliveredToExists => "route_bare_artifact_delivered_to_exists",
+            Self::AddRouteTarget => "add_route_target",
+            Self::AddReadmeResource => "add_readme_resource",
+            Self::GenerateReadme => "generate_readme",
+            Self::AddArtifactSchema => "add_artifact_schema",
+            Self::AddContractCompletion => "add_contract_completion",
+            Self::NarrowWriteScope => "narrow_write_scope",
+            Self::ProvideRuntimeResource => "provide_runtime_resource",
+        }
+    }
+}
+
 impl ContractCompletion {
     fn as_str(&self) -> &'static str {
         match self {
@@ -606,6 +1079,26 @@ impl NodeDriver {
             Self::Script => "script",
             Self::Review => "review",
             Self::Human => "human",
+        }
+    }
+}
+
+impl CompletionPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Manual => "manual",
+            Self::AllArtifacts => "all_artifacts",
+        }
+    }
+}
+
+impl StopGate {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Preferred => "preferred",
+            Self::None => "none",
         }
     }
 }
@@ -647,34 +1140,88 @@ impl WriteScope {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DiagnosticRepair {
+    repairability: Repairability,
+    repair_kinds: Vec<RepairKind>,
+}
+
+impl DiagnosticRepair {
+    fn new(repairability: Repairability, repair_kinds: Vec<RepairKind>) -> Self {
+        Self {
+            repairability,
+            repair_kinds,
+        }
+    }
+}
+
 impl Diagnostic {
     fn error(
+        domain: DiagnosticDomain,
         code: impl Into<String>,
         location: impl Into<String>,
         message: impl Into<String>,
         fix_hint: impl Into<String>,
+        why_it_matters: impl Into<String>,
+        repair: DiagnosticRepair,
     ) -> Self {
         Self {
             code: code.into(),
-            severity: Severity::Error,
+            domain,
+            severity: DiagnosticSeverity::Error.legacy_severity(),
+            severity_level: DiagnosticSeverity::Error,
+            repairability: repair.repairability,
             location: location.into(),
             message: message.into(),
             fix_hint: Some(fix_hint.into()),
+            why_it_matters: Some(why_it_matters.into()),
+            repair_kinds: repair.repair_kinds,
+        }
+    }
+
+    fn fatal(
+        domain: DiagnosticDomain,
+        code: impl Into<String>,
+        location: impl Into<String>,
+        message: impl Into<String>,
+        fix_hint: impl Into<String>,
+        why_it_matters: impl Into<String>,
+        repair: DiagnosticRepair,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            domain,
+            severity: DiagnosticSeverity::Fatal.legacy_severity(),
+            severity_level: DiagnosticSeverity::Fatal,
+            repairability: repair.repairability,
+            location: location.into(),
+            message: message.into(),
+            fix_hint: Some(fix_hint.into()),
+            why_it_matters: Some(why_it_matters.into()),
+            repair_kinds: repair.repair_kinds,
         }
     }
 
     fn warning(
+        domain: DiagnosticDomain,
         code: impl Into<String>,
         location: impl Into<String>,
         message: impl Into<String>,
         fix_hint: impl Into<String>,
+        why_it_matters: impl Into<String>,
+        repair: DiagnosticRepair,
     ) -> Self {
         Self {
             code: code.into(),
-            severity: Severity::Warning,
+            domain,
+            severity: DiagnosticSeverity::Warning.legacy_severity(),
+            severity_level: DiagnosticSeverity::Warning,
+            repairability: repair.repairability,
             location: location.into(),
             message: message.into(),
             fix_hint: Some(fix_hint.into()),
+            why_it_matters: Some(why_it_matters.into()),
+            repair_kinds: repair.repair_kinds,
         }
     }
 }
@@ -694,45 +1241,124 @@ fn push_broad_write_scope_diagnostic(
         scope.tag()
     );
     let fix_hint = "Use artifact or resource write scopes unless wider access is required.";
+    let why_it_matters = "Broad write scopes make node effects harder to audit.";
     let diagnostic = match severity {
-        Severity::Error => Diagnostic::error("FLOW_BROAD_WRITE_SCOPE", location, message, fix_hint),
-        Severity::Warning => {
-            Diagnostic::warning("FLOW_BROAD_WRITE_SCOPE", location, message, fix_hint)
-        }
+        Severity::Error => Diagnostic::error(
+            DiagnosticDomain::Policy,
+            "FLOW_BROAD_WRITE_SCOPE",
+            location,
+            message,
+            fix_hint,
+            why_it_matters,
+            DiagnosticRepair::new(Repairability::Candidate, vec![RepairKind::NarrowWriteScope]),
+        ),
+        Severity::Warning => Diagnostic::warning(
+            DiagnosticDomain::Policy,
+            "FLOW_BROAD_WRITE_SCOPE",
+            location,
+            message,
+            fix_hint,
+            why_it_matters,
+            DiagnosticRepair::new(Repairability::Candidate, vec![RepairKind::NarrowWriteScope]),
+        ),
     };
     diagnostics.push(diagnostic);
 }
 
-fn route_predicate_is_fact_driven(predicate: &str) -> bool {
-    let cleaned = strip_quoted_strings(predicate);
-    let tokens = identifier_tokens(&cleaned);
-
-    if tokens.is_empty() {
-        return false;
+fn action_contract_fields(action: &NodeAction) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut requires = action.reads.clone();
+    let mut prefers = Vec::new();
+    if let Some(prompt_ref) = &action.prompt_ref {
+        prefers.push(prompt_ref.clone());
+    }
+    prefers.extend(action.resource_refs.clone());
+    let mut accepts = action.writes.clone();
+    if let Some(verdict_artifact) = &action.verdict_artifact {
+        accepts.push(verdict_artifact.clone());
     }
 
-    let mut has_fact_path = false;
-    for token in tokens {
-        let ident = token.text;
-        if is_boolean_literal(ident) {
-            continue;
-        }
-        if ident == "exists" {
-            if next_non_whitespace(&cleaned, token.end) != Some('(') {
-                return false;
-            }
-            continue;
-        }
-        if next_non_whitespace(&cleaned, token.end) == Some('(') {
-            return false;
-        }
-        if !is_fact_path(ident) {
-            return false;
-        }
-        has_fact_path = true;
+    dedup_preserving_order(&mut requires);
+    dedup_preserving_order(&mut prefers);
+    dedup_preserving_order(&mut accepts);
+
+    (requires, prefers, accepts)
+}
+
+fn dedup_preserving_order(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
+fn route_activate_missing(route: &RouteAuthoring) -> bool {
+    route
+        .activate
+        .as_deref()
+        .is_none_or(|activate| activate.trim().is_empty())
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn artifact_exists_predicate(value: &str) -> Option<String> {
+    artifact_fact_path(value).map(|path| format!("exists({path})"))
+}
+
+fn delivered_artifact_predicate(value: &str) -> Option<String> {
+    let value = value.trim();
+    let artifact = value
+        .strip_suffix(".delivered")
+        .or_else(|| value.strip_suffix(".ready"))
+        .or_else(|| value.strip_suffix(".done"))?;
+
+    if is_fact_path(artifact) && artifact.starts_with("artifact.") {
+        Some(format!("exists({artifact})"))
+    } else {
+        None
+    }
+}
+
+fn artifact_fact_path(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.starts_with("artifact.") {
+        return is_fact_path(value).then(|| value.to_string());
     }
 
-    has_fact_path
+    if value.split('.').all(is_fact_path_segment) {
+        let candidate = format!("artifact.{value}");
+        is_fact_path(&candidate).then_some(candidate)
+    } else {
+        None
+    }
+}
+
+fn is_fact_path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn route_predicate_is_runtime_supported(predicate: &str) -> bool {
+    let trimmed = predicate.trim();
+
+    if let Some(path) = exists_fact_argument(trimmed) {
+        return is_executable_route_fact_path(path);
+    }
+
+    is_executable_route_fact_path(trimmed)
+}
+
+fn is_executable_route_fact_path(path: &str) -> bool {
+    is_fact_path(path) && (path.starts_with("artifact.") || path.starts_with("board."))
+}
+
+fn exists_fact_argument(predicate: &str) -> Option<&str> {
+    predicate
+        .strip_prefix("exists(")?
+        .strip_suffix(')')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
 }
 
 fn route_for_each_is_artifact_driven(expression: &str) -> bool {
@@ -849,10 +1475,6 @@ fn slug_ascii_id(value: &str, fallback: &str) -> String {
     }
 }
 
-fn is_boolean_literal(value: &str) -> bool {
-    matches!(value, "true" | "false")
-}
-
 fn is_fact_path(value: &str) -> bool {
     ["artifact.", "board.", "event."]
         .iter()
@@ -870,7 +1492,6 @@ fn is_fact_path(value: &str) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct IdentifierToken<'a> {
     text: &'a str,
-    end: usize,
 }
 
 fn identifier_tokens(input: &str) -> Vec<IdentifierToken<'_>> {
@@ -905,24 +1526,11 @@ fn push_identifier_token<'a>(
         return;
     }
 
-    let leading_dots = input[start..end].len() - input[start..end].trim_start_matches('.').len();
-    let adjusted_start = start + leading_dots;
-    let adjusted_end = adjusted_start + text.len();
-
-    tokens.push(IdentifierToken {
-        text,
-        end: adjusted_end,
-    });
+    tokens.push(IdentifierToken { text });
 }
 
 fn is_identifier_path_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_' || character == '.'
-}
-
-fn next_non_whitespace(input: &str, start: usize) -> Option<char> {
-    input[start..]
-        .chars()
-        .find(|character| !character.is_ascii_whitespace())
 }
 
 fn strip_quoted_strings(input: &str) -> String {
@@ -955,306 +1563,4 @@ fn strip_quoted_strings(input: &str) -> String {
     }
 
     output
-}
-
-fn normalize_draft(draft: &FlowDraft) -> String {
-    let mut nodes = draft.nodes.clone();
-    nodes.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut contracts = draft.contracts.clone();
-    contracts.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut routes = draft.routes.clone();
-    routes.sort_by(|left, right| {
-        left.activate
-            .cmp(&right.activate)
-            .then(left.predicate.cmp(&right.predicate))
-            .then(left.for_each.cmp(&right.for_each))
-    });
-    let mut resources = draft.resources.clone();
-    resources.sort_by(|left, right| {
-        left.id
-            .cmp(&right.id)
-            .then(left.kind.as_str().cmp(right.kind.as_str()))
-            .then(left.source.cmp(&right.source))
-    });
-    let mut imports = draft.imports.clone();
-    imports.sort_by(|left, right| {
-        left.resource_id
-            .cmp(&right.resource_id)
-            .then(left.alias.cmp(&right.alias))
-    });
-    let mut extensions = draft.extensions.clone();
-    extensions.sort();
-
-    format!(
-        "{{\"nodes\":{},\"contracts\":{},\"routes\":{},\"resources\":{},\"imports\":{},\"policies\":{},\"extensions\":{}}}",
-        normalize_nodes(&nodes),
-        normalize_contracts(&contracts),
-        normalize_routes(&routes),
-        normalize_resources(&resources),
-        normalize_imports(&imports),
-        normalize_policies(&draft.policies),
-        normalize_strings(&extensions),
-    )
-}
-
-fn normalize_nodes(nodes: &[FlowNode]) -> String {
-    let values = nodes
-        .iter()
-        .map(|node| {
-            let mut write_scopes = node.write_scopes.clone();
-            write_scopes.sort();
-            let mut extensions = node.extensions.clone();
-            extensions.sort();
-            format!(
-                "{{\"id\":{},\"contract_id\":{},\"action\":{},\"write_scopes\":{},\"extensions\":{}}}",
-                quote(&node.id),
-                quote_option(node.contract_id.as_deref()),
-                normalize_action(node.action.as_ref()),
-                normalize_write_scopes(&write_scopes),
-                normalize_strings(&extensions)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_action(action: Option<&NodeAction>) -> String {
-    let Some(action) = action else {
-        return "null".into();
-    };
-    let mut resource_refs = action.resource_refs.clone();
-    resource_refs.sort();
-    let mut reads = action.reads.clone();
-    reads.sort();
-    let mut writes = action.writes.clone();
-    writes.sort();
-
-    format!(
-        "{{\"driver\":{},\"prompt_ref\":{},\"resource_refs\":{},\"reads\":{},\"writes\":{},\"verdict_artifact\":{}}}",
-        quote(action.driver.as_str()),
-        quote_option(action.prompt_ref.as_deref()),
-        normalize_strings(&resource_refs),
-        normalize_strings(&reads),
-        normalize_strings(&writes),
-        quote_option(action.verdict_artifact.as_deref())
-    )
-}
-
-fn normalize_contracts(contracts: &[FlowContract]) -> String {
-    let values = contracts
-        .iter()
-        .map(|contract| {
-            let mut artifacts = contract.artifacts.clone();
-            artifacts.sort_by(|left, right| {
-                left.id
-                    .cmp(&right.id)
-                    .then(left.schema_resource_id.cmp(&right.schema_resource_id))
-            });
-            format!(
-                "{{\"id\":{},\"completion\":{},\"artifacts\":{}}}",
-                quote(&contract.id),
-                contract
-                    .completion
-                    .as_ref()
-                    .map(ContractCompletion::as_str)
-                    .map(quote)
-                    .unwrap_or_else(|| "null".into()),
-                normalize_artifacts(&artifacts)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_artifacts(artifacts: &[ContractArtifact]) -> String {
-    let values = artifacts
-        .iter()
-        .map(|artifact| {
-            format!(
-                "{{\"id\":{},\"schema_resource_id\":{}}}",
-                quote(&artifact.id),
-                quote_option(artifact.schema_resource_id.as_deref())
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_routes(routes: &[FlowRoute]) -> String {
-    let values = routes
-        .iter()
-        .map(|route| {
-            format!(
-                "{{\"activate\":{},\"predicate\":{},\"for_each\":{}}}",
-                quote(&route.activate),
-                quote(&route.predicate),
-                quote_option(route.for_each.as_deref())
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_resources(resources: &[FlowResource]) -> String {
-    let values = resources
-        .iter()
-        .map(|resource| {
-            format!(
-                "{{\"id\":{},\"kind\":{},\"source\":{}}}",
-                quote(&resource.id),
-                quote(resource.kind.as_str()),
-                quote(&resource.source)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_imports(imports: &[FlowImport]) -> String {
-    let values = imports
-        .iter()
-        .map(|import| {
-            format!(
-                "{{\"resource_id\":{},\"alias\":{}}}",
-                quote(&import.resource_id),
-                quote_option(import.alias.as_deref())
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_policies(policies: &FlowPolicies) -> String {
-    let mut write_scopes = policies.write_scopes.clone();
-    write_scopes.sort();
-    format!(
-        "{{\"write_scopes\":{}}}",
-        normalize_write_scopes(&write_scopes)
-    )
-}
-
-fn normalize_write_scopes(write_scopes: &[WriteScope]) -> String {
-    let values = write_scopes
-        .iter()
-        .map(|scope| {
-            format!(
-                "{{\"kind\":{},\"value\":{}}}",
-                quote(scope.tag()),
-                quote_option(scope.value())
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_diagnostics(diagnostics: &[Diagnostic]) -> String {
-    let mut sorted = diagnostics.to_vec();
-    sorted.sort_by(|left, right| {
-        left.code
-            .cmp(&right.code)
-            .then(left.location.cmp(&right.location))
-            .then(left.message.cmp(&right.message))
-            .then(left.fix_hint.cmp(&right.fix_hint))
-    });
-
-    let values = sorted.iter().map(normalize_diagnostic).collect::<Vec<_>>();
-    format!("[{}]", values.join(","))
-}
-
-fn normalize_diagnostic(diagnostic: &Diagnostic) -> String {
-    format!(
-        "{{\"code\":{},\"severity\":{},\"location\":{},\"message\":{},\"fix_hint\":{}}}",
-        quote(&diagnostic.code),
-        quote(diagnostic.severity.as_str()),
-        quote(&diagnostic.location),
-        quote(&diagnostic.message),
-        quote_option(diagnostic.fix_hint.as_deref())
-    )
-}
-
-fn normalize_strings(values: &[String]) -> String {
-    let quoted = values.iter().map(|value| quote(value)).collect::<Vec<_>>();
-    format!("[{}]", quoted.join(","))
-}
-
-fn export_lock_json(lock: &FlowLock) -> String {
-    format!(
-        "{{\n  \"id\": {},\n  \"check_mode\": {},\n  \"diagnostics\": {},\n  \"content\": {}\n}}",
-        quote(&lock.id),
-        quote(lock.mode.as_str()),
-        normalize_diagnostics(&lock.diagnostics),
-        quote(&lock.normalized_content)
-    )
-}
-
-fn export_lock_yaml(lock: &FlowLock) -> String {
-    let diagnostics = if lock.diagnostics.is_empty() {
-        "[]".into()
-    } else {
-        lock.diagnostics
-            .iter()
-            .map(|diagnostic| {
-                format!(
-                    "  - code: {}\n    severity: {}\n    location: {}\n    message: {}\n    fix_hint: {}",
-                    yaml_scalar(&diagnostic.code),
-                    yaml_scalar(diagnostic.severity.as_str()),
-                    yaml_scalar(&diagnostic.location),
-                    yaml_scalar(&diagnostic.message),
-                    diagnostic
-                        .fix_hint
-                        .as_deref()
-                        .map(yaml_scalar)
-                        .unwrap_or_else(|| "null".into())
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    format!(
-        "id: {}\ncheck_mode: {}\ndiagnostics: {}\ncontent: {}\n",
-        lock.id,
-        lock.mode.as_str(),
-        diagnostics,
-        yaml_scalar(&lock.normalized_content)
-    )
-}
-
-fn quote_option(value: Option<&str>) -> String {
-    value.map(quote).unwrap_or_else(|| "null".into())
-}
-
-fn quote(value: &str) -> String {
-    format!("\"{}\"", escape_json(value))
-}
-
-fn escape_json(value: &str) -> String {
-    let mut escaped = String::new();
-    for character in value.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character.is_control() => {
-                escaped.push_str(&format!("\\u{:04x}", character as u32));
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-fn yaml_scalar(value: &str) -> String {
-    quote(value)
-}
-
-fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }

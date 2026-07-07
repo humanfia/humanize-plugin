@@ -1,9 +1,11 @@
 use humanize_plugin::flow::{
-    ContractArtifact, ContractCompletion, Diagnostic, FlowCheckMode, FlowContract, FlowDraft,
-    FlowExportFormat, FlowImport, FlowNode, FlowPolicies, FlowResource, FlowRoute,
-    FlowSuggestInput, NodeAction, NodeDriver, ResourceKind, RunCompatibility, Severity, WriteScope,
-    effective_node_write_scopes, flow_check, flow_check_run_compatibility, flow_export, flow_lock,
-    flow_suggest,
+    AdapterCapability, ArtifactRequirement, ContractArtifact, ContractCompletion, Diagnostic,
+    DiagnosticDomain, DiagnosticSeverity, EffectRequirement, FlowCheckMode, FlowContract,
+    FlowDraft, FlowExportFormat, FlowImport, FlowNode, FlowPolicies, FlowRepairInput, FlowResource,
+    FlowRoute, FlowSuggestInput, NodeAction, NodeContract, NodeDriver, RepairKind, Repairability,
+    ResourceKind, RouteAuthoring, RoutePredicateDraft, RunCompatibility, Severity, StopGate,
+    WriteScope, effective_node_write_scopes, flow_check, flow_check_run_compatibility, flow_export,
+    flow_lock, flow_repair, flow_suggest,
 };
 
 fn valid_draft() -> FlowDraft {
@@ -135,6 +137,13 @@ fn diagnostic_codes(diagnostics: &[Diagnostic]) -> Vec<&str> {
     diagnostics
         .iter()
         .map(|diagnostic| diagnostic.code.as_str())
+        .collect()
+}
+
+fn diagnostic_domains(diagnostics: &[Diagnostic]) -> Vec<DiagnosticDomain> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.domain)
         .collect()
 }
 
@@ -522,7 +531,336 @@ fn core_check_reports_authoring_errors() {
             && !diagnostic.location.is_empty()
             && !diagnostic.message.is_empty()
             && diagnostic.fix_hint.is_some()
+            && diagnostic.why_it_matters.is_some()
     }));
+}
+
+#[test]
+fn diagnostics_include_stable_metadata_fields() {
+    let mut draft = valid_draft();
+    draft.resources[0].source = "inline: ".into();
+    draft.routes[0].activate = "missing-node".into();
+    draft.contracts[0].artifacts[0].schema_resource_id = Some("schema.missing".into());
+    draft.policies.write_scopes = vec![WriteScope::Workspace];
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec![
+            "FLOW_EMPTY_README",
+            "FLOW_UNKNOWN_ROUTE_TARGET",
+            "FLOW_MISSING_ARTIFACT_SCHEMA",
+            "FLOW_BROAD_WRITE_SCOPE",
+        ]
+    );
+    assert_eq!(
+        diagnostic_domains(&report.diagnostics),
+        vec![
+            DiagnosticDomain::Package,
+            DiagnosticDomain::Route,
+            DiagnosticDomain::Resource,
+            DiagnosticDomain::Policy,
+        ]
+    );
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.severity_level)
+            .collect::<Vec<_>>(),
+        vec![
+            DiagnosticSeverity::Error,
+            DiagnosticSeverity::Error,
+            DiagnosticSeverity::Error,
+            DiagnosticSeverity::Warning,
+        ]
+    );
+    assert_eq!(
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.repairability)
+            .collect::<Vec<_>>(),
+        vec![
+            Repairability::GuidanceOnly,
+            Repairability::Candidate,
+            Repairability::GuidanceOnly,
+            Repairability::Candidate,
+        ]
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.why_it_matters.is_some())
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .flat_map(|diagnostic| diagnostic.repair_kinds.iter())
+            .any(|kind| *kind == RepairKind::AddRouteTarget)
+    );
+}
+
+#[test]
+fn diagnostics_cover_contract_and_runtime_compat_domains() {
+    let mut draft = valid_draft();
+    draft.contracts[0].completion = None;
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_domains(&report.diagnostics),
+        vec![DiagnosticDomain::Contract]
+    );
+    assert_eq!(
+        report.diagnostics[0].repairability,
+        Repairability::GuidanceOnly
+    );
+
+    let result = flow_check_run_compatibility(
+        &valid_draft(),
+        RunCompatibility {
+            available_resources: vec!["readme.main".into(), "schema.handoff".into()],
+        },
+    );
+
+    assert_eq!(
+        diagnostic_domains(&result.diagnostics),
+        vec![DiagnosticDomain::RuntimeCompat]
+    );
+    assert_eq!(
+        result.diagnostics[0].repairability,
+        Repairability::GuidanceOnly
+    );
+}
+
+#[test]
+fn readme_diagnostics_are_guidance_only_errors() {
+    let mut missing = valid_draft();
+    missing
+        .resources
+        .retain(|resource| resource.id != "readme.main");
+    let missing_report = flow_check(&missing, FlowCheckMode::Core);
+
+    assert_eq!(
+        missing_report.diagnostics[0].domain,
+        DiagnosticDomain::Package
+    );
+    assert_eq!(
+        missing_report.diagnostics[0].severity_level,
+        DiagnosticSeverity::Error
+    );
+    assert_eq!(
+        missing_report.diagnostics[0].repairability,
+        Repairability::GuidanceOnly
+    );
+    assert!(
+        !missing_report.diagnostics[0]
+            .repair_kinds
+            .contains(&RepairKind::GenerateReadme)
+    );
+
+    let mut empty = valid_draft();
+    empty.resources[0].source = "inline: ".into();
+    let repair = flow_repair(&FlowRepairInput::from_draft(empty, FlowCheckMode::Core));
+
+    assert_eq!(
+        diagnostic_codes(&repair.diagnostics),
+        vec!["FLOW_EMPTY_README"]
+    );
+    assert!(repair.patches.is_empty());
+    assert!(repair.candidates.is_empty());
+}
+
+#[test]
+fn node_contract_model_projects_existing_draft_fields() {
+    let mut draft = valid_draft();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Agent,
+        prompt_ref: Some("prompt.start".into()),
+        resource_refs: vec!["schema.handoff".into()],
+        reads: vec!["artifact.input".into()],
+        writes: vec!["artifact.handoff".into()],
+        verdict_artifact: Some("artifact.verdict".into()),
+    });
+    draft.resources.push(FlowResource {
+        id: "prompt.start".into(),
+        kind: ResourceKind::Prompt,
+        source: "inline:Collect the handoff.".into(),
+    });
+
+    let contracts = NodeContract::from_draft(&draft);
+    let capability = AdapterCapability::from_action(
+        "start",
+        draft.nodes[0].action.as_ref().expect("action should exist"),
+    );
+
+    assert_eq!(contracts[0].node_id, "start");
+    assert_eq!(contracts[0].contract_id.as_deref(), Some("contract.start"));
+    assert_eq!(contracts[0].requires, vec!["artifact.input"]);
+    assert_eq!(contracts[0].prefers, vec!["prompt.start", "schema.handoff"]);
+    assert_eq!(
+        contracts[0].accepts,
+        vec!["artifact.handoff", "artifact.verdict"]
+    );
+    assert_eq!(
+        contracts[0].artifact_requirements,
+        vec![ArtifactRequirement {
+            id: "handoff".into(),
+            schema_resource_id: Some("schema.handoff".into()),
+            required: true,
+        }]
+    );
+    assert_eq!(
+        contracts[0].effect_requirements,
+        Vec::<EffectRequirement>::new()
+    );
+    assert_eq!(contracts[0].stop_gate, StopGate::Preferred);
+    assert_eq!(capability.node_id, "start");
+    assert_eq!(capability.requires, vec!["artifact.input"]);
+    assert_eq!(
+        capability.accepts,
+        vec!["artifact.handoff", "artifact.verdict"]
+    );
+}
+
+#[test]
+fn core_check_rejects_node_contract_id_without_matching_contract() {
+    let mut draft = valid_draft();
+    draft.nodes[0].contract_id = Some("contract.missing".into());
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_UNKNOWN_NODE_CONTRACT"]
+    );
+    let diagnostic = &report.diagnostics[0];
+    assert_eq!(diagnostic.domain, DiagnosticDomain::Contract);
+    assert_eq!(diagnostic.severity, Severity::Error);
+    assert_eq!(diagnostic.severity_level, DiagnosticSeverity::Error);
+    assert_eq!(diagnostic.repairability, Repairability::GuidanceOnly);
+    assert_eq!(diagnostic.location, "nodes[start].contract_id");
+    assert!(diagnostic.message.contains("contract.missing"));
+    assert_eq!(diagnostic.repair_kinds, Vec::<RepairKind>::new());
+
+    let err = flow_lock(&draft, FlowCheckMode::Core).unwrap_err();
+    assert_eq!(
+        diagnostic_codes(&err.diagnostics),
+        vec!["FLOW_UNKNOWN_NODE_CONTRACT"]
+    );
+}
+
+#[test]
+fn route_authoring_repair_returns_mechanical_patches_and_candidates() {
+    let input = FlowRepairInput {
+        draft: valid_draft(),
+        mode: FlowCheckMode::Core,
+        route_authoring: vec![
+            RouteAuthoring {
+                when: Some("exists(artifact.ready)".into()),
+                predicate: None,
+                to: Some("finish".into()),
+                activate: None,
+                for_each: None,
+            },
+            RouteAuthoring {
+                when: None,
+                predicate: Some(RoutePredicateDraft::Artifact("summary".into())),
+                to: None,
+                activate: Some("finish".into()),
+                for_each: None,
+            },
+            RouteAuthoring {
+                when: None,
+                predicate: Some(RoutePredicateDraft::Text(
+                    "artifact.report.delivered".into(),
+                )),
+                to: None,
+                activate: Some("".into()),
+                for_each: None,
+            },
+        ],
+        diagnostics: Vec::new(),
+    };
+
+    let repair = flow_repair(&input);
+
+    assert_eq!(repair.diagnostics, Vec::new());
+    assert_eq!(
+        repair
+            .patches
+            .iter()
+            .map(|patch| patch.repair_kind)
+            .collect::<Vec<_>>(),
+        vec![
+            RepairKind::RouteWhenToPredicate,
+            RepairKind::RouteToToActivate,
+            RepairKind::RouteArtifactObjectToExists,
+        ]
+    );
+    assert_eq!(repair.patches[0].location, "routes[0].when");
+    assert_eq!(
+        repair.patches[0].replacement,
+        "predicate: exists(artifact.ready)"
+    );
+    assert_eq!(repair.patches[1].replacement, "activate: finish");
+    assert_eq!(
+        repair.patches[2].replacement,
+        "predicate: exists(artifact.summary)"
+    );
+
+    assert_eq!(
+        repair
+            .candidates
+            .iter()
+            .map(|candidate| candidate.repair_kind)
+            .collect::<Vec<_>>(),
+        vec![
+            RepairKind::RouteBareArtifactDeliveredToExists,
+            RepairKind::AddRouteTarget,
+            RepairKind::AddRouteTarget,
+        ]
+    );
+    assert_eq!(
+        repair.candidates[0].replacement,
+        "predicate: exists(artifact.report)"
+    );
+    assert_eq!(repair.candidates[1].replacement, "activate: start");
+    assert_eq!(repair.candidates[2].replacement, "activate: finish");
+}
+
+#[test]
+fn fatal_diagnostics_suppress_repair_patches() {
+    let mut draft = valid_draft();
+    draft.extensions = vec!["NodeActivation".into()];
+    let input = FlowRepairInput {
+        draft,
+        mode: FlowCheckMode::Core,
+        route_authoring: vec![RouteAuthoring {
+            when: Some("exists(artifact.ready)".into()),
+            predicate: None,
+            to: Some("finish".into()),
+            activate: None,
+            for_each: None,
+        }],
+        diagnostics: Vec::new(),
+    };
+
+    let repair = flow_repair(&input);
+
+    assert_eq!(
+        diagnostic_codes(&repair.diagnostics),
+        vec!["FLOW_AUTHORING_PRIMITIVE_MISUSE"]
+    );
+    assert_eq!(
+        repair.diagnostics[0].severity_level,
+        DiagnosticSeverity::Fatal
+    );
+    assert!(repair.patches.is_empty());
 }
 
 #[test]
@@ -728,10 +1066,21 @@ fn broad_write_scope_is_warning_in_core_and_error_in_strict() {
 
     let core_report = flow_check(&draft, FlowCheckMode::Core);
     let strict_report = flow_check(&draft, FlowCheckMode::Strict);
+    let core_lock = flow_lock(&draft, FlowCheckMode::Core).unwrap();
 
     assert_eq!(core_report.diagnostics.len(), 1);
     assert_eq!(core_report.diagnostics[0].code, "FLOW_BROAD_WRITE_SCOPE");
     assert_eq!(core_report.diagnostics[0].severity, Severity::Warning);
+    assert!(
+        core_lock
+            .normalized_content()
+            .contains("\"domain\":\"policy\"")
+    );
+    assert!(
+        core_lock
+            .normalized_content()
+            .contains("\"repairability\":\"candidate\"")
+    );
 
     assert_eq!(strict_report.diagnostics.len(), 1);
     assert_eq!(strict_report.diagnostics[0].code, "FLOW_BROAD_WRITE_SCOPE");
@@ -756,12 +1105,12 @@ fn route_predicates_and_fanout_survive_lock_normalization_and_export() {
     let mut draft = valid_draft();
     draft.routes = vec![
         FlowRoute {
-            predicate: "artifact.schema == 'handoff.v1' && board.ready == true".into(),
+            predicate: "board.ready".into(),
             for_each: None,
             activate: "finish".into(),
         },
         FlowRoute {
-            predicate: "exists(event.review_requested)".into(),
+            predicate: "exists(artifact.items)".into(),
             for_each: Some("artifact.items".into()),
             activate: "finish".into(),
         },
@@ -774,15 +1123,18 @@ fn route_predicates_and_fanout_survive_lock_normalization_and_export() {
     let lock = flow_lock(&draft, FlowCheckMode::Core).unwrap();
     let normalized = lock.normalized_content();
 
-    assert!(normalized.contains("\"predicate\":\"exists(event.review_requested)\""));
+    assert!(normalized.contains("\"predicate\":\"exists(artifact.items)\""));
     assert!(normalized.contains("\"for_each\":\"artifact.items\""));
     assert!(normalized.contains("\"id\":\"readme.main\""));
     assert!(normalized.contains("\"kind\":\"readme\""));
+    assert!(normalized.contains("\"node_contracts\""));
+    assert!(normalized.contains("\"artifact_requirements\""));
+    assert!(normalized.contains("\"stop_gate\""));
 
     let json = flow_export(&lock, FlowExportFormat::Json);
     let yaml = flow_export(&lock, FlowExportFormat::Yaml);
 
-    assert!(json.contains("exists(event.review_requested)"));
+    assert!(json.contains("exists(artifact.items)"));
     assert!(json.contains("readme.main"));
     assert!(yaml.contains("artifact.items"));
     assert!(yaml.contains("readme.main"));
@@ -875,6 +1227,46 @@ fn route_predicates_reject_effectful_calls_and_non_fact_roots() {
             "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
             "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
             "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
+            "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
+            "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
+        ]
+    );
+}
+
+#[test]
+fn route_predicates_reject_runtime_unsupported_compound_expressions() {
+    let mut draft = valid_draft();
+    draft.routes = vec![FlowRoute {
+        predicate: "artifact.schema == 'handoff.v1' && board.ready == true".into(),
+        for_each: None,
+        activate: "finish".into(),
+    }];
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN"]
+    );
+}
+
+#[test]
+fn route_predicates_reject_event_sources_until_runtime_can_execute_them() {
+    let mut draft = valid_draft();
+    draft.routes = ["event.review_requested", "exists(event.review_requested)"]
+        .into_iter()
+        .map(|predicate| FlowRoute {
+            predicate: predicate.into(),
+            for_each: None,
+            activate: "finish".into(),
+        })
+        .collect();
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec![
             "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
             "FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN",
         ]

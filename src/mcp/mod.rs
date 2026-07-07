@@ -1,18 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 
-use crate::adapters::tmux::{CommandRunner, SystemCommandRunner, TmuxAdapter};
+use crate::adapters::tmux::{
+    CommandRunner, SystemCommandRunner, TmuxAdapter, TmuxPane, TmuxWindow,
+};
 use crate::flow;
-use crate::runtime::{self, BoardPatch, NodeSpec, Runtime, StopContract};
-use crate::view::{VisualizationSnapshot, render_terminal_dashboard, serve_browser_snapshot};
-use flow_json::flow_draft_json;
+use crate::runtime::{
+    self, BoardPatch, ControlCommand, DriverState, DriverTickInput, NodeSpec, Runtime, StopContract,
+};
+use crate::view::VisualizationSnapshot;
 use serde_json::{Value, json};
 
 mod flow_json;
+mod flow_tools;
+mod review_tools;
 mod route_preview;
+mod runtime_control;
 mod surface;
+mod tmux_tools;
+mod update_tools;
+mod view_tools;
 
-pub use surface::{AUTHORING_TOOL_NAMES, McpSurface, McpToolDescriptor, RUNTIME_TOOL_NAMES};
+pub use surface::{
+    AUTHORING_TOOL_NAMES, McpSurface, McpToolDescriptor, REVIEW_TOOL_NAMES, RUNTIME_TOOL_NAMES,
+};
 
 pub struct McpServer<R: CommandRunner = SystemCommandRunner> {
     surface: McpSurface,
@@ -94,16 +105,28 @@ impl<R: CommandRunner> McpServer<R> {
             "activate_node" => self.activate_node(arguments),
             "send_message" => self.send_message(arguments),
             "validate_stop" => self.validate_stop(arguments),
+            "observe_stop" => self.observe_stop(arguments),
             "apply_flow_lock" => self.apply_flow_lock(arguments),
             "preview_flow_routes" => self.preview_flow_routes(arguments),
+            "run_flow" => self.run_flow(arguments),
+            "run_status" => self.run_status(arguments),
+            "run_why" => self.run_why(arguments),
+            "pause_run" => self.pause_run(arguments),
+            "resume_run" => self.resume_run(arguments),
+            "stop_run" => self.stop_run(arguments),
             "view_terminal" => self.view_terminal(arguments),
             "view_snapshot" => self.view_snapshot(arguments),
             "view_browser" => self.view_browser(arguments),
+            "flow_repair" => self.flow_repair(arguments),
             "flow_apply" => self.flow_apply(arguments),
             "flow_suggest" => self.flow_suggest(arguments),
             "flow_check" => self.flow_check(arguments),
             "flow_lock" => self.flow_lock(arguments),
             "flow_export" => self.flow_export(arguments),
+            "propose_flow_update" => self.propose_flow_update(arguments),
+            "apply_flow_update" => self.apply_flow_update(arguments),
+            "prepare_flow_review" => self.prepare_flow_review(arguments),
+            "approve_flow_review" => self.approve_flow_review(arguments),
             _ => Ok(ToolCallResult::error(
                 json!({ "ok": false, "error": "unknown tool" }),
             )),
@@ -113,57 +136,32 @@ impl<R: CommandRunner> McpServer<R> {
     fn start_run(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         let run_id = require_string(arguments, &["run_id", "runId"])?;
         let nodes = node_specs(arguments)?;
-        validate_start_run_preconditions(&self.state.runtime, run_id, &nodes)?;
-        let tmux = self.start_run_tmux_metadata(run_id, arguments)?;
+        validate_start_run_preconditions(self.state.runtime(), run_id, &nodes)?;
+        let activation_ids = nodes
+            .iter()
+            .map(|node| node.id().to_string())
+            .collect::<Vec<_>>();
+        let tmux = self.start_run_tmux_metadata(run_id, arguments, &activation_ids)?;
         let activation_ids = self
             .state
-            .runtime
+            .runtime_mut()
             .start_run(run_id, nodes)
             .map_err(ToolError::from_runtime)?;
+        self.state
+            .remember_tmux_allocation(run_id, &tmux.window, &tmux.panes);
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
             "run_id": run_id,
             "activation_ids": activation_ids,
-            "tmux": tmux
+            "tmux": tmux.structured
         })))
-    }
-
-    fn start_run_tmux_metadata(&self, run_id: &str, arguments: &Value) -> Result<Value, ToolError> {
-        match tmux_start_options(arguments)? {
-            TmuxStartOptions::Disabled => Ok(json!({
-                "enabled": false,
-                "created": false
-            })),
-            TmuxStartOptions::Enabled {
-                session_id,
-                window_name,
-            } => {
-                let session = self
-                    .tmux_adapter
-                    .ensure_session(session_id.as_str())
-                    .map_err(ToolError::from_tmux)?;
-                let window = self
-                    .tmux_adapter
-                    .create_window_named(&session, run_id, window_name.as_str())
-                    .map_err(ToolError::from_tmux)?;
-
-                Ok(json!({
-                    "enabled": true,
-                    "created": true,
-                    "session_id": session.id(),
-                    "window_id": window.id(),
-                    "window_name": window.name(),
-                    "run_id": window.run_id()
-                }))
-            }
-        }
     }
 
     fn get_context(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         match optional_string(arguments, &["run_id", "runId"])? {
             Some(run_id) => {
-                if !self.state.runtime.has_run(run_id) {
+                if !self.state.runtime().has_run(run_id) {
                     return Err(ToolError::from_runtime(
                         runtime::RuntimeError::RunNotFound {
                             run_id: run_id.to_owned(),
@@ -206,12 +204,12 @@ impl<R: CommandRunner> McpServer<R> {
         let payload = payload_string(arguments.get("payload"))?;
         let artifact_id = self
             .state
-            .runtime
+            .runtime_mut()
             .deliver_artifact(run_id, activation_id, artifact_key, payload)
             .map_err(ToolError::from_runtime)?;
         let record = self
             .state
-            .runtime
+            .runtime()
             .state()
             .artifact_records
             .get(&artifact_id)
@@ -242,10 +240,10 @@ impl<R: CommandRunner> McpServer<R> {
         let node = node_spec_from_arguments(node_id, arguments)?;
         let activation_ids = self
             .state
-            .runtime
+            .runtime_mut()
             .fanout_from_artifact(run_id, &node, artifact_key)
             .map_err(ToolError::from_runtime)?;
-        let state = self.state.runtime.state();
+        let state = self.state.runtime().state();
         let activations = activation_ids
             .iter()
             .map(|activation_id| {
@@ -277,7 +275,7 @@ impl<R: CommandRunner> McpServer<R> {
         let effect_key = require_string(arguments, &["effect_key", "effectKey", "key"])?;
         let payload = payload_string(arguments.get("payload"))?;
         self.state
-            .runtime
+            .runtime_mut()
             .record_effect(run_id, activation_id, effect_key, payload)
             .map_err(ToolError::from_runtime)?;
 
@@ -297,7 +295,7 @@ impl<R: CommandRunner> McpServer<R> {
             return Err(ToolError::invalid("patch must include at least one key"));
         }
         let expected_version = optional_u64(arguments, &["expected_version", "expectedVersion"])?;
-        let mut board_version = self.state.runtime.state().board_version;
+        let mut board_version = self.state.runtime().state().board_version;
         for (index, (key, value)) in patch.iter().enumerate() {
             let mut board_patch = BoardPatch::new(key, value_as_string(value)?);
             if index == 0 {
@@ -307,7 +305,7 @@ impl<R: CommandRunner> McpServer<R> {
             }
             board_version = self
                 .state
-                .runtime
+                .runtime_mut()
                 .patch_board(run_id, activation_id, board_patch)
                 .map_err(ToolError::from_runtime)?;
         }
@@ -335,7 +333,7 @@ impl<R: CommandRunner> McpServer<R> {
         let node = node_spec_from_arguments(node_id, arguments)?;
         let activation_id = self
             .state
-            .runtime
+            .runtime_mut()
             .activate_node(run_id, &node, None)
             .map_err(ToolError::from_runtime)?;
 
@@ -370,7 +368,7 @@ impl<R: CommandRunner> McpServer<R> {
         let run_id = require_string(arguments, &["run_id", "runId"])?;
         let activation_id = require_string(arguments, &["activation_id", "activationId"])?;
 
-        match self.state.runtime.validate_stop(run_id, activation_id) {
+        match self.state.runtime().validate_stop(run_id, activation_id) {
             Ok(()) => Ok(ToolCallResult::ok(json!({
                 "ok": true,
                 "run_id": run_id,
@@ -419,7 +417,7 @@ impl<R: CommandRunner> McpServer<R> {
                 "error": "flow lock content hash mismatch"
             })));
         }
-        if !self.state.runtime.has_run(run_id) {
+        if !self.state.runtime().has_run(run_id) {
             let mut structured = run_not_found_guidance(run_id);
             if let Some(object) = structured.as_object_mut() {
                 object.insert("mode".to_string(), json!(flow_lock_mode_name(mode)));
@@ -431,7 +429,7 @@ impl<R: CommandRunner> McpServer<R> {
         }
 
         self.state
-            .runtime
+            .runtime_mut()
             .apply_flow_lock(run_id, mode, lock_id, provided_content_hash)
             .map_err(ToolError::from_runtime)?;
 
@@ -446,219 +444,6 @@ impl<R: CommandRunner> McpServer<R> {
 
     fn preview_flow_routes(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         route_preview::preview_flow_routes(&self.state, arguments)
-    }
-
-    fn view_terminal(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let snapshot = self.view_snapshot_arg(arguments)?;
-        let run_count = snapshot.runs.len();
-        let dashboard = render_terminal_dashboard(&snapshot);
-
-        Ok(ToolCallResult::ok(json!({
-            "ok": true,
-            "format": "terminal",
-            "dashboard": dashboard,
-            "run_count": run_count
-        })))
-    }
-
-    fn view_snapshot(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let snapshot = self.view_snapshot_arg(arguments)?;
-        let run_count = snapshot.runs.len();
-
-        Ok(ToolCallResult::ok(json!({
-            "ok": true,
-            "format": "json",
-            "snapshot": snapshot,
-            "run_count": run_count
-        })))
-    }
-
-    fn view_browser(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let host = optional_string(arguments, &["host"])?.unwrap_or("127.0.0.1");
-        let host = match host {
-            "127.0.0.1" | "localhost" => "127.0.0.1",
-            _ => {
-                return Err(ToolError::invalid(
-                    "view_browser host must be loopback: 127.0.0.1 or localhost",
-                ));
-            }
-        };
-        let port = optional_u64(arguments, &["port"])?
-            .map(u16::try_from)
-            .transpose()
-            .map_err(|_| ToolError::invalid("port must be between 0 and 65535"))?
-            .unwrap_or(0);
-        let snapshot = self.state.runtime_snapshot();
-        let run_count = snapshot.runs.len();
-        let server = serve_browser_snapshot(host, port, &snapshot).map_err(ToolError::from_view)?;
-
-        Ok(ToolCallResult::ok(json!({
-            "ok": true,
-            "url": server.url,
-            "host": server.host,
-            "port": server.port,
-            "run_count": run_count
-        })))
-    }
-
-    fn view_snapshot_arg(&self, arguments: &Value) -> Result<VisualizationSnapshot, ToolError> {
-        let snapshot = self.state.runtime_snapshot();
-        match optional_string(arguments, &["run_id", "runId"])? {
-            Some(run_id) => {
-                let Some(run) = snapshot.run(run_id) else {
-                    return Err(ToolError::from_runtime(
-                        runtime::RuntimeError::RunNotFound {
-                            run_id: run_id.to_string(),
-                        },
-                    ));
-                };
-                Ok(VisualizationSnapshot {
-                    runs: vec![run.clone()],
-                })
-            }
-            None => Ok(snapshot),
-        }
-    }
-
-    fn flow_apply(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        if arguments.get("flow").is_some() {
-            let draft = flow_draft_arg(arguments)?;
-            if flow_draft_is_empty(&draft) {
-                return Err(ToolError::invalid(
-                    "flow must include at least one authoring field",
-                ));
-            }
-            let mode = flow_check_mode_arg(arguments)?;
-            return match flow::flow_lock(&draft, mode) {
-                Ok(lock) => {
-                    let lock_id = lock.id().to_string();
-                    let content_hash = content_hash(lock.normalized_content());
-                    let diagnostics = diagnostics_json(lock.diagnostics());
-                    self.state.flow_locks.insert(lock_id.clone(), lock);
-                    Ok(ToolCallResult::ok(json!({
-                        "ok": true,
-                        "mode": flow_check_mode_name(mode),
-                        "flow_lock_id": lock_id,
-                        "lock_id": lock_id,
-                        "content_hash": content_hash,
-                        "diagnostics": diagnostics
-                    })))
-                }
-                Err(err) => Ok(ToolCallResult::error(json!({
-                    "ok": false,
-                    "mode": flow_check_mode_name(mode),
-                    "diagnostics": diagnostics_json(&err.diagnostics)
-                }))),
-            };
-        }
-
-        let flow_lock_id = require_string(
-            arguments,
-            &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
-        )?;
-        let Some(lock) = self.state.flow_locks.get(flow_lock_id) else {
-            return Ok(ToolCallResult::error(json!({
-                "ok": false,
-                "flow_lock_id": flow_lock_id,
-                "error": "flow lock not found"
-            })));
-        };
-        let content_hash = content_hash(lock.normalized_content());
-
-        Ok(ToolCallResult::ok(json!({
-            "ok": true,
-            "mode": flow_check_mode_name(lock.mode()),
-            "flow_lock_id": flow_lock_id,
-            "lock_id": flow_lock_id,
-            "content_hash": content_hash,
-            "diagnostics": diagnostics_json(lock.diagnostics())
-        })))
-    }
-
-    fn flow_suggest(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let input = flow_suggest_input_arg(arguments)?;
-        let draft = flow::flow_suggest(input)
-            .map_err(|err| ToolError::invalid(err.message().to_string()))?;
-        let report = flow::flow_check(&draft, flow::FlowCheckMode::Core);
-        let valid = !report.has_errors();
-        let structured = json!({
-            "ok": valid,
-            "flow": flow_draft_json(&draft),
-            "mode": flow_check_mode_name(report.mode),
-            "diagnostics": diagnostics_json(&report.diagnostics),
-            "valid": valid
-        });
-
-        if valid {
-            Ok(ToolCallResult::ok(structured))
-        } else {
-            Ok(ToolCallResult::error(structured))
-        }
-    }
-
-    fn flow_check(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let draft = flow_draft_arg(arguments)?;
-        let mode = flow_check_mode_arg(arguments)?;
-        let report = flow::flow_check(&draft, mode);
-        let ok = !report.has_errors();
-        let structured = json!({
-            "ok": ok,
-            "mode": flow_check_mode_name(report.mode),
-            "diagnostics": diagnostics_json(&report.diagnostics)
-        });
-
-        if ok {
-            Ok(ToolCallResult::ok(structured))
-        } else {
-            Ok(ToolCallResult::error(structured))
-        }
-    }
-
-    fn flow_lock(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let draft = flow_draft_arg(arguments)?;
-        let mode = flow_check_mode_arg(arguments)?;
-        match flow::flow_lock(&draft, mode) {
-            Ok(lock) => {
-                let lock_id = lock.id().to_string();
-                let content_hash = content_hash(lock.normalized_content());
-                self.state.flow_locks.insert(lock_id.clone(), lock);
-                Ok(ToolCallResult::ok(json!({
-                    "ok": true,
-                    "mode": flow_check_mode_name(mode),
-                    "flow_lock_id": lock_id,
-                    "lock_id": lock_id,
-                    "content_hash": content_hash
-                })))
-            }
-            Err(err) => Ok(ToolCallResult::error(json!({
-                "ok": false,
-                "mode": flow_check_mode_name(mode),
-                "diagnostics": diagnostics_json(&err.diagnostics)
-            }))),
-        }
-    }
-
-    fn flow_export(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let flow_lock_id = require_string(
-            arguments,
-            &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
-        )?;
-        let format = flow_export_format_arg(arguments)?;
-        let Some(lock) = self.state.flow_locks.get(flow_lock_id) else {
-            return Ok(ToolCallResult::error(json!({
-                "ok": false,
-                "flow_lock_id": flow_lock_id,
-                "error": "flow lock not found"
-            })));
-        };
-        let document = flow::flow_export(lock, format);
-
-        Ok(ToolCallResult::ok(json!({
-            "ok": true,
-            "flow_lock_id": flow_lock_id,
-            "format": flow_export_format_name(format),
-            "document": document
-        })))
     }
 }
 
@@ -688,14 +473,80 @@ pub fn serve_stdio<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::
 
 #[derive(Debug, Default)]
 struct McpServerState {
-    runtime: Runtime,
+    driver: DriverState,
     flow_locks: BTreeMap<String, flow::FlowLock>,
+    reviews: BTreeMap<String, FlowReviewRecord>,
+    flow_review_index: BTreeMap<String, String>,
+    proposed_updates: BTreeMap<String, ProposedFlowUpdate>,
     messages: BTreeMap<String, Vec<Value>>,
+    tmux_windows: BTreeMap<String, TmuxWindow>,
+    tmux_panes: BTreeMap<(String, String), TmuxPane>,
 }
 
 impl McpServerState {
+    fn runtime(&self) -> &Runtime {
+        self.driver.runtime()
+    }
+
+    fn runtime_mut(&mut self) -> &mut Runtime {
+        self.driver.runtime_mut()
+    }
+
+    fn tick_control(&mut self, control: ControlCommand) -> runtime::DriverTickReport {
+        self.driver
+            .tick(self.driver_tick_input().with_control(control))
+    }
+
+    fn tick_stop_observation(
+        &mut self,
+        run_id: &str,
+        activation_id: &str,
+        observation: runtime::StopObservation,
+    ) -> runtime::DriverTickReport {
+        self.driver
+            .tick(self.driver_tick_input().with_stop_observation(
+                run_id,
+                activation_id,
+                observation,
+            ))
+    }
+
+    fn driver_tick_input(&self) -> DriverTickInput {
+        let mut input = DriverTickInput::default();
+        let lock_ids = self
+            .runtime()
+            .state()
+            .flow_lock_id_by_run
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for lock_id in lock_ids {
+            if let Some(lock) = self.flow_locks.get(&lock_id) {
+                input = input.with_route_lock(lock.clone());
+            }
+        }
+        input
+    }
+
+    fn remember_tmux_allocation(
+        &mut self,
+        run_id: &str,
+        window: &Option<TmuxWindow>,
+        panes: &[TmuxPane],
+    ) {
+        if let Some(window) = window {
+            self.tmux_windows.insert(run_id.to_string(), window.clone());
+        }
+        for pane in panes {
+            self.tmux_panes.insert(
+                (run_id.to_string(), pane.activation_id().to_string()),
+                pane.clone(),
+            );
+        }
+    }
+
     fn runtime_snapshot(&self) -> VisualizationSnapshot {
-        VisualizationSnapshot::from_runtime(self.runtime.state(), &self.message_counts())
+        VisualizationSnapshot::from_runtime(self.runtime().state(), &self.message_counts())
     }
 
     fn message_counts(&self) -> BTreeMap<String, usize> {
@@ -704,6 +555,42 @@ impl McpServerState {
             .map(|(run_id, messages)| (run_id.clone(), messages.len()))
             .collect()
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct FlowReviewRecord {
+    review_id: String,
+    lock_id: String,
+    content_hash: String,
+    status: FlowReviewStatus,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FlowReviewStatus {
+    Pending,
+    Approved,
+    Bypassed,
+    Rejected,
+}
+
+impl FlowReviewStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Bypassed => "bypassed",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ProposedFlowUpdate {
+    mode: runtime::FlowLockMode,
+    content_hash: String,
+    summary: String,
+    review_required: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -835,12 +722,15 @@ fn content_length(line: &str) -> Option<usize> {
     }
 }
 
+const SERVER_INSTRUCTIONS: &str = "When a user asks to use Humanize or workflow, start with flow_suggest from the terse natural-language request, then call flow_check, flow_lock, prepare_flow_review, approve_flow_review with an approved or bypassed decision, and run_flow; do not substitute ordinary repo exploration for this workflow. Validate that the flow package includes a README before locking or running.";
+
 fn initialize_result() -> Value {
     json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
             "tools": {}
         },
+        "instructions": SERVER_INSTRUCTIONS,
         "serverInfo": {
             "name": "humanize-plugin-mcp",
             "version": env!("CARGO_PKG_VERSION")
@@ -953,6 +843,18 @@ fn optional_u64(arguments: &Value, names: &[&str]) -> Result<Option<u64>, ToolEr
                 .as_u64()
                 .map(Some)
                 .ok_or_else(|| ToolError::invalid(format!("{name} must be an unsigned integer")));
+        }
+    }
+    Ok(None)
+}
+
+fn optional_bool(arguments: &Value, names: &[&str]) -> Result<Option<bool>, ToolError> {
+    for name in names {
+        if let Some(value) = arguments.get(*name) {
+            return value
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be a boolean")));
         }
     }
     Ok(None)
@@ -1176,6 +1078,26 @@ fn flow_lock_mode_arg(arguments: &Value) -> Result<runtime::FlowLockMode, ToolEr
     }
 }
 
+fn optional_flow_lock_mode_arg(
+    arguments: &Value,
+    names: &[&str],
+) -> Result<Option<runtime::FlowLockMode>, ToolError> {
+    let Some(value) = optional_string(arguments, names)? else {
+        return Ok(None);
+    };
+    match value {
+        "future_activations" | "futureActivations" | "future-activations" => {
+            Ok(Some(runtime::FlowLockMode::FutureActivations))
+        }
+        "checkpoint_restart" | "checkpointRestart" | "checkpoint-restart" => {
+            Ok(Some(runtime::FlowLockMode::CheckpointRestart))
+        }
+        value => Err(ToolError::invalid(format!(
+            "unknown flow lock mode: {value}"
+        ))),
+    }
+}
+
 fn flow_lock_mode_name(mode: runtime::FlowLockMode) -> &'static str {
     match mode {
         runtime::FlowLockMode::FutureActivations => "future_activations",
@@ -1205,6 +1127,95 @@ fn flow_suggest_input_arg(arguments: &Value) -> Result<flow::FlowSuggestInput, T
         nodes: optional_string_array(arguments, &["nodes"])?,
         artifact: optional_string(arguments, &["artifact"])?.map(str::to_string),
     })
+}
+
+fn flow_repair_input_arg(arguments: &Value) -> Result<flow::FlowRepairInput, ToolError> {
+    let mode = flow_check_mode_arg(arguments)?;
+    let flow = require_object_arg(arguments, &["flow"])?;
+    let draft = flow_draft_for_repair(flow)?;
+    let route_authoring = route_authoring_arg(arguments, flow)?;
+
+    Ok(flow::FlowRepairInput {
+        draft,
+        mode,
+        route_authoring,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn flow_draft_for_repair(
+    flow: &serde_json::Map<String, Value>,
+) -> Result<flow::FlowDraft, ToolError> {
+    Ok(flow::FlowDraft {
+        nodes: optional_array_field(flow, "nodes")?
+            .iter()
+            .map(parse_flow_node)
+            .collect::<Result<Vec<_>, _>>()?,
+        contracts: optional_array_field(flow, "contracts")?
+            .iter()
+            .map(parse_flow_contract)
+            .collect::<Result<Vec<_>, _>>()?,
+        routes: optional_array_field(flow, "routes")?
+            .iter()
+            .filter_map(|route| parse_flow_route(route).ok())
+            .collect::<Vec<_>>(),
+        resources: optional_array_field(flow, "resources")?
+            .iter()
+            .map(parse_flow_resource)
+            .collect::<Result<Vec<_>, _>>()?,
+        imports: optional_array_field(flow, "imports")?
+            .iter()
+            .map(parse_flow_import)
+            .collect::<Result<Vec<_>, _>>()?,
+        policies: parse_flow_policies(flow.get("policies"))?,
+        extensions: match flow.get("extensions") {
+            Some(value) => string_array(value, "extensions")?,
+            None => Vec::new(),
+        },
+    })
+}
+
+fn route_authoring_arg(
+    arguments: &Value,
+    flow: &serde_json::Map<String, Value>,
+) -> Result<Vec<flow::RouteAuthoring>, ToolError> {
+    let source = match arguments.get("route_authoring") {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| ToolError::invalid("route_authoring must be an array"))?,
+        None => optional_array_field(flow, "routes")?,
+    };
+
+    source.iter().map(parse_route_authoring).collect()
+}
+
+fn parse_route_authoring(value: &Value) -> Result<flow::RouteAuthoring, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("route_authoring items must be objects"))?;
+
+    Ok(flow::RouteAuthoring {
+        when: optional_string_field(object, &["when"])?.map(str::to_string),
+        predicate: object
+            .get("predicate")
+            .map(parse_route_predicate)
+            .transpose()?,
+        to: optional_string_field(object, &["to"])?.map(str::to_string),
+        activate: optional_string_field(object, &["activate"])?.map(str::to_string),
+        for_each: optional_string_field(object, &["for_each", "forEach"])?.map(str::to_string),
+    })
+}
+
+fn parse_route_predicate(value: &Value) -> Result<flow::RoutePredicateDraft, ToolError> {
+    match value {
+        Value::String(value) => Ok(flow::RoutePredicateDraft::Text(value.clone())),
+        Value::Object(object) => Ok(flow::RoutePredicateDraft::Artifact(
+            string_field(object, &["artifact"])?.to_string(),
+        )),
+        _ => Err(ToolError::invalid(
+            "predicate must be a string or an object with artifact",
+        )),
+    }
 }
 
 fn flow_draft_arg(arguments: &Value) -> Result<flow::FlowDraft, ToolError> {
@@ -1504,6 +1515,79 @@ fn flow_export_format_name(format: flow::FlowExportFormat) -> &'static str {
     }
 }
 
+fn input_severity_name(diagnostics: &[flow::Diagnostic]) -> &'static str {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity_level == flow::DiagnosticSeverity::Fatal)
+    {
+        "fatal"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity_level == flow::DiagnosticSeverity::Error)
+    {
+        "error"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity_level == flow::DiagnosticSeverity::Warning)
+    {
+        "warning"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity_level == flow::DiagnosticSeverity::Note)
+    {
+        "note"
+    } else {
+        "none"
+    }
+}
+
+fn repair_patches_json(patches: &[flow::FlowRepairPatch]) -> Vec<Value> {
+    patches
+        .iter()
+        .map(|patch| {
+            json!({
+                "repair_kind": repair_kind_name(patch.repair_kind),
+                "location": patch.location,
+                "replacement": patch.replacement
+            })
+        })
+        .collect()
+}
+
+fn repair_candidates_json(candidates: &[flow::FlowRepairCandidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "repair_kind": repair_kind_name(candidate.repair_kind),
+                "location": candidate.location,
+                "replacement": candidate.replacement
+            })
+        })
+        .collect()
+}
+
+fn repair_guidance_json(diagnostics: &[flow::Diagnostic]) -> Vec<Value> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "code": diagnostic.code,
+                "location": diagnostic.location,
+                "message": diagnostic.message,
+                "fix_hint": diagnostic.fix_hint,
+                "why_it_matters": diagnostic.why_it_matters,
+                "repairability": repairability_name(diagnostic.repairability),
+                "repair_kinds": diagnostic
+                    .repair_kinds
+                    .iter()
+                    .map(|kind| repair_kind_name(*kind))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
 fn diagnostics_json(diagnostics: &[flow::Diagnostic]) -> Vec<Value> {
     diagnostics
         .iter()
@@ -1511,18 +1595,86 @@ fn diagnostics_json(diagnostics: &[flow::Diagnostic]) -> Vec<Value> {
             json!({
                 "code": diagnostic.code,
                 "severity": severity_name(diagnostic.severity),
+                "severity_level": diagnostic_severity_name(diagnostic.severity_level),
+                "domain": diagnostic_domain_name(diagnostic.domain),
+                "repairability": repairability_name(diagnostic.repairability),
                 "location": diagnostic.location,
                 "message": diagnostic.message,
-                "fix_hint": diagnostic.fix_hint
+                "fix_hint": diagnostic.fix_hint,
+                "why_it_matters": diagnostic.why_it_matters,
+                "repair_kinds": diagnostic
+                    .repair_kinds
+                    .iter()
+                    .map(|kind| repair_kind_name(*kind))
+                    .collect::<Vec<_>>()
             })
         })
         .collect()
+}
+
+fn diagnostic_codes_text(diagnostics: &[flow::Diagnostic]) -> String {
+    if diagnostics.is_empty() {
+        "none".to_string()
+    } else {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn severity_name(severity: flow::Severity) -> &'static str {
     match severity {
         flow::Severity::Error => "error",
         flow::Severity::Warning => "warning",
+    }
+}
+
+fn diagnostic_severity_name(severity: flow::DiagnosticSeverity) -> &'static str {
+    match severity {
+        flow::DiagnosticSeverity::Fatal => "fatal",
+        flow::DiagnosticSeverity::Error => "error",
+        flow::DiagnosticSeverity::Warning => "warning",
+        flow::DiagnosticSeverity::Note => "note",
+    }
+}
+
+fn diagnostic_domain_name(domain: flow::DiagnosticDomain) -> &'static str {
+    match domain {
+        flow::DiagnosticDomain::Package => "package",
+        flow::DiagnosticDomain::Contract => "contract",
+        flow::DiagnosticDomain::Resource => "resource",
+        flow::DiagnosticDomain::Route => "route",
+        flow::DiagnosticDomain::Policy => "policy",
+        flow::DiagnosticDomain::RuntimeCompat => "runtime_compat",
+    }
+}
+
+fn repairability_name(repairability: flow::Repairability) -> &'static str {
+    match repairability {
+        flow::Repairability::Automatic => "automatic",
+        flow::Repairability::Candidate => "candidate",
+        flow::Repairability::GuidanceOnly => "guidance_only",
+        flow::Repairability::None => "none",
+    }
+}
+
+fn repair_kind_name(kind: flow::RepairKind) -> &'static str {
+    match kind {
+        flow::RepairKind::RouteWhenToPredicate => "route_when_to_predicate",
+        flow::RepairKind::RouteToToActivate => "route_to_to_activate",
+        flow::RepairKind::RouteArtifactObjectToExists => "route_artifact_object_to_exists",
+        flow::RepairKind::RouteBareArtifactDeliveredToExists => {
+            "route_bare_artifact_delivered_to_exists"
+        }
+        flow::RepairKind::AddRouteTarget => "add_route_target",
+        flow::RepairKind::AddReadmeResource => "add_readme_resource",
+        flow::RepairKind::GenerateReadme => "generate_readme",
+        flow::RepairKind::AddArtifactSchema => "add_artifact_schema",
+        flow::RepairKind::AddContractCompletion => "add_contract_completion",
+        flow::RepairKind::NarrowWriteScope => "narrow_write_scope",
+        flow::RepairKind::ProvideRuntimeResource => "provide_runtime_resource",
     }
 }
 

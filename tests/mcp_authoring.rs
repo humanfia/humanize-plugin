@@ -6,7 +6,7 @@ use serde_json::json;
 use support::mcp::{
     assert_prefixed_hex, assert_tool_error, blank_inline_readme_flow, call_tool, diagnostic_codes,
     lock_valid_flow, missing_readme_flow, node_less_missing_readme_flow, readme_resource,
-    structured,
+    structured, valid_flow,
 };
 
 #[test]
@@ -228,6 +228,126 @@ fn flow_action_export_uses_snake_case_after_lock() {
     assert!(!content.contains("promptRef"));
     assert!(!content.contains("resourceRefs"));
     assert!(!content.contains("verdictArtifact"));
+}
+#[test]
+fn flow_repair_returns_mechanical_patches_and_unranked_candidates() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_repair",
+        json!({
+            "flow": valid_flow(),
+            "route_authoring": [
+                {
+                    "when": "exists(artifact.ready)",
+                    "to": "finish"
+                },
+                {
+                    "predicate": {
+                        "artifact": "summary"
+                    },
+                    "activate": "finish"
+                },
+                {
+                    "predicate": "artifact.report.delivered",
+                    "activate": ""
+                }
+            ]
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(structured(&response)["ok"], true);
+    assert_eq!(structured(&response)["repairable"], true);
+    assert_eq!(structured(&response)["input_severity"], "none");
+    assert_eq!(
+        structured(&response)["patches"][0],
+        json!({
+            "repair_kind": "route_when_to_predicate",
+            "location": "routes[0].when",
+            "replacement": "predicate: exists(artifact.ready)"
+        })
+    );
+    let candidate = structured(&response)["candidates"][0]
+        .as_object()
+        .expect("candidate should be an object");
+    assert_eq!(
+        candidate.get("repair_kind"),
+        Some(&json!("route_bare_artifact_delivered_to_exists"))
+    );
+    assert!(candidate.get("rank").is_none());
+    assert!(candidate.get("recommended").is_none());
+    assert!(candidate.get("best_candidate").is_none());
+}
+
+#[test]
+fn flow_repair_keeps_fatal_input_patch_free() {
+    let mut server = McpServer::new();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_repair",
+        json!({
+            "flow": {
+                "nodes": ["root"],
+                "resources": [readme_resource()],
+                "extensions": ["NodeActivation"]
+            },
+            "route_authoring": [
+                {
+                    "when": "exists(artifact.ready)",
+                    "to": "root"
+                }
+            ]
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(structured(&response)["ok"], true);
+    assert_eq!(structured(&response)["repairable"], false);
+    assert_eq!(structured(&response)["input_severity"], "fatal");
+    assert_eq!(structured(&response)["patches"], json!([]));
+    assert_eq!(
+        diagnostic_codes(&response),
+        vec!["FLOW_AUTHORING_PRIMITIVE_MISUSE"]
+    );
+}
+
+#[test]
+fn propose_flow_update_locks_flow_and_reports_review_risk() {
+    let mut server = McpServer::new();
+
+    let proposed = call_tool(
+        &mut server,
+        1,
+        "propose_flow_update",
+        json!({
+            "flow": valid_flow(),
+            "apply_mode": "future_activations",
+            "summary": "Add reviewed route activation."
+        }),
+    );
+
+    assert_eq!(proposed["result"]["isError"], false);
+    assert_eq!(structured(&proposed)["ok"], true);
+    assert_eq!(structured(&proposed)["apply_mode"], "future_activations");
+    assert_eq!(structured(&proposed)["review_required"], true);
+    assert_eq!(structured(&proposed)["risk"], "medium");
+    assert_prefixed_hex(
+        structured(&proposed)["flow_lock_id"]
+            .as_str()
+            .expect("proposal should include a flow lock id"),
+        "flk_",
+    );
+    assert_prefixed_hex(
+        structured(&proposed)["content_hash"]
+            .as_str()
+            .expect("proposal should include a content hash"),
+        "fnv1a64:",
+    );
 }
 
 #[test]

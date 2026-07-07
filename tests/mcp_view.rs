@@ -3,7 +3,7 @@ mod support;
 use humanize_plugin::mcp::McpServer;
 use serde_json::{Value, json};
 
-use support::mcp::{call_tool, http_get, populate_view_run, structured};
+use support::mcp::{call_tool, http_get, populate_view_run, structured, valid_flow};
 
 #[test]
 fn view_terminal_returns_dashboard_for_runtime_snapshot() {
@@ -20,7 +20,7 @@ fn view_terminal_returns_dashboard_for_runtime_snapshot() {
         .expect("dashboard should be text");
     assert!(dashboard.contains("humanize dashboard"));
     assert!(dashboard.contains(
-        "run run-view | activations 1 | board v0 | messages 0 | artifacts 1 | effects 1 | missing 2"
+        "run run-view | activations 1 | board version 0 | messages 0 | artifacts 1 | effects 1 | missing 2"
     ));
     assert!(dashboard.contains("root | node root | missing artifact:report, effect:review"));
 }
@@ -67,6 +67,99 @@ fn view_snapshot_returns_filterable_structured_snapshot() {
             .contains("missing-run")
     );
 }
+
+#[test]
+fn prepare_flow_review_returns_document_and_snapshot_sections() {
+    let mut server = McpServer::new();
+
+    let prepared = call_tool(
+        &mut server,
+        1,
+        "prepare_flow_review",
+        json!({
+            "flow": valid_flow()
+        }),
+    );
+
+    assert_eq!(structured(&prepared)["ok"], true);
+    assert_eq!(structured(&prepared)["review_status"], "pending");
+    assert!(
+        structured(&prepared)["review_id"]
+            .as_str()
+            .expect("review id should be present")
+            .starts_with("review_")
+    );
+    let snapshot = &structured(&prepared)["snapshot"];
+    for key in [
+        "graph",
+        "nodes",
+        "routes",
+        "contracts",
+        "capabilities",
+        "risks",
+        "dynamic_diff",
+    ] {
+        assert!(snapshot.get(key).is_some(), "snapshot should include {key}");
+    }
+    let document = structured(&prepared)["document"]
+        .as_str()
+        .expect("document should be present");
+    assert!(document.contains("Flow Review"));
+    assert!(document.contains("Workflow Graph"));
+    assert!(document.contains("Dynamic Update Diff"));
+}
+
+#[test]
+fn approve_flow_review_records_bypass_reason_and_rejects_missing_reason() {
+    let mut server = McpServer::new();
+
+    let prepared = call_tool(
+        &mut server,
+        1,
+        "prepare_flow_review",
+        json!({
+            "flow": valid_flow()
+        }),
+    );
+    let review_id = structured(&prepared)["review_id"]
+        .as_str()
+        .expect("review id should be present");
+
+    let missing_reason = call_tool(
+        &mut server,
+        2,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "bypassed"
+        }),
+    );
+    assert_eq!(missing_reason["error"]["code"], -32602);
+    assert!(
+        missing_reason["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("reason")
+    );
+
+    let bypassed = call_tool(
+        &mut server,
+        3,
+        "approve_flow_review",
+        json!({
+            "review_id": review_id,
+            "decision": "bypassed",
+            "reason": "Emergency operator override."
+        }),
+    );
+    assert_eq!(structured(&bypassed)["ok"], true);
+    assert_eq!(structured(&bypassed)["review_status"], "bypassed");
+    assert_eq!(
+        structured(&bypassed)["reason"],
+        "Emergency operator override."
+    );
+}
+
 #[test]
 fn view_browser_rejects_non_loopback_host() {
     let mut server = McpServer::new();

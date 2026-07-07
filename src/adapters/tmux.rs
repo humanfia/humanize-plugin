@@ -2,6 +2,11 @@ use std::error::Error;
 use std::fmt;
 use std::process::Command;
 
+use crate::adapters::lifecycle::{
+    AdapterCapabilities, AgentLifecycleAdapter, LifecycleCleanup, LifecycleCleanupAction,
+    LifecycleStatus,
+};
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TmuxAdapter<R: CommandRunner = SystemCommandRunner> {
     runner: R,
@@ -79,6 +84,44 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Ok(session)
     }
 
+    pub fn has_session(&self, session: &TmuxSession) -> Result<bool, TmuxError> {
+        validate_session_id(session.id())?;
+        let check = self
+            .runner
+            .run(argv(["tmux", "has-session", "-t"], [session.id()]))?;
+        Ok(check.is_success())
+    }
+
+    fn create_session_with_window(
+        &self,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+    ) -> Result<(TmuxSession, TmuxWindow), TmuxError> {
+        let session = TmuxSession::new(session_id);
+        validate_session_id(session.id())?;
+        let run_id = run_id.into();
+        let window_name = window_name.into();
+        let output = self.run_checked(argv(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-s",
+                session.id(),
+                "-n",
+            ],
+            [window_name.as_str()],
+        ))?;
+        let window_id = trimmed_stdout(&output, "window id")?;
+        let window = TmuxWindow::new_named(session.id(), run_id, window_name, window_id);
+
+        Ok((session, window))
+    }
+
     pub fn create_window(
         &self,
         session: &TmuxSession,
@@ -118,6 +161,54 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             window_name,
             window_id,
         ))
+    }
+
+    fn ensure_window_named(
+        &self,
+        session: &TmuxSession,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+    ) -> Result<TmuxWindow, TmuxError> {
+        validate_session_id(session.id())?;
+        let run_id = run_id.into();
+        let window_name = window_name.into();
+        let output = self.run_checked(argv(
+            ["tmux", "list-windows", "-t", session.id(), "-F"],
+            ["#{window_name}\t#{window_id}"],
+        ))?;
+
+        if let Some(window_id) = listed_window_id(&output, &window_name)? {
+            return Ok(TmuxWindow::new_named(
+                session.id(),
+                run_id,
+                window_name,
+                window_id,
+            ));
+        }
+
+        self.create_window_named(session, run_id, window_name)
+    }
+
+    fn prepare_activation_window(
+        &self,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+    ) -> Result<(TmuxSession, TmuxWindow), TmuxError> {
+        let session = TmuxSession::new(session_id);
+        validate_session_id(session.id())?;
+        let run_id = run_id.into();
+        let window_name = window_name.into();
+        let check = self
+            .runner
+            .run(argv(["tmux", "has-session", "-t"], [session.id()]))?;
+
+        if check.is_success() {
+            let window = self.ensure_window_named(&session, run_id, window_name)?;
+            return Ok((session, window));
+        }
+
+        self.create_session_with_window(session.id(), run_id, window_name)
     }
 
     pub fn create_window_named_with_pane(
@@ -216,6 +307,13 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Ok(())
     }
 
+    pub fn send_key(&self, pane: &TmuxPane, key: &str) -> Result<(), TmuxError> {
+        validate_owned_session_id("pane", pane.session_id())?;
+        let target = pane_target(pane);
+        self.run_checked(argv(["tmux", "send-keys", "-t", target.as_str()], [key]))?;
+        Ok(())
+    }
+
     pub fn capture_pane(&self, pane: &TmuxPane) -> Result<String, TmuxError> {
         validate_owned_session_id("pane", pane.session_id())?;
         let target = pane_target(pane);
@@ -237,6 +335,271 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 stderr: output.stderr,
             })
         }
+    }
+}
+
+impl<R: CommandRunner> AgentLifecycleAdapter for TmuxAdapter<R> {
+    type ActivationRequest = TmuxActivationRequest;
+    type Activation = TmuxActivation;
+    type Handle = TmuxAgentHandle;
+    type Observation = TmuxLifecycleObservation;
+    type Error = TmuxError;
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::tmux_lifecycle()
+    }
+
+    fn prepare_activation(
+        &self,
+        request: Self::ActivationRequest,
+    ) -> Result<Self::Activation, Self::Error> {
+        let (session, window) = self.prepare_activation_window(
+            request.session_id(),
+            request.run_id(),
+            request.window_name(),
+        )?;
+        let pane = self.split_pane_for_activation(&window, request.activation_id())?;
+        Ok(TmuxActivation::new(session, window, pane))
+    }
+
+    fn start_agent(
+        &self,
+        activation: &Self::Activation,
+        command: &str,
+    ) -> Result<Self::Handle, Self::Error> {
+        self.send_keys_literal(activation.pane(), command)?;
+        self.send_key(activation.pane(), "Enter")?;
+        Ok(activation.clone().into_handle())
+    }
+
+    fn send_prompt(&self, handle: &Self::Handle, prompt: &str) -> Result<(), Self::Error> {
+        self.send_keys_literal(handle.pane(), prompt)?;
+        self.send_key(handle.pane(), "Enter")?;
+        Ok(())
+    }
+
+    fn observe_lifecycle(&self, handle: &Self::Handle) -> Result<Self::Observation, Self::Error> {
+        let captured_text = self.capture_pane(handle.pane())?;
+        Ok(TmuxLifecycleObservation::new(
+            handle.metadata().clone(),
+            captured_text,
+            LifecycleStatus::Running,
+        ))
+    }
+
+    fn cleanup_activation(
+        &self,
+        handle: &Self::Handle,
+        status: LifecycleStatus,
+    ) -> Result<LifecycleCleanup, Self::Error> {
+        let action = match status {
+            LifecycleStatus::ContractSatisfied => {
+                self.kill_pane(handle.pane())?;
+                LifecycleCleanupAction::KillPane
+            }
+            LifecycleStatus::Running | LifecycleStatus::Blocked | LifecycleStatus::Failed => {
+                LifecycleCleanupAction::PreservePane
+            }
+        };
+
+        Ok(LifecycleCleanup::new(action, status))
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxActivationRequest {
+    session_id: String,
+    run_id: String,
+    window_name: String,
+    activation_id: String,
+}
+
+impl TmuxActivationRequest {
+    pub fn new(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+        activation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            window_name: window_name.into(),
+            activation_id: activation_id.into(),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn window_name(&self) -> &str {
+        &self.window_name
+    }
+
+    pub fn activation_id(&self) -> &str {
+        &self.activation_id
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxActivation {
+    session: TmuxSession,
+    window: TmuxWindow,
+    pane: TmuxPane,
+    metadata: TmuxActivationMetadata,
+}
+
+impl TmuxActivation {
+    pub fn new(session: TmuxSession, window: TmuxWindow, pane: TmuxPane) -> Self {
+        let metadata = TmuxActivationMetadata::from_tmux(&session, &window, &pane);
+        Self {
+            session,
+            window,
+            pane,
+            metadata,
+        }
+    }
+
+    pub fn session(&self) -> &TmuxSession {
+        &self.session
+    }
+
+    pub fn window(&self) -> &TmuxWindow {
+        &self.window
+    }
+
+    pub fn pane(&self) -> &TmuxPane {
+        &self.pane
+    }
+
+    pub fn metadata(&self) -> &TmuxActivationMetadata {
+        &self.metadata
+    }
+
+    pub fn into_handle(self) -> TmuxAgentHandle {
+        TmuxAgentHandle {
+            pane: self.pane,
+            metadata: self.metadata,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxAgentHandle {
+    pane: TmuxPane,
+    metadata: TmuxActivationMetadata,
+}
+
+impl TmuxAgentHandle {
+    pub fn pane(&self) -> &TmuxPane {
+        &self.pane
+    }
+
+    pub fn metadata(&self) -> &TmuxActivationMetadata {
+        &self.metadata
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxActivationMetadata {
+    session_id: String,
+    run_id: String,
+    window_name: String,
+    window_id: String,
+    activation_id: String,
+    pane_id: String,
+}
+
+impl TmuxActivationMetadata {
+    pub fn new(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+        window_id: impl Into<String>,
+        activation_id: impl Into<String>,
+        pane_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            window_name: window_name.into(),
+            window_id: window_id.into(),
+            activation_id: activation_id.into(),
+            pane_id: pane_id.into(),
+        }
+    }
+
+    pub fn from_tmux(session: &TmuxSession, window: &TmuxWindow, pane: &TmuxPane) -> Self {
+        Self::new(
+            session.id(),
+            window.run_id(),
+            window.name(),
+            window.id(),
+            pane.activation_id(),
+            pane.id(),
+        )
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn window_name(&self) -> &str {
+        &self.window_name
+    }
+
+    pub fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
+    pub fn activation_id(&self) -> &str {
+        &self.activation_id
+    }
+
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxLifecycleObservation {
+    metadata: TmuxActivationMetadata,
+    captured_text: String,
+    status: LifecycleStatus,
+}
+
+impl TmuxLifecycleObservation {
+    pub fn new(
+        metadata: TmuxActivationMetadata,
+        captured_text: impl Into<String>,
+        status: LifecycleStatus,
+    ) -> Self {
+        Self {
+            metadata,
+            captured_text: captured_text.into(),
+            status,
+        }
+    }
+
+    pub fn metadata(&self) -> &TmuxActivationMetadata {
+        &self.metadata
+    }
+
+    pub fn captured_text(&self) -> &str {
+        &self.captured_text
+    }
+
+    pub fn status(&self) -> LifecycleStatus {
+        self.status
     }
 }
 
@@ -462,6 +825,9 @@ pub enum TmuxError {
     MissingSession {
         target: &'static str,
     },
+    InvalidSessionName {
+        reason: &'static str,
+    },
     ReservedSession {
         session_id: String,
     },
@@ -486,6 +852,7 @@ impl fmt::Display for TmuxError {
             Self::MissingSession { target } => {
                 write!(formatter, "tmux {target} requires session ownership")
             }
+            Self::InvalidSessionName { reason } => write!(formatter, "{reason}"),
             Self::ReservedSession { session_id } => {
                 write!(formatter, "tmux session named {session_id} is reserved")
             }
@@ -511,6 +878,16 @@ fn argv<const N: usize, const M: usize>(head: [&str; N], tail: [&str; M]) -> Vec
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), TmuxError> {
+    if session_id.is_empty() {
+        return Err(TmuxError::InvalidSessionName {
+            reason: "tmux session name must not be empty",
+        });
+    }
+    if session_id.contains(':') || session_id.contains('.') {
+        return Err(TmuxError::InvalidSessionName {
+            reason: "tmux session name must not contain tmux target delimiters ':' or '.'",
+        });
+    }
     if session_id == "dev" {
         Err(TmuxError::ReservedSession {
             session_id: session_id.to_string(),
@@ -543,6 +920,26 @@ fn trimmed_stdout(output: &CommandOutput, field: &'static str) -> Result<String,
     } else {
         Ok(value.to_string())
     }
+}
+
+fn listed_window_id(
+    output: &CommandOutput,
+    window_name: &str,
+) -> Result<Option<String>, TmuxError> {
+    for line in output.stdout.lines() {
+        let Some((name, window_id)) = line.split_once('\t') else {
+            continue;
+        };
+        if name == window_name {
+            let window_id = window_id.trim();
+            if window_id.is_empty() {
+                return Err(TmuxError::EmptyOutput { field: "window id" });
+            }
+            return Ok(Some(window_id.to_string()));
+        }
+    }
+
+    Ok(None)
 }
 
 fn window_pane_stdout(output: &CommandOutput) -> Result<(String, String), TmuxError> {

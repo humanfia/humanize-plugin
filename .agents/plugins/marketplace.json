@@ -1,0 +1,20 @@
+{
+  "name": "humanfia",
+  "interface": {
+    "displayName": "Humanfia"
+  },
+  "plugins": [
+    {
+      "name": "humanize-plugin",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

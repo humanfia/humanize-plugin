@@ -17,7 +17,7 @@ pub(super) fn preview_flow_routes(
     )?;
     let provided_content_hash =
         optional_string(arguments, &["content_hash", "contentHash"])?.map(str::to_string);
-    if !state.runtime.has_run(run_id) {
+    if !state.runtime().has_run(run_id) {
         if requested_lock_id.is_some() {
             return Ok(ToolCallResult::error(run_not_found_guidance(run_id)));
         }
@@ -37,7 +37,7 @@ pub(super) fn preview_flow_routes(
     let (lock_id, source, applied_content_hash) = match requested_lock_id {
         Some(lock_id) => (lock_id.to_string(), "explicit", None),
         None => {
-            let runtime_state = state.runtime.state();
+            let runtime_state = state.runtime().state();
             let Some(application_id) = runtime_state
                 .latest_flow_lock_application_by_run
                 .get(run_id)
@@ -99,7 +99,7 @@ pub(super) fn preview_flow_routes(
         .or(applied_content_hash)
         .unwrap_or_else(|| expected_content_hash.clone());
 
-    let routes = runtime::preview_flow_routes(state.runtime.state(), run_id, lock)
+    let routes = runtime::preview_flow_routes(state.runtime().state(), run_id, lock)
         .map_err(ToolError::from_runtime)?;
     let routes = serde_json::to_value(routes)
         .map_err(|_| ToolError::invalid("route preview serialization failed"))?;
@@ -180,11 +180,11 @@ mod tests {
         let mut state = McpServerState::default();
         state.flow_locks.insert(lock_id.clone(), lock);
         state
-            .runtime
+            .runtime_mut()
             .start_run("run-applied-hash", vec![NodeSpec::new("root")])
             .unwrap();
         state
-            .runtime
+            .runtime_mut()
             .apply_flow_lock(
                 "run-applied-hash",
                 FlowLockMode::FutureActivations,
