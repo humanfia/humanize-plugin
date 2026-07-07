@@ -26,6 +26,44 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Self { runner }
     }
 
+    pub fn create_session_with_window_pane(
+        &self,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+        activation_id: impl Into<String>,
+    ) -> Result<(TmuxSession, TmuxWindow, TmuxPane), TmuxError> {
+        let session = TmuxSession::new(session_id);
+        validate_session_id(session.id())?;
+        let run_id = run_id.into();
+        let window_name = window_name.into();
+        let activation_id = activation_id.into();
+        let output = self.run_checked(argv(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}\t#{pane_id}",
+                "-s",
+                session.id(),
+                "-n",
+            ],
+            [window_name.as_str()],
+        ))?;
+        let (window_id, pane_id) = window_pane_stdout(&output)?;
+        let window = TmuxWindow::new_named(session.id(), run_id, window_name, window_id);
+        let pane = TmuxPane::new_in_session(
+            session.id(),
+            window.id(),
+            activation_id.as_str(),
+            pane_id.as_str(),
+        );
+
+        Ok((session, window, pane))
+    }
+
     pub fn ensure_session(&self, session_id: impl Into<String>) -> Result<TmuxSession, TmuxError> {
         let session = TmuxSession::new(session_id);
         validate_session_id(session.id())?;
@@ -82,13 +120,50 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         ))
     }
 
+    pub fn create_window_named_with_pane(
+        &self,
+        session: &TmuxSession,
+        run_id: impl Into<String>,
+        window_name: impl Into<String>,
+        activation_id: impl Into<String>,
+    ) -> Result<(TmuxWindow, TmuxPane), TmuxError> {
+        validate_session_id(session.id())?;
+        let run_id = run_id.into();
+        let window_name = window_name.into();
+        let activation_id = activation_id.into();
+        let output = self.run_checked(argv(
+            [
+                "tmux",
+                "new-window",
+                "-P",
+                "-F",
+                "#{window_id}\t#{pane_id}",
+                "-t",
+                session.id(),
+                "-n",
+            ],
+            [window_name.as_str()],
+        ))?;
+        let (window_id, pane_id) = window_pane_stdout(&output)?;
+        let window = TmuxWindow::new_named(session.id(), run_id, window_name, window_id);
+        let pane = TmuxPane::new_in_session(
+            session.id(),
+            window.id(),
+            activation_id.as_str(),
+            pane_id.as_str(),
+        );
+
+        Ok((window, pane))
+    }
+
     pub fn split_pane_for_activation(
         &self,
         window: &TmuxWindow,
         activation_id: impl Into<String>,
     ) -> Result<TmuxPane, TmuxError> {
-        validate_session_id(window.session_id())?;
+        validate_owned_session_id("window", window.session_id())?;
         let activation_id = activation_id.into();
+        let target = window_target(window);
         let output = self.run_checked(argv(
             [
                 "tmux",
@@ -97,22 +172,57 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 "-F",
                 "#{pane_id}",
                 "-t",
-                window.id(),
+                target.as_str(),
             ],
             ["-v"],
         ))?;
         let pane_id = trimmed_stdout(&output, "pane id")?;
 
-        Ok(TmuxPane::new(window.id(), activation_id, pane_id))
+        Ok(TmuxPane::new_in_session(
+            window.session_id(),
+            window.id(),
+            activation_id,
+            pane_id,
+        ))
+    }
+
+    pub fn kill_pane(&self, pane: &TmuxPane) -> Result<(), TmuxError> {
+        validate_owned_session_id("pane", pane.session_id())?;
+        let target = pane_target(pane);
+        self.run_checked(argv(["tmux", "kill-pane", "-t"], [target.as_str()]))?;
+        Ok(())
+    }
+
+    pub fn kill_window(&self, window: &TmuxWindow) -> Result<(), TmuxError> {
+        validate_owned_session_id("window", window.session_id())?;
+        let target = window_target(window);
+        self.run_checked(argv(["tmux", "kill-window", "-t"], [target.as_str()]))?;
+        Ok(())
+    }
+
+    pub fn kill_session(&self, session: &TmuxSession) -> Result<(), TmuxError> {
+        validate_owned_session_id("session", session.id())?;
+        self.run_checked(argv(["tmux", "kill-session", "-t"], [session.id()]))?;
+        Ok(())
     }
 
     pub fn send_keys_literal(&self, pane: &TmuxPane, text: &str) -> Result<(), TmuxError> {
-        self.run_checked(argv(["tmux", "send-keys", "-t", pane.id(), "-l"], [text]))?;
+        validate_owned_session_id("pane", pane.session_id())?;
+        let target = pane_target(pane);
+        self.run_checked(argv(
+            ["tmux", "send-keys", "-t", target.as_str(), "-l"],
+            [text],
+        ))?;
         Ok(())
     }
 
     pub fn capture_pane(&self, pane: &TmuxPane) -> Result<String, TmuxError> {
-        let output = self.run_checked(argv(["tmux", "capture-pane", "-p", "-t"], [pane.id()]))?;
+        validate_owned_session_id("pane", pane.session_id())?;
+        let target = pane_target(pane);
+        let output = self.run_checked(argv(
+            ["tmux", "capture-pane", "-p", "-t"],
+            [target.as_str()],
+        ))?;
         Ok(output.stdout)
     }
 
@@ -201,6 +311,7 @@ impl TmuxWindow {
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TmuxPane {
+    session_id: String,
     window_id: String,
     activation_id: String,
     id: String,
@@ -213,10 +324,29 @@ impl TmuxPane {
         id: impl Into<String>,
     ) -> Self {
         Self {
+            session_id: String::new(),
             window_id: window_id.into(),
             activation_id: activation_id.into(),
             id: id.into(),
         }
+    }
+
+    pub fn new_in_session(
+        session_id: impl Into<String>,
+        window_id: impl Into<String>,
+        activation_id: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            window_id: window_id.into(),
+            activation_id: activation_id.into(),
+            id: id.into(),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub fn window_id(&self) -> &str {
@@ -329,6 +459,9 @@ impl CommandRunner for SystemCommandRunner {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TmuxError {
     EmptyArgv,
+    MissingSession {
+        target: &'static str,
+    },
     ReservedSession {
         session_id: String,
     },
@@ -350,6 +483,9 @@ impl fmt::Display for TmuxError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyArgv => write!(formatter, "empty command argv"),
+            Self::MissingSession { target } => {
+                write!(formatter, "tmux {target} requires session ownership")
+            }
             Self::ReservedSession { session_id } => {
                 write!(formatter, "tmux session named {session_id} is reserved")
             }
@@ -384,6 +520,22 @@ fn validate_session_id(session_id: &str) -> Result<(), TmuxError> {
     }
 }
 
+fn validate_owned_session_id(target: &'static str, session_id: &str) -> Result<(), TmuxError> {
+    if session_id.is_empty() {
+        Err(TmuxError::MissingSession { target })
+    } else {
+        validate_session_id(session_id)
+    }
+}
+
+fn window_target(window: &TmuxWindow) -> String {
+    format!("{}:{}", window.session_id(), window.id())
+}
+
+fn pane_target(pane: &TmuxPane) -> String {
+    format!("{}:{}.{}", pane.session_id(), pane.window_id(), pane.id())
+}
+
 fn trimmed_stdout(output: &CommandOutput, field: &'static str) -> Result<String, TmuxError> {
     let value = output.stdout.trim();
     if value.is_empty() {
@@ -391,4 +543,23 @@ fn trimmed_stdout(output: &CommandOutput, field: &'static str) -> Result<String,
     } else {
         Ok(value.to_string())
     }
+}
+
+fn window_pane_stdout(output: &CommandOutput) -> Result<(String, String), TmuxError> {
+    let value = output.stdout.trim();
+    if value.is_empty() {
+        return Err(TmuxError::EmptyOutput {
+            field: "window and pane ids",
+        });
+    }
+
+    let mut fields = value.split_whitespace();
+    let Some(window_id) = fields.next() else {
+        return Err(TmuxError::EmptyOutput { field: "window id" });
+    };
+    let Some(pane_id) = fields.next() else {
+        return Err(TmuxError::EmptyOutput { field: "pane id" });
+    };
+
+    Ok((window_id.to_string(), pane_id.to_string()))
 }

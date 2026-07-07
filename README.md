@@ -79,6 +79,11 @@ The local runtime maps tmux session to the host coding session, tmux window to a
 workflow run, and tmux pane to a node activation.
 The plugin refuses to use a tmux session named exactly `dev`; use a dedicated
 session such as `humanize-plugin-real-test` for local trials.
+Real-test topology is reserved for `humanize-plugin-real-test`: one window per
+flow, one pane per project/tool lease, and explicit cleanup for panes, windows,
+and the session. The real-test allocator creates that dedicated session fresh
+when it has no owned session state; the ordinary MCP runtime path remains
+separate and uses the adapter boundary for host-session and window management.
 
 ## Real Trial Prompt
 
@@ -90,7 +95,7 @@ Use Humanize to audit this C library without editing files.
 ```
 
 A low-capability human-simulator can drive tmux with send/capture operations for
-realistic tests while pane creation remains lazy.
+realistic tests while additional panes are created only when a lease is needed.
 
 ## v0 Limitations
 
