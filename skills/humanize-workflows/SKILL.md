@@ -18,10 +18,236 @@ exploration.
 2. Validate the draft with `flow_check`.
 3. Confirm the flow package includes a README resource.
 4. Lock the validated draft with `flow_lock`.
-5. Prepare the review gate with `prepare_flow_review`.
-6. Ask for human approval unless the user explicitly permits bypass.
-7. Record the decision with `approve_flow_review` using `approved` or `bypassed`.
-8. Run with `run_flow` only after the review gate is recorded.
+5. Export the locked flow with `flow_export` when a run artifact directory is available.
+6. Prepare the review gate with `prepare_flow_review`.
+7. Ask for human approval unless the user explicitly permits bypass.
+8. Record the decision with `approve_flow_review` using `approved` or `bypassed`.
+9. Run with `run_flow` only after the review gate is recorded.
+
+## MCP Interaction Pattern
+
+Use MCP tools as the compiler and runtime interface:
+
+1. `flow_suggest`: get a valid skeleton from the terse task.
+2. Edit the returned draft in memory to add nodes, contracts, actions,
+   resources, and routes that fit the task.
+3. `flow_check`: validate the full draft. Use `strict` when the flow will be
+   shared or run for a long time.
+4. `flow_repair`: ask for mechanical patches or candidate repairs when
+   diagnostics are local. Choose among candidates yourself; do not blindly
+   apply a ranking.
+5. `flow_lock`: freeze the checked draft.
+6. `flow_export`: save the locked flow when artifacts should be collected.
+7. `prepare_flow_review`: create the human review view before execution.
+8. `approve_flow_review`: record either explicit approval or an explicit
+   bypass.
+9. `run_flow`: start the runtime driver.
+10. During a run, use `preview_flow_routes`, `propose_flow_update`, and
+   `apply_flow_update` when observations justify changing the flow.
+
+For long-running tasks, prefer entering `run_flow` quickly with a small,
+validated adaptive loop over spending many turns hand-authoring a large
+perfect-looking graph.
+
+## Flow Architecture
+
+Design the smallest flow that gives the task durable control. Use the Humanize
+primitives directly:
+
+| Primitive | Purpose |
+| --- | --- |
+| `nodes` | Work units: agent, script, review, or human. |
+| `contracts` | Required delivery for a node. Use `all_artifacts` when stopping must depend on artifacts. |
+| `routes` | Runtime activation rules. Use predicates over artifacts, verdicts, or state. |
+| `resources` | README, prompts, schemas, scripts, views, and packaged subflows. |
+| `imports` | Reusable flow resources or schema aliases. |
+| `policies` | Write boundaries for artifacts, resources, workspace, and system state. |
+
+Prefer a small graph over a large instruction blob. A good flow has a frozen
+task contract, bounded work nodes, explicit artifacts, measurable checks, and
+a review or guard that decides whether to continue, branch, or finish.
+
+## Design Heuristics
+
+- Start by naming the durable value: bug fix, benchmark improvement, migration
+  patch, audit report, release packet, reproduction evidence, or test suite.
+- Freeze the operator-owned task contract early with a script or human node.
+  Later agent nodes should read this artifact instead of reinterpreting the
+  original request.
+- Make each agent node own one coherent lane. Use separate lanes for
+  investigation, implementation, testing, documentation, performance
+  hypotheses, or candidate variants.
+- Use script nodes for deterministic checks, materialization, benchmark runs,
+  route classification, archive creation, and evidence guards.
+- Use review nodes for judgment: accept, revise, reject, promote, continue, or
+  finish. A review node should write a verdict artifact that routes can test.
+- Use routes for adaptation. Branch on reproduced vs not reproduced, patch vs
+  no-code evidence, benchmark winner, review verdict, missing artifact, or
+  validation failure.
+- Use `for_each` only when a collection is real: hypotheses, failing tests,
+  changed modules, benchmark candidates, or independent work lanes.
+- Keep loops bounded by contract and evidence. A loop should have a concrete
+  repair target, a validation signal, and an archive path for terminal state.
+- Put long instructions in prompt resources, not in the user-facing request.
+  Keep the top-level flow draft readable.
+- Include a README resource in every package. It should explain intent,
+  prerequisites, expected artifacts, review gates, and how to rerun or inspect
+  the flow.
+- If the workspace has `.flowbench/humanize-flow`, write the exported locked
+  flow, review pointer, run id, and any terminal archive there.
+
+## Common Shapes
+
+| Task shape | Flow shape |
+| --- | --- |
+| Bug repair | Freeze task -> triage -> reproduce -> isolate cause -> patch or no-code evidence -> regression -> review -> repair loop or archive. |
+| Performance work | Freeze task -> capture baseline -> generate hypotheses -> run candidates in parallel -> benchmark -> select or repair -> review loop -> archive. |
+| Parallel implementation | Freeze task -> scope plan -> parallel lanes -> lane guard -> integration review -> validation -> final review. |
+| Research reproduction | Freeze claim -> setup -> baseline run -> variant or negative control -> comparison -> review loop -> archive evidence. |
+| Documentation or tests | Inventory -> gap report -> generate or patch -> validation -> review -> repair loop or archive. |
+
+## Minimal Draft Example
+
+For a measured optimization task, use a shape like this:
+
+```json
+{
+  "nodes": [
+    {
+      "id": "capture_baseline",
+      "contract_id": "contract.baseline",
+      "action": {
+        "driver": "script",
+        "resource_refs": ["script.benchmark"],
+        "writes": ["artifact.baseline"]
+      }
+    },
+    {
+      "id": "try_candidates",
+      "contract_id": "contract.candidates",
+      "action": {
+        "driver": "agent",
+        "prompt_ref": "prompt.optimize",
+        "reads": ["artifact.baseline"],
+        "writes": ["artifact.candidates"]
+      }
+    },
+    {
+      "id": "review_selection",
+      "contract_id": "contract.review",
+      "action": {
+        "driver": "review",
+        "prompt_ref": "prompt.review",
+        "reads": ["artifact.baseline", "artifact.candidates"],
+        "writes": ["artifact.review_verdict"],
+        "verdict_artifact": "artifact.review_verdict"
+      }
+    }
+  ],
+  "contracts": [
+    {
+      "id": "contract.baseline",
+      "completion": "all_artifacts",
+      "artifacts": [
+        {
+          "id": "baseline",
+          "schema_resource_id": "schema.baseline"
+        }
+      ]
+    },
+    {
+      "id": "contract.candidates",
+      "completion": "all_artifacts",
+      "artifacts": [
+        {
+          "id": "candidates",
+          "schema_resource_id": "schema.candidates"
+        }
+      ]
+    },
+    {
+      "id": "contract.review",
+      "completion": "all_artifacts",
+      "artifacts": [
+        {
+          "id": "review_verdict",
+          "schema_resource_id": "schema.review_verdict"
+        }
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "predicate": "exists(artifact.baseline)",
+      "activate": "try_candidates"
+    },
+    {
+      "predicate": "exists(artifact.candidates)",
+      "activate": "review_selection"
+    },
+    {
+      "predicate": "artifact.review_verdict == \"continue\"",
+      "activate": "try_candidates"
+    }
+  ],
+  "resources": [
+    {
+      "id": "readme.main",
+      "kind": "readme",
+      "source": "inline:Measured optimization flow with baseline, candidate search, review, and loop."
+    },
+    {
+      "id": "prompt.optimize",
+      "kind": "prompt",
+      "source": "inline:Generate and test one bounded candidate improvement."
+    },
+    {
+      "id": "prompt.review",
+      "kind": "prompt",
+      "source": "inline:Choose finish or continue based on measured evidence."
+    },
+    {
+      "id": "script.benchmark",
+      "kind": "script",
+      "source": "inline:run benchmark command and write artifact.baseline"
+    },
+    {
+      "id": "schema.baseline",
+      "kind": "schema",
+      "source": "inline:baseline metrics and command evidence"
+    },
+    {
+      "id": "schema.candidates",
+      "kind": "schema",
+      "source": "inline:candidate changes with benchmark evidence"
+    },
+    {
+      "id": "schema.review_verdict",
+      "kind": "schema",
+      "source": "inline:verdict string finish or continue with reason"
+    }
+  ]
+}
+```
+
+This is only a shape. Adapt the node names, artifacts, resources, and routes to
+the task. Keep contracts and schemas aligned with the actual artifacts.
+
+## Contract Rules
+
+- Every node that must deliver something should have a contract. If the main
+  output is side-effect work, use `manual` completion and still record evidence.
+- A README must be authored for the package. Do not rely on a placeholder that
+  only repeats the terse user goal.
+- Artifact names should be semantic and stable, such as
+  `artifact.baseline`, `artifact.hypotheses`, `artifact.validation`,
+  `artifact.review_verdict`, and `artifact.archive`.
+- Schemas can be lightweight, but every required artifact should have either a
+  schema resource or a concise prompt resource describing the expected shape.
+- Review and guard outputs should be route-friendly: use small verdict strings
+  or structured fields instead of prose-only summaries.
+- Do not use Humanize as decoration after ordinary implementation has already
+  started. The flow should be the execution plan.
 
 ## Quick Reference
 
