@@ -1,8 +1,11 @@
 pub mod adapters;
 pub mod client_config;
 pub mod flow;
+pub mod input_ledger;
 pub mod kernel;
 pub mod mcp;
 pub mod real_test;
 pub mod runtime;
+pub mod tmux_guard;
+pub mod transcript;
 pub mod view;

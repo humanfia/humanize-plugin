@@ -1,15 +1,22 @@
 use std::error::Error;
 use std::fmt;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use crate::adapters::lifecycle::{
     AdapterCapabilities, AgentLifecycleAdapter, LifecycleCleanup, LifecycleCleanupAction,
     LifecycleStatus,
 };
+use crate::input_ledger::{
+    MachineInputClock, MachineInputLedger, MachineInputRecord, MachineInputSubmission,
+    machine_input_payload_hash, machine_input_transaction_id, normalize_machine_input_text,
+};
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TmuxAdapter<R: CommandRunner = SystemCommandRunner> {
     runner: R,
+    input_config: TmuxInputTransactionConfig,
 }
 
 impl TmuxAdapter<SystemCommandRunner> {
@@ -22,13 +29,25 @@ impl Default for TmuxAdapter<SystemCommandRunner> {
     fn default() -> Self {
         Self {
             runner: SystemCommandRunner,
+            input_config: TmuxInputTransactionConfig::runtime(),
         }
     }
 }
 
 impl<R: CommandRunner> TmuxAdapter<R> {
     pub fn with_runner(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            input_config: TmuxInputTransactionConfig::runtime(),
+        }
+    }
+
+    pub fn with_input_transaction_config(
+        mut self,
+        input_config: TmuxInputTransactionConfig,
+    ) -> Self {
+        self.input_config = input_config;
+        self
     }
 
     pub fn create_session_with_window_pane(
@@ -314,6 +333,105 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Ok(())
     }
 
+    pub fn send_input_transaction(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        text: &str,
+    ) -> Result<TmuxInputTransaction, TmuxError> {
+        self.validate_exact_pane(metadata)?;
+        let started_at_ms = self.input_config.clock.now_ms();
+        let normalized_text = normalize_machine_input_text(text);
+        let payload_hash = machine_input_payload_hash(&normalized_text);
+        let sequence = self.input_config.ledger.next_sequence();
+        let transaction_id = machine_input_transaction_id(
+            metadata.run_id(),
+            metadata.activation_id(),
+            metadata.pane_id(),
+            &payload_hash,
+            started_at_ms,
+            sequence,
+        );
+        let pane = TmuxPane::new_in_session(
+            metadata.session_id(),
+            metadata.window_id(),
+            metadata.activation_id(),
+            metadata.pane_id(),
+        );
+
+        self.input_config
+            .ledger
+            .append(MachineInputRecord::started(MachineInputSubmission {
+                run_id: metadata.run_id(),
+                activation_id: metadata.activation_id(),
+                pane_id: metadata.pane_id(),
+                started_at_ms,
+                submitted_at_ms: started_at_ms,
+                text,
+                submit_key_count: self.input_config.submit_key_count,
+                transaction_id: transaction_id.clone(),
+            }))
+            .map_err(|err| TmuxError::InputLedger {
+                message: err.to_string(),
+            })?;
+
+        if let Err(err) = self.send_keys_literal(&pane, text) {
+            self.record_failed_input(metadata, text, started_at_ms, &transaction_id);
+            return Err(err);
+        }
+        sleep_if_needed(self.input_config.prompt_to_submit_delay);
+        for index in 0..self.input_config.submit_key_count {
+            if let Err(err) = self.send_key(&pane, "Enter") {
+                self.record_failed_input(metadata, text, started_at_ms, &transaction_id);
+                return Err(err);
+            }
+            if index + 1 < self.input_config.submit_key_count {
+                sleep_if_needed(self.input_config.submit_key_delay);
+            }
+        }
+
+        let submitted_at_ms = self.input_config.clock.now_ms();
+        let record = MachineInputRecord::submitted(MachineInputSubmission {
+            run_id: metadata.run_id(),
+            activation_id: metadata.activation_id(),
+            pane_id: metadata.pane_id(),
+            started_at_ms,
+            submitted_at_ms,
+            text,
+            submit_key_count: self.input_config.submit_key_count,
+            transaction_id: transaction_id.clone(),
+        });
+        self.input_config
+            .ledger
+            .append(record.clone())
+            .map_err(|err| TmuxError::InputLedger {
+                message: err.to_string(),
+            })?;
+        Ok(TmuxInputTransaction { record })
+    }
+
+    fn record_failed_input(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        text: &str,
+        started_at_ms: u64,
+        transaction_id: &str,
+    ) {
+        let failed_at_ms = self.input_config.clock.now_ms();
+        let _ =
+            self.input_config
+                .ledger
+                .append(MachineInputRecord::failed(MachineInputSubmission {
+                    run_id: metadata.run_id(),
+                    activation_id: metadata.activation_id(),
+                    pane_id: metadata.pane_id(),
+                    started_at_ms,
+                    submitted_at_ms: failed_at_ms,
+                    text,
+                    submit_key_count: self.input_config.submit_key_count,
+                    transaction_id: transaction_id.to_string(),
+                }));
+    }
+
     pub fn capture_pane(&self, pane: &TmuxPane) -> Result<String, TmuxError> {
         validate_owned_session_id("pane", pane.session_id())?;
         let target = pane_target(pane);
@@ -322,6 +440,42 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             [target.as_str()],
         ))?;
         Ok(output.stdout)
+    }
+
+    fn validate_exact_pane(&self, metadata: &TmuxActivationMetadata) -> Result<(), TmuxError> {
+        validate_owned_session_id("pane", metadata.session_id())?;
+        let target = metadata_pane_target(metadata);
+        let output = self.run_checked(argv(
+            ["tmux", "display-message", "-p", "-t", target.as_str()],
+            ["#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}"],
+        ))?;
+        let (actual_session_id, actual_window_id, actual_window_name, actual_pane_id) =
+            pane_identity_stdout(&output)?;
+
+        if actual_session_id != metadata.session_id()
+            || actual_window_id != metadata.window_id()
+            || actual_window_name != metadata.window_name()
+            || actual_pane_id != metadata.pane_id()
+        {
+            return Err(TmuxError::PaneMetadataMismatch(Box::new(
+                TmuxPaneMetadataMismatch::new(
+                    TmuxPaneIdentity::new(
+                        metadata.session_id(),
+                        metadata.window_id(),
+                        metadata.window_name(),
+                        metadata.pane_id(),
+                    ),
+                    TmuxPaneIdentity::new(
+                        actual_session_id,
+                        actual_window_id,
+                        actual_window_name,
+                        actual_pane_id,
+                    ),
+                ),
+            )));
+        }
+
+        Ok(())
     }
 
     fn run_checked(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
@@ -335,6 +489,67 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 stderr: output.stderr,
             })
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TmuxInputTransactionConfig {
+    ledger: MachineInputLedger,
+    clock: MachineInputClock,
+    submit_key_count: usize,
+    prompt_to_submit_delay: Duration,
+    submit_key_delay: Duration,
+}
+
+impl TmuxInputTransactionConfig {
+    pub fn runtime() -> Self {
+        Self {
+            ledger: MachineInputLedger::runtime_default(),
+            clock: MachineInputClock::realtime(),
+            submit_key_count: 1,
+            prompt_to_submit_delay: Duration::from_millis(250),
+            submit_key_delay: Duration::from_millis(250),
+        }
+    }
+
+    pub fn deterministic(ledger: MachineInputLedger, timestamp_ms: u64) -> Self {
+        Self {
+            ledger,
+            clock: MachineInputClock::fixed(timestamp_ms),
+            submit_key_count: 1,
+            prompt_to_submit_delay: Duration::ZERO,
+            submit_key_delay: Duration::ZERO,
+        }
+    }
+
+    pub fn with_submit_key_count(mut self, submit_key_count: usize) -> Self {
+        self.submit_key_count = submit_key_count.max(1);
+        self
+    }
+
+    pub fn with_prompt_to_submit_delay(mut self, delay: Duration) -> Self {
+        self.prompt_to_submit_delay = delay;
+        self
+    }
+
+    pub fn with_submit_key_delay(mut self, delay: Duration) -> Self {
+        self.submit_key_delay = delay;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxInputTransaction {
+    record: MachineInputRecord,
+}
+
+impl TmuxInputTransaction {
+    pub fn transaction_id(&self) -> &str {
+        &self.record.transaction_id
+    }
+
+    pub fn record(&self) -> &MachineInputRecord {
+        &self.record
     }
 }
 
@@ -367,14 +582,12 @@ impl<R: CommandRunner> AgentLifecycleAdapter for TmuxAdapter<R> {
         activation: &Self::Activation,
         command: &str,
     ) -> Result<Self::Handle, Self::Error> {
-        self.send_keys_literal(activation.pane(), command)?;
-        self.send_key(activation.pane(), "Enter")?;
+        self.send_input_transaction(activation.metadata(), command)?;
         Ok(activation.clone().into_handle())
     }
 
     fn send_prompt(&self, handle: &Self::Handle, prompt: &str) -> Result<(), Self::Error> {
-        self.send_keys_literal(handle.pane(), prompt)?;
-        self.send_key(handle.pane(), "Enter")?;
+        self.send_input_transaction(handle.metadata(), prompt)?;
         Ok(())
     }
 
@@ -820,6 +1033,42 @@ impl CommandRunner for SystemCommandRunner {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxPaneIdentity {
+    pub session_id: String,
+    pub window_id: String,
+    pub window_name: String,
+    pub pane_id: String,
+}
+
+impl TmuxPaneIdentity {
+    pub fn new(
+        session_id: impl Into<String>,
+        window_id: impl Into<String>,
+        window_name: impl Into<String>,
+        pane_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            window_id: window_id.into(),
+            window_name: window_name.into(),
+            pane_id: pane_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TmuxPaneMetadataMismatch {
+    pub expected: TmuxPaneIdentity,
+    pub actual: TmuxPaneIdentity,
+}
+
+impl TmuxPaneMetadataMismatch {
+    pub fn new(expected: TmuxPaneIdentity, actual: TmuxPaneIdentity) -> Self {
+        Self { expected, actual }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TmuxError {
     EmptyArgv,
     MissingSession {
@@ -838,6 +1087,10 @@ pub enum TmuxError {
         argv: Vec<String>,
         message: String,
     },
+    InputLedger {
+        message: String,
+    },
+    PaneMetadataMismatch(Box<TmuxPaneMetadataMismatch>),
     CommandFailed {
         argv: Vec<String>,
         status: i32,
@@ -858,6 +1111,19 @@ impl fmt::Display for TmuxError {
             }
             Self::EmptyOutput { field } => write!(formatter, "tmux did not return {field}"),
             Self::Io { argv, message } => write!(formatter, "{}: {message}", argv.join(" ")),
+            Self::InputLedger { message } => write!(formatter, "{message}"),
+            Self::PaneMetadataMismatch(mismatch) => write!(
+                formatter,
+                "tmux pane metadata mismatch: expected {}:{}({}).{}, got {}:{}({}).{}",
+                mismatch.expected.session_id,
+                mismatch.expected.window_id,
+                mismatch.expected.window_name,
+                mismatch.expected.pane_id,
+                mismatch.actual.session_id,
+                mismatch.actual.window_id,
+                mismatch.actual.window_name,
+                mismatch.actual.pane_id,
+            ),
             Self::CommandFailed {
                 argv,
                 status,
@@ -913,6 +1179,21 @@ fn pane_target(pane: &TmuxPane) -> String {
     format!("{}:{}.{}", pane.session_id(), pane.window_id(), pane.id())
 }
 
+fn metadata_pane_target(metadata: &TmuxActivationMetadata) -> String {
+    format!(
+        "{}:{}.{}",
+        metadata.session_id(),
+        metadata.window_id(),
+        metadata.pane_id()
+    )
+}
+
+fn sleep_if_needed(duration: Duration) {
+    if !duration.is_zero() {
+        thread::sleep(duration);
+    }
+}
+
 fn trimmed_stdout(output: &CommandOutput, field: &'static str) -> Result<String, TmuxError> {
     let value = output.stdout.trim();
     if value.is_empty() {
@@ -959,4 +1240,40 @@ fn window_pane_stdout(output: &CommandOutput) -> Result<(String, String), TmuxEr
     };
 
     Ok((window_id.to_string(), pane_id.to_string()))
+}
+
+fn pane_identity_stdout(
+    output: &CommandOutput,
+) -> Result<(String, String, String, String), TmuxError> {
+    let value = output.stdout.trim();
+    if value.is_empty() {
+        return Err(TmuxError::EmptyOutput {
+            field: "pane metadata",
+        });
+    }
+
+    let mut fields = value.split('\t');
+    let Some(session_id) = fields.next() else {
+        return Err(TmuxError::EmptyOutput {
+            field: "session name",
+        });
+    };
+    let Some(window_id) = fields.next() else {
+        return Err(TmuxError::EmptyOutput { field: "window id" });
+    };
+    let Some(window_name) = fields.next() else {
+        return Err(TmuxError::EmptyOutput {
+            field: "window name",
+        });
+    };
+    let Some(pane_id) = fields.next() else {
+        return Err(TmuxError::EmptyOutput { field: "pane id" });
+    };
+
+    Ok((
+        session_id.to_string(),
+        window_id.to_string(),
+        window_name.to_string(),
+        pane_id.to_string(),
+    ))
 }
