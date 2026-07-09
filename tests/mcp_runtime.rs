@@ -1088,9 +1088,29 @@ fn preview_flow_routes_uses_latest_applied_lock_by_default() {
         }),
     );
     assert_eq!(structured(&applied)["ok"], true);
-    let delivered = call_tool(
+    let status = call_tool(
         &mut server,
         4,
+        "run_status",
+        json!({
+            "run_id": "run-preview-latest"
+        }),
+    );
+    assert_eq!(structured(&status)["context"]["flow_lock_id"], lock_id);
+    assert_eq!(structured(&status)["context"]["content_hash"], content_hash);
+    assert_eq!(
+        structured(&status)["context"]["flow_review_status"],
+        "not_required"
+    );
+    assert!(
+        structured(&status)["context"]["flow_export_document"]
+            .as_str()
+            .unwrap()
+            .contains("root")
+    );
+    let delivered = call_tool(
+        &mut server,
+        5,
         "deliver_artifact",
         json!({
             "run_id": "run-preview-latest",

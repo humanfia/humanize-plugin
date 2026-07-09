@@ -424,7 +424,15 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                         "properties": {
                             "enabled": { "type": "boolean" },
                             "session": { "type": "string" },
-                            "window": { "type": "string" }
+                            "window": { "type": "string" },
+                            "agent_command": {
+                                "type": "string",
+                                "description": "Command to launch the node agent inside each tmux pane before the node prompt is submitted."
+                            },
+                            "agentCommand": {
+                                "type": "string",
+                                "description": "Alias for agent_command."
+                            }
                         }
                     }
                 }),

@@ -224,6 +224,14 @@ fn new_tool_schemas_cover_core_arguments() {
         run_flow.input_schema()["properties"]["tmux"]["properties"]["enabled"]["type"],
         "boolean"
     );
+    assert_eq!(
+        run_flow.input_schema()["properties"]["tmux"]["properties"]["agent_command"]["type"],
+        "string"
+    );
+    assert_eq!(
+        run_flow.input_schema()["properties"]["tmux"]["properties"]["agentCommand"]["type"],
+        "string"
+    );
 
     for name in [
         "run_status",

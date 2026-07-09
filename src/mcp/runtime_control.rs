@@ -1,14 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-use crate::adapters::tmux::CommandRunner;
+use crate::adapters::tmux::{CommandRunner, TmuxActivationMetadata};
 use crate::flow;
+use crate::input_ledger::MachineInputRecord;
 use crate::runtime::{self, ControlCommand};
 use serde_json::{Value, json};
 
 use super::{
-    FlowReviewStatus, McpServer, ToolCallResult, ToolError, content_hash, diagnostic_codes_text,
-    flow_check_mode_arg, flow_draft_arg, node_specs, optional_bool, optional_string,
-    require_string, run_not_found_guidance, validate_start_run_preconditions,
+    FlowReviewStatus, McpServer, RunArchive, ToolCallResult, ToolError, content_hash,
+    diagnostic_codes_text, flow_check_mode_arg, flow_draft_arg, node_specs, optional_bool,
+    optional_string, require_string, run_not_found_guidance, validate_start_run_preconditions,
 };
 
 impl<R: CommandRunner> McpServer<R> {
@@ -23,6 +24,7 @@ impl<R: CommandRunner> McpServer<R> {
                     || arguments.get("lockId").is_some()
             });
         let flow_binding = self.flow_lock_binding_from_arguments(arguments)?;
+        let agent_command = agent_command_from_arguments(arguments)?;
         let nodes = match flow_binding.as_ref() {
             Some((lock_id, _)) => self.locked_flow_node_specs(lock_id)?,
             None => node_specs(arguments)?,
@@ -113,6 +115,16 @@ impl<R: CommandRunner> McpServer<R> {
         };
         self.state
             .remember_tmux_allocation(run_id, &tmux.window, &tmux.panes);
+        if let Some(command) = agent_command {
+            self.state
+                .run_agent_commands
+                .insert(run_id.to_string(), command);
+        }
+        if let Some((lock_id, content_hash)) = flow_binding.as_ref() {
+            let review_status = self.run_review_status_name(lock_id, review_required);
+            self.remember_run_archive(run_id, lock_id, content_hash, review_status);
+        }
+        let actuation = self.actuate_locked_flow(run_id, &activation_ids)?;
 
         let run_status = self.run_status_string(run_id)?;
         Ok(ToolCallResult::ok(json!({
@@ -121,6 +133,10 @@ impl<R: CommandRunner> McpServer<R> {
             "activation_ids": activation_ids,
             "run_status": run_status,
             "tmux": tmux.structured,
+            "actuation": {
+                "sent": actuation.sent
+            },
+            "actuation_warnings": actuation.warnings,
             "flow_lock_id": flow_binding.as_ref().map(|(lock_id, _)| lock_id.as_str()),
             "content_hash": flow_binding.as_ref().map(|(_, content_hash)| content_hash.as_str()),
             "pipeline": report.pipeline
@@ -216,6 +232,7 @@ impl<R: CommandRunner> McpServer<R> {
             runtime::StopObservation::new(reason),
         );
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
+        self.actuate_locked_flow(run_id, &[])?;
         let tmux_cleanup = self.cleanup_tmux_pane_after_stop(run_id, activation_id, &report)?;
         let run_status = self.run_status_string(run_id)?;
 
@@ -246,6 +263,7 @@ impl<R: CommandRunner> McpServer<R> {
         }
         let report = self.state.tick_control(command(run_id));
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
+        self.actuate_locked_flow(run_id, &[])?;
         let run_status = self.run_status_string(run_id)?;
 
         Ok(ToolCallResult::ok(json!({
@@ -356,6 +374,366 @@ impl<R: CommandRunner> McpServer<R> {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string())
+    }
+
+    pub(super) fn remember_run_archive(
+        &mut self,
+        run_id: &str,
+        lock_id: &str,
+        content_hash: &str,
+        review_status: String,
+    ) {
+        let flow_export_document = self
+            .state
+            .flow_locks
+            .get(lock_id)
+            .map(|lock| flow::flow_export(lock, flow::FlowExportFormat::Json))
+            .unwrap_or_default();
+        self.state.run_archives.insert(
+            run_id.to_string(),
+            RunArchive {
+                flow_lock_id: lock_id.to_string(),
+                content_hash: content_hash.to_string(),
+                review_status,
+                flow_export_document,
+            },
+        );
+    }
+
+    pub(super) fn run_review_status_name(&self, lock_id: &str, review_required: bool) -> String {
+        match self.review_status_for_lock(lock_id) {
+            Some(status) => status.as_str().to_string(),
+            None if review_required => "missing".to_string(),
+            None => "not_required".to_string(),
+        }
+    }
+
+    fn actuate_locked_flow(
+        &mut self,
+        run_id: &str,
+        activation_ids: &[String],
+    ) -> Result<RuntimeActuation, ToolError> {
+        let Some(lock_id) = self
+            .state
+            .runtime()
+            .state()
+            .flow_lock_id_by_run
+            .get(run_id)
+            .cloned()
+        else {
+            return Ok(RuntimeActuation::default());
+        };
+        let Some(lock) = self.state.flow_locks.get(&lock_id).cloned() else {
+            return Ok(RuntimeActuation::default());
+        };
+        let draft = lock.draft().clone();
+        let node_by_id = draft
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+        let selected_activation_ids = if activation_ids.is_empty() {
+            self.state
+                .runtime()
+                .state()
+                .activations
+                .values()
+                .filter(|activation| activation.run_id == run_id)
+                .map(|activation| activation.activation_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            activation_ids.to_vec()
+        };
+        let mut actuation = RuntimeActuation::default();
+
+        for activation_id in selected_activation_ids {
+            let key = (run_id.to_string(), activation_id.clone());
+            if self.state.actuated_activations.contains(&key) {
+                continue;
+            }
+            let Some(activation) = self.state.runtime().state().activations.get(&key).cloned()
+            else {
+                continue;
+            };
+            if activation.status != runtime::ActivationStatus::Running {
+                continue;
+            }
+            let Some(node) = node_by_id.get(activation.node_id.as_str()) else {
+                continue;
+            };
+            let Some(action) = node.action.as_ref() else {
+                continue;
+            };
+            if action.driver != flow::NodeDriver::Agent {
+                self.push_actuation_warning(
+                    run_id,
+                    json!({
+                        "activation_id": activation.activation_id,
+                        "node_id": activation.node_id,
+                        "driver": node_driver_name(action.driver),
+                        "message": "action driver is not supported for autonomous tmux actuation"
+                    }),
+                    &mut actuation,
+                );
+                continue;
+            }
+            let Some(agent_command) = self.state.run_agent_commands.get(run_id).cloned() else {
+                self.push_actuation_warning(
+                    run_id,
+                    json!({
+                        "activation_id": activation.activation_id,
+                        "node_id": activation.node_id,
+                        "driver": "agent",
+                        "message": "tmux.agent_command is required before autonomous agent actuation"
+                    }),
+                    &mut actuation,
+                );
+                continue;
+            };
+
+            let Some(window) = self.state.tmux_windows.get(run_id).cloned() else {
+                self.push_actuation_warning(
+                    run_id,
+                    json!({
+                        "activation_id": activation.activation_id,
+                        "node_id": activation.node_id,
+                        "driver": "agent",
+                        "message": "tmux pane mapping is required for agent actuation"
+                    }),
+                    &mut actuation,
+                );
+                continue;
+            };
+            let Some(pane) = self
+                .state
+                .tmux_panes
+                .get(&(run_id.to_string(), activation.activation_id.clone()))
+                .cloned()
+            else {
+                self.push_actuation_warning(
+                    run_id,
+                    json!({
+                        "activation_id": activation.activation_id,
+                        "node_id": activation.node_id,
+                        "driver": "agent",
+                        "message": "tmux pane mapping is required for agent actuation"
+                    }),
+                    &mut actuation,
+                );
+                continue;
+            };
+
+            let prompt = initial_agent_prompt(&draft, node, action);
+            let metadata = TmuxActivationMetadata::new(
+                pane.session_id(),
+                run_id,
+                window.name(),
+                pane.window_id(),
+                activation.activation_id.as_str(),
+                pane.id(),
+            );
+            let mut launch_transaction_id = None;
+            if !self.state.launched_activations.contains(&key) {
+                match self
+                    .tmux_adapter
+                    .send_input_transaction(&metadata, &agent_command)
+                {
+                    Ok(transaction) => {
+                        launch_transaction_id = Some(transaction.transaction_id().to_string());
+                        self.record_machine_input(run_id, "agent_launch", transaction.record());
+                        self.state.launched_activations.insert(key.clone());
+                    }
+                    Err(err) => {
+                        self.push_actuation_warning(
+                            run_id,
+                            json!({
+                                "activation_id": activation.activation_id,
+                                "node_id": activation.node_id,
+                                "driver": "agent",
+                                "message": "tmux actuation failed before agent launch",
+                                "error": err.to_string()
+                            }),
+                            &mut actuation,
+                        );
+                        continue;
+                    }
+                }
+            }
+            match self.tmux_adapter.send_input_transaction(&metadata, &prompt) {
+                Ok(transaction) => {
+                    let prompt_transaction_id = transaction.transaction_id().to_string();
+                    self.record_machine_input(run_id, "node_prompt", transaction.record());
+                    self.state.actuated_activations.insert(key);
+                    actuation.sent.push(json!({
+                        "activation_id": activation.activation_id,
+                        "node_id": activation.node_id,
+                        "driver": "agent",
+                        "agent_command": agent_command,
+                        "agent_launch_transaction_id": launch_transaction_id,
+                        "prompt_transaction_id": prompt_transaction_id,
+                        "pane_id": pane.id(),
+                        "session_id": pane.session_id(),
+                        "window_id": pane.window_id(),
+                        "window_name": window.name()
+                    }));
+                }
+                Err(err) => {
+                    self.push_actuation_warning(
+                        run_id,
+                        json!({
+                            "activation_id": activation.activation_id,
+                            "node_id": activation.node_id,
+                            "driver": "agent",
+                            "message": "tmux actuation failed before prompt submission",
+                            "error": err.to_string()
+                        }),
+                        &mut actuation,
+                    );
+                }
+            }
+        }
+
+        Ok(actuation)
+    }
+
+    fn push_actuation_warning(
+        &mut self,
+        run_id: &str,
+        warning: Value,
+        actuation: &mut RuntimeActuation,
+    ) {
+        if !actuation.warnings.contains(&warning) {
+            actuation.warnings.push(warning.clone());
+        }
+        let warnings = self
+            .state
+            .actuation_warnings
+            .entry(run_id.to_string())
+            .or_default();
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+
+    fn record_machine_input(&mut self, run_id: &str, role: &str, record: &MachineInputRecord) {
+        let mut value = serde_json::to_value(record).unwrap_or_else(|_| {
+            json!({
+                "transaction_id": record.transaction_id,
+                "status": "unknown"
+            })
+        });
+        if let Some(object) = value.as_object_mut() {
+            object.insert("role".to_string(), json!(role));
+        }
+        self.state
+            .machine_inputs
+            .entry(run_id.to_string())
+            .or_default()
+            .push(value);
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeActuation {
+    sent: Vec<Value>,
+    warnings: Vec<Value>,
+}
+
+fn agent_command_from_arguments(arguments: &Value) -> Result<Option<String>, ToolError> {
+    if let Some(command) = optional_string(arguments, &["agent_command", "agentCommand"])? {
+        return non_empty_agent_command(command, "agent_command");
+    }
+    let Some(tmux) = arguments.get("tmux") else {
+        return Ok(None);
+    };
+    let object = tmux
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("tmux must be an object"))?;
+    for key in ["agent_command", "agentCommand"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let Some(command) = value.as_str() else {
+            return Err(ToolError::invalid("tmux.agent_command must be a string"));
+        };
+        return non_empty_agent_command(command, "tmux.agent_command");
+    }
+    Ok(None)
+}
+
+fn non_empty_agent_command(command: &str, field: &str) -> Result<Option<String>, ToolError> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(ToolError::invalid(format!("{field} must be non-empty")));
+    }
+    Ok(Some(command.to_string()))
+}
+
+fn initial_agent_prompt(
+    draft: &flow::FlowDraft,
+    node: &flow::FlowNode,
+    action: &flow::NodeAction,
+) -> String {
+    let resources_by_id = draft
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), resource))
+        .collect::<BTreeMap<_, _>>();
+    let mut prompt = action
+        .prompt_ref
+        .as_deref()
+        .and_then(|prompt_ref| resources_by_id.get(prompt_ref))
+        .map(|resource| resource_source_body(&resource.source).to_string())
+        .filter(|body| !body.is_empty())
+        .unwrap_or_else(|| format!("Run node {}.", node.id));
+
+    let resources = action
+        .resource_refs
+        .iter()
+        .filter_map(|resource_id| {
+            resources_by_id
+                .get(resource_id.as_str())
+                .map(|resource| (resource_id, *resource))
+        })
+        .collect::<Vec<_>>();
+    if !resources.is_empty() {
+        prompt.push_str("\n\nResources:");
+        for (resource_id, resource) in resources {
+            prompt.push('\n');
+            prompt.push_str(resource_id);
+            prompt.push_str(" (");
+            prompt.push_str(resource_kind_name(&resource.kind));
+            prompt.push_str("): ");
+            prompt.push_str(resource_source_body(&resource.source));
+        }
+    }
+
+    prompt
+}
+
+fn resource_source_body(source: &str) -> &str {
+    source.strip_prefix("inline:").unwrap_or(source).trim()
+}
+
+fn node_driver_name(driver: flow::NodeDriver) -> &'static str {
+    match driver {
+        flow::NodeDriver::Agent => "agent",
+        flow::NodeDriver::Script => "script",
+        flow::NodeDriver::Review => "review",
+        flow::NodeDriver::Human => "human",
+    }
+}
+
+fn resource_kind_name(kind: &flow::ResourceKind) -> &'static str {
+    match kind {
+        flow::ResourceKind::Schema => "schema",
+        flow::ResourceKind::Rule => "rule",
+        flow::ResourceKind::Profile => "profile",
+        flow::ResourceKind::View => "view",
+        flow::ResourceKind::Prompt => "prompt",
+        flow::ResourceKind::Script => "script",
+        flow::ResourceKind::Flow => "flow",
+        flow::ResourceKind::Readme => "readme",
     }
 }
 

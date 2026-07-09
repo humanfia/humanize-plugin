@@ -16,6 +16,7 @@ mod flow_tools;
 mod review_tools;
 mod route_preview;
 mod runtime_control;
+mod runtime_snapshot;
 mod surface;
 mod tmux_tools;
 mod update_tools;
@@ -432,6 +433,8 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .apply_flow_lock(run_id, mode, lock_id, provided_content_hash)
             .map_err(ToolError::from_runtime)?;
+        let review_status = self.run_review_status_name(lock_id, false);
+        self.remember_run_archive(run_id, lock_id, provided_content_hash, review_status);
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
@@ -481,6 +484,12 @@ struct McpServerState {
     messages: BTreeMap<String, Vec<Value>>,
     tmux_windows: BTreeMap<String, TmuxWindow>,
     tmux_panes: BTreeMap<(String, String), TmuxPane>,
+    run_archives: BTreeMap<String, RunArchive>,
+    run_agent_commands: BTreeMap<String, String>,
+    machine_inputs: BTreeMap<String, Vec<Value>>,
+    actuation_warnings: BTreeMap<String, Vec<Value>>,
+    launched_activations: BTreeSet<(String, String)>,
+    actuated_activations: BTreeSet<(String, String)>,
 }
 
 impl McpServerState {
@@ -546,7 +555,10 @@ impl McpServerState {
     }
 
     fn runtime_snapshot(&self) -> VisualizationSnapshot {
-        VisualizationSnapshot::from_runtime(self.runtime().state(), &self.message_counts())
+        let mut snapshot =
+            VisualizationSnapshot::from_runtime(self.runtime().state(), &self.message_counts());
+        self.enrich_runtime_snapshot(&mut snapshot);
+        snapshot
     }
 
     fn message_counts(&self) -> BTreeMap<String, usize> {
@@ -555,6 +567,14 @@ impl McpServerState {
             .map(|(run_id, messages)| (run_id.clone(), messages.len()))
             .collect()
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunArchive {
+    flow_lock_id: String,
+    content_hash: String,
+    review_status: String,
+    flow_export_document: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -39,6 +39,8 @@ fn visualization_snapshot_projects_runtime_counts_and_stop_contract_gaps() {
     assert_eq!(snapshot.runs.len(), 1);
     let run = &snapshot.runs[0];
     assert_eq!(run.run_id, "run-a");
+    assert_eq!(run.driver_mode, "event_driven_mcp");
+    assert!(run.driver_mode_detail.contains("MCP tool calls"));
     assert_eq!(run.activation_count, 1);
     assert_eq!(run.artifact_count, 1);
     assert_eq!(run.effect_count, 1);
@@ -73,7 +75,12 @@ fn terminal_dashboard_is_compact_and_deterministic() {
     });
     run.pane_mappings.push(PaneMappingSnapshot {
         activation_id: "root".to_string(),
+        run_id: "run-a".to_string(),
         pane: "%1".to_string(),
+        session_id: "host-a".to_string(),
+        window_id: "%0".to_string(),
+        window_name: "run-a".to_string(),
+        pane_id: "%1".to_string(),
         status: "reserved".to_string(),
     });
     run.runtime_budgets.push(RuntimeBudgetSnapshot {
@@ -84,7 +91,12 @@ fn terminal_dashboard_is_compact_and_deterministic() {
     });
     run.activations.get_mut("root").unwrap().pane = Some(PaneMappingSnapshot {
         activation_id: "root".to_string(),
+        run_id: "run-a".to_string(),
         pane: "%1".to_string(),
+        session_id: "host-a".to_string(),
+        window_id: "%0".to_string(),
+        window_name: "run-a".to_string(),
+        pane_id: "%1".to_string(),
         status: "reserved".to_string(),
     });
 

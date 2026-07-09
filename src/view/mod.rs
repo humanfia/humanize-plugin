@@ -47,6 +47,8 @@ impl VisualizationSnapshot {
 pub struct RunSnapshot {
     pub run_id: String,
     pub run_status: String,
+    pub driver_mode: String,
+    pub driver_mode_detail: String,
     pub activation_count: usize,
     pub artifact_count: usize,
     pub effect_count: usize,
@@ -60,13 +62,21 @@ pub struct RunSnapshot {
     pub effects: BTreeMap<String, String>,
     pub board: BTreeMap<String, String>,
     pub flow_lock_mode: Option<String>,
+    pub flow_lock_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub flow_review_status: Option<String>,
+    pub flow_export_document: Option<String>,
     pub latest_flow_lock_application: Option<String>,
     pub flow_lock_applications: BTreeMap<String, FlowLockApplicationSnapshot>,
     pub missing_stop_contracts: BTreeMap<String, Vec<String>>,
     pub runtime_budgets: Vec<RuntimeBudgetSnapshot>,
     pub pane_mappings: Vec<PaneMappingSnapshot>,
+    pub event_count: usize,
     pub event_timeline: Vec<RuntimeEventSnapshot>,
     pub last_decision: Option<RuntimeDecisionSnapshot>,
+    pub stop_decisions: Vec<RuntimeStopDecisionSnapshot>,
+    pub machine_inputs: Vec<Value>,
+    pub actuation_warnings: Vec<Value>,
     pub why: Option<String>,
 }
 
@@ -168,6 +178,8 @@ impl RunSnapshot {
         Self {
             run_id: run_id.to_string(),
             run_status: run_status.to_string(),
+            driver_mode: "event_driven_mcp".to_string(),
+            driver_mode_detail: "progress advances on MCP tool calls; no background daemon is attached to this in-process driver".to_string(),
             activation_count: activations.len(),
             artifact_count: artifacts.len(),
             effect_count: effects.len(),
@@ -186,6 +198,10 @@ impl RunSnapshot {
                 .copied()
                 .map(flow_lock_mode_name)
                 .map(str::to_string),
+            flow_lock_id: state.flow_lock_id_by_run.get(run_id).cloned(),
+            content_hash: state.contract_hash_by_run.get(run_id).cloned(),
+            flow_review_status: None,
+            flow_export_document: None,
             latest_flow_lock_application: state
                 .latest_flow_lock_application_by_run
                 .get(run_id)
@@ -194,8 +210,12 @@ impl RunSnapshot {
             missing_stop_contracts,
             runtime_budgets: Vec::new(),
             pane_mappings: Vec::new(),
+            event_count: 0,
             event_timeline: Vec::new(),
             last_decision: None,
+            stop_decisions: Vec::new(),
+            machine_inputs: Vec::new(),
+            actuation_warnings: Vec::new(),
             why: None,
         }
     }
@@ -220,15 +240,25 @@ impl RunSnapshot {
             "board_version": self.board_version,
             "message_count": self.message_count,
             "flow_lock_mode": self.flow_lock_mode,
+            "flow_lock_id": self.flow_lock_id,
+            "content_hash": self.content_hash,
+            "flow_review_status": self.flow_review_status,
+            "flow_export_document": self.flow_export_document,
             "latest_flow_lock_application": self.latest_flow_lock_application,
             "flow_lock_applications": self.flow_lock_applications,
             "missing_stop_contract_count": self.missing_stop_contract_count,
             "missing_stop_contracts": self.missing_stop_contracts,
             "run_status": self.run_status,
+            "driver_mode": self.driver_mode,
+            "driver_mode_detail": self.driver_mode_detail,
             "runtime_budgets": self.runtime_budgets,
             "pane_mappings": self.pane_mappings,
+            "event_count": self.event_count,
             "event_timeline": self.event_timeline,
             "last_decision": self.last_decision,
+            "stop_decisions": self.stop_decisions,
+            "machine_inputs": self.machine_inputs,
+            "actuation_warnings": self.actuation_warnings,
             "why": self.why
         })
     }
@@ -245,7 +275,12 @@ pub struct RuntimeBudgetSnapshot {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct PaneMappingSnapshot {
     pub activation_id: String,
+    pub run_id: String,
     pub pane: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub window_name: String,
+    pub pane_id: String,
     pub status: String,
 }
 
@@ -261,6 +296,16 @@ pub struct RuntimeDecisionSnapshot {
     pub decision_id: String,
     pub summary: String,
     pub why: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RuntimeStopDecisionSnapshot {
+    pub decision_id: String,
+    pub activation_id: String,
+    pub decision: String,
+    pub attempt: u32,
+    pub reason: Option<String>,
+    pub missing: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
