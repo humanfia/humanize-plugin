@@ -49,6 +49,32 @@ For long-running tasks, prefer entering `run_flow` quickly with a small,
 validated adaptive loop over spending many turns hand-authoring a large
 perfect-looking graph.
 
+## Executable tmux Runs
+
+When a locked flow contains agent nodes, pass `tmux.agent_command` to
+`run_flow`. Resolve the current tmux session instead of hardcoding it, choose a
+unique workflow window for the run, and launch an interactive coding agent:
+
+```json
+{
+  "run_id": "task-run",
+  "flow_lock_id": "flow-lock-id",
+  "tmux": {
+    "enabled": true,
+    "session": "current-session-name",
+    "window": "task-run",
+    "agent_command": "codex --dangerously-bypass-approvals-and-sandbox"
+  }
+}
+```
+
+Use `tmux display-message -p '#S'` to discover the current session. The coding
+agent inherits the container environment and its installed Humanize MCP
+configuration. Current autonomous tmux actuation directly launches agent nodes;
+script and review nodes require explicit orchestration by the main agent or an
+agent node that performs and records the deterministic or review action. Treat
+an actuation warning as an execution gap, not as successful node completion.
+
 ## Flow Architecture
 
 Design the smallest flow that gives the task durable control. Use the Humanize

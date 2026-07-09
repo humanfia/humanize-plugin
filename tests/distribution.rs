@@ -126,3 +126,13 @@ fn readme_starts_with_production_install_flow_and_terse_prompt() {
     ));
     assert!(readme.contains("cargo uninstall humanize-plugin"));
 }
+
+#[test]
+fn workflow_skill_explains_executable_tmux_agent_runs() {
+    let skill = read_text("skills/humanize-workflows/SKILL.md");
+
+    assert!(skill.contains("tmux.agent_command"));
+    assert!(skill.contains("codex --dangerously-bypass-approvals-and-sandbox"));
+    assert!(skill.contains("autonomous tmux actuation directly launches agent nodes"));
+    assert!(skill.contains("script and review nodes require explicit orchestration"));
+}
