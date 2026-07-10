@@ -1,12 +1,32 @@
 mod support;
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use humanize_plugin::mcp::McpServer;
+use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::{Value, json};
 
 use support::mcp::{
-    assert_tool_error, call_tool, lock_flow, lock_valid_flow, readme_resource, structured,
-    valid_flow,
+    RecordingRunner, assert_tool_error, call_tool, lock_flow, lock_valid_flow, readme_resource,
+    structured, valid_flow,
 };
+
+static NEXT_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
+
+fn isolated_server() -> McpServer<RecordingRunner> {
+    let index = NEXT_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("mcp-runtime-assets-{index}"));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    McpServer::with_tmux_runner_and_run_asset_store(
+        RecordingRunner::default(),
+        RunAssetStore::new(RunAssetSink::Root(root)),
+    )
+}
 
 fn flow_for_each_preview() -> Value {
     json!({
@@ -109,12 +129,12 @@ fn flow_with_locked_root_contract() -> Value {
 
 #[test]
 fn get_context_keeps_existing_runtime_context_fields() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
         1,
-        "start_run",
+        "run_flow",
         json!({
             "run_id": "run-context",
             "nodes": [
@@ -226,12 +246,12 @@ fn get_context_keeps_existing_runtime_context_fields() {
 
 #[test]
 fn get_context_includes_stop_contract_summary() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
         1,
-        "run_flow",
+        "start_run",
         json!({
             "runId": "run-context-stop-summary",
             "nodes": [
@@ -282,7 +302,7 @@ fn get_context_includes_stop_contract_summary() {
 
 #[test]
 fn mcp_rejects_cross_run_deliver_and_validate_stop() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let run_a = call_tool(
         &mut server,
@@ -350,7 +370,7 @@ fn mcp_rejects_cross_run_deliver_and_validate_stop() {
 }
 #[test]
 fn validate_stop_uses_activation_contract_before_and_after_artifact_delivery() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -409,7 +429,7 @@ fn validate_stop_uses_activation_contract_before_and_after_artifact_delivery() {
 
 #[test]
 fn run_flow_requires_prepared_review_when_review_is_required() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
 
     let blocked = call_tool(
@@ -437,7 +457,7 @@ fn run_flow_requires_prepared_review_when_review_is_required() {
 
 #[test]
 fn run_flow_starts_reviewed_run_and_exposes_status_and_cause() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     let (lock_id, content_hash) = lock_flow(&mut server, 1, flow_with_locked_root_contract());
     let prepared = call_tool(
         &mut server,
@@ -517,7 +537,7 @@ fn run_flow_starts_reviewed_run_and_exposes_status_and_cause() {
 
 #[test]
 fn run_flow_uses_locked_draft_nodes_and_contracts_when_lock_supplied() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     let (lock_id, content_hash) = lock_flow(&mut server, 1, flow_with_locked_root_contract());
     let prepared = call_tool(
         &mut server,
@@ -596,7 +616,7 @@ fn run_flow_uses_locked_draft_nodes_and_contracts_when_lock_supplied() {
 
 #[test]
 fn pause_resume_and_stop_run_use_runtime_control_statuses() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -645,7 +665,7 @@ fn pause_resume_and_stop_run_use_runtime_control_statuses() {
 
 #[test]
 fn observe_stop_records_observation_and_advances_driver() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -699,7 +719,7 @@ fn observe_stop_records_observation_and_advances_driver() {
 
 #[test]
 fn mcp_locked_flow_routes_activate_after_stop_observation() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
     let prepared = call_tool(
         &mut server,
@@ -784,7 +804,7 @@ fn mcp_locked_flow_routes_activate_after_stop_observation() {
 
 #[test]
 fn apply_flow_update_records_runtime_application() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -872,7 +892,7 @@ fn apply_flow_update_records_runtime_application() {
 
 #[test]
 fn apply_flow_update_enforces_required_review_status() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -984,7 +1004,7 @@ fn apply_flow_update_enforces_required_review_status() {
 
 #[test]
 fn preview_flow_routes_uses_explicit_lock_without_runtime_mutation() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
     let started = call_tool(
@@ -1063,7 +1083,7 @@ fn preview_flow_routes_uses_explicit_lock_without_runtime_mutation() {
 
 #[test]
 fn preview_flow_routes_uses_latest_applied_lock_by_default() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
     let started = call_tool(
@@ -1139,7 +1159,7 @@ fn preview_flow_routes_uses_latest_applied_lock_by_default() {
 
 #[test]
 fn preview_flow_routes_without_latest_lock_returns_tool_error() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -1168,7 +1188,7 @@ fn preview_flow_routes_without_latest_lock_returns_tool_error() {
 
 #[test]
 fn preview_flow_routes_missing_run_returns_start_run_guidance() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
 
@@ -1199,7 +1219,7 @@ fn preview_flow_routes_missing_run_returns_start_run_guidance() {
 
 #[test]
 fn preview_flow_routes_missing_run_without_explicit_lock_requires_lock_binding() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let preview = call_tool(
         &mut server,
@@ -1230,7 +1250,7 @@ fn preview_flow_routes_missing_run_without_explicit_lock_requires_lock_binding()
 
 #[test]
 fn preview_flow_routes_rejects_content_hash_mismatch() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
     let started = call_tool(
@@ -1271,7 +1291,7 @@ fn preview_flow_routes_rejects_content_hash_mismatch() {
 
 #[test]
 fn preview_flow_routes_fans_out_artifact_lines_without_runtime_mutation() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, _) = lock_flow(&mut server, 1, flow_for_each_preview());
     let started = call_tool(
@@ -1354,7 +1374,7 @@ fn preview_flow_routes_fans_out_artifact_lines_without_runtime_mutation() {
 
 #[test]
 fn preview_flow_routes_reports_duplicate_fanout_activation_without_partial_plan() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, _) = lock_flow(&mut server, 1, flow_for_each_preview());
     let started = call_tool(
@@ -1426,7 +1446,7 @@ fn preview_flow_routes_reports_duplicate_fanout_activation_without_partial_plan(
 
 #[test]
 fn preview_flow_routes_distinguishes_board_presence_from_bare_truthiness() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, _) = lock_flow(&mut server, 1, flow_with_board_routes());
     let started = call_tool(
@@ -1483,7 +1503,7 @@ fn preview_flow_routes_distinguishes_board_presence_from_bare_truthiness() {
 
 #[test]
 fn preview_flow_routes_matches_artifact_and_board_paths_containing_event() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, _) = lock_flow(&mut server, 1, flow_with_event_named_fact_routes());
     let started = call_tool(
@@ -1559,7 +1579,7 @@ fn preview_flow_routes_matches_artifact_and_board_paths_containing_event() {
 
 #[test]
 fn fanout_from_artifact_returns_activation_metadata_and_context() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -1641,7 +1661,7 @@ fn fanout_from_artifact_returns_activation_metadata_and_context() {
 
 #[test]
 fn fanout_from_artifact_missing_artifact_returns_error_without_activation() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -1689,7 +1709,7 @@ fn fanout_from_artifact_missing_artifact_returns_error_without_activation() {
 
 #[test]
 fn fanout_from_artifact_for_each_mismatch_returns_error_without_activation() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,

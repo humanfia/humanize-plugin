@@ -145,10 +145,68 @@ impl<R: CommandRunner> McpServer<R> {
                 .map(|proposal| proposal.0)
                 .unwrap_or(runtime::FlowLockMode::FutureActivations),
         };
-        self.state
+        let review_status = self.run_review_status_name(lock_id, false);
+        let prepared_revision = match self.prepare_run_flow_revision(
+            run_id,
+            lock_id,
+            provided_content_hash,
+            &review_status,
+        ) {
+            Ok(revision_id) => revision_id,
+            Err(err) => {
+                let message = err.message;
+                self.record_asset_preservation_error(run_id, None, None, "flow_package", &message);
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "flow_lock_id": lock_id,
+                    "lock_id": lock_id,
+                    "content_hash": provided_content_hash,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "flow_package",
+                        "error": message
+                    },
+                    "error": "run asset preservation failed"
+                })));
+            }
+        };
+        if let Err(err) = self
+            .state
             .runtime_mut()
             .apply_flow_lock(run_id, mode, lock_id, provided_content_hash)
-            .map_err(ToolError::from_runtime)?;
+            .map_err(ToolError::from_runtime)
+        {
+            self.mark_prepared_flow_revision_failed(run_id, &prepared_revision, &err.message);
+            return Err(err);
+        }
+        if let Err(err) = self.commit_run_flow_revision(run_id, &prepared_revision) {
+            let message = err.message;
+            self.record_asset_preservation_error(run_id, None, None, "flow_package", &message);
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "flow_lock_id": lock_id,
+                "lock_id": lock_id,
+                "content_hash": provided_content_hash,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "flow_package",
+                    "error": message
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
+        let tmux_captures = self.capture_existing_tmux_panes(run_id)?;
+        let run_assets = self.run_assets_json(run_id);
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
@@ -159,7 +217,9 @@ impl<R: CommandRunner> McpServer<R> {
             "lock_id": lock_id,
             "content_hash": provided_content_hash,
             "summary": proposed.as_ref().map(|proposal| proposal.2.as_str()),
-            "review_required": proposed.as_ref().map(|proposal| proposal.3).unwrap_or(false)
+            "review_required": proposed.as_ref().map(|proposal| proposal.3).unwrap_or(false),
+            "tmux_captures": tmux_captures,
+            "run_assets": run_assets
         })))
     }
 }

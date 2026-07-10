@@ -53,7 +53,7 @@ fn normalize_draft(draft: &FlowDraft) -> String {
     format!(
         "{{\"nodes\":{},\"contracts\":{},\"routes\":{},\"resources\":{},\"imports\":{},\"policies\":{},\"extensions\":{}}}",
         normalize_nodes(&nodes),
-        normalize_contracts(&contracts),
+        normalize_contracts(draft, &contracts),
         normalize_routes(&routes),
         normalize_resources(&resources),
         normalize_imports(&imports),
@@ -200,27 +200,38 @@ fn normalize_effect_requirements(requirements: &[EffectRequirement]) -> String {
     format!("[{}]", values.join(","))
 }
 
-fn normalize_contracts(contracts: &[FlowContract]) -> String {
+fn normalize_contracts(draft: &FlowDraft, contracts: &[FlowContract]) -> String {
     let values = contracts
         .iter()
         .map(|contract| {
             let mut artifacts = contract.artifacts.clone();
+            let mut effects = flow_draft_contract_effects(draft, &contract.id);
             artifacts.sort_by(|left, right| {
                 left.id
                     .cmp(&right.id)
                     .then(left.schema_resource_id.cmp(&right.schema_resource_id))
             });
-            format!(
-                "{{\"id\":{},\"completion\":{},\"artifacts\":{}}}",
-                quote(&contract.id),
-                contract
-                    .completion
-                    .as_ref()
-                    .map(ContractCompletion::as_str)
-                    .map(quote)
-                    .unwrap_or_else(|| "null".into()),
-                normalize_artifacts(&artifacts)
-            )
+            effects.sort();
+            let mut fields = vec![
+                format!("\"id\":{}", quote(&contract.id)),
+                format!(
+                    "\"completion\":{}",
+                    contract
+                        .completion
+                        .as_ref()
+                        .map(ContractCompletion::as_str)
+                        .map(quote)
+                        .unwrap_or_else(|| "null".into())
+                ),
+                format!("\"artifacts\":{}", normalize_artifacts(&artifacts)),
+            ];
+            if !effects.is_empty() {
+                fields.push(format!(
+                    "\"effects\":{}",
+                    normalize_effect_requirements(&effects)
+                ));
+            }
+            format!("{{{}}}", fields.join(","))
         })
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))

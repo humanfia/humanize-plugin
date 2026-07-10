@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::str::FromStr;
 
 use humanize_plugin::client_config::{ClientConfigTarget, render_client_config};
-use humanize_plugin::mcp::{McpSurface, serve_stdio};
+use humanize_plugin::mcp::{McpSurface, serve_stdio_signal_aware};
+use humanize_plugin::pipe_sink::{
+    PipeSinkAckRequest, PipeSinkIdentity, append_reader_to_pipe_log_under_root_with_completion,
+};
 use humanize_plugin::tmux_guard::{TmuxSendGuardDecision, classify_tmux_send_with_context};
 
 const USAGE: &str = "usage: humanize-plugin-mcp [--list-tools|--version|--print-client-config <target> --command <path>|--guard-tmux-send [--owned-pane <target>...] [--current-pane <target>] -- <tmux args...>]";
@@ -23,9 +26,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         [] => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            let mut reader = BufReader::new(stdin.lock());
-            let mut writer = BufWriter::new(stdout.lock());
-            serve_stdio(&mut reader, &mut writer)?;
+            let reader = stdin.lock();
+            let writer = BufWriter::new(stdout);
+            serve_stdio_signal_aware(reader, writer)?;
+        }
+        [flag, pipe_args @ ..] if flag == "--pipe-sink" => {
+            run_pipe_sink(pipe_args)?;
         }
         [flag] if flag == "--list-tools" => {
             let stdout = io::stdout();
@@ -57,6 +63,39 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn run_pipe_sink(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let value = |flag: &str| -> Result<&str, Box<dyn Error>> {
+        args.windows(2)
+            .find_map(|window| (window[0] == flag).then_some(window[1].as_str()))
+            .ok_or_else(|| format!("missing {flag}").into())
+    };
+    let root = Path::new(value("--root")?);
+    let relative = Path::new(value("--relative")?);
+    let ack_relative = Path::new(value("--ack-relative")?);
+    let completion_relative = Path::new(value("--completion-relative")?);
+    let ack_nonce = value("--ack-nonce")?;
+    let identity = PipeSinkIdentity {
+        dev: value("--dev")?.parse()?,
+        ino: value("--ino")?.parse()?,
+        uid: value("--uid")?.parse()?,
+        mode: value("--mode")?.parse()?,
+        nlink: value("--nlink")?.parse()?,
+    };
+    let ack = PipeSinkAckRequest::new(ack_relative, ack_nonce);
+    let completion = PipeSinkAckRequest::new(completion_relative, ack_nonce);
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    append_reader_to_pipe_log_under_root_with_completion(
+        root,
+        relative,
+        &identity,
+        Some(&ack),
+        Some(&completion),
+        &mut reader,
+    )?;
     Ok(())
 }
 

@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "run_id": "worker:artifact/0",
+  "created_at_ms": 1700000000000,
+  "updated_at_ms": 1700000000000,
+  "sink": "root",
+  "root": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0",
+  "manifest_path": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/manifest.json",
+  "storage": {
+    "raw_run_id": "worker:artifact/0",
+    "run_directory": "run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0",
+    "run_relative_path": "run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0"
+  },
+  "protocol": {
+    "mcp_protocol_version": "2024-11-05",
+    "package_name": "humanize-plugin",
+    "package_version": "0.1.0"
+  },
+  "flow": {
+    "main_flow": true,
+    "status": "complete",
+    "complete": true,
+    "current_revision_id": "rev-0001",
+    "current_export_path": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/flow/revisions/rev-0001/flow-lock.json",
+    "current_export_relative_path": "flow/revisions/rev-0001/flow-lock.json",
+    "revisions": [
+      {
+        "revision_id": "rev-0001",
+        "main_flow": true,
+        "flow_lock_id": "flk_d10912e3ee9cfcf8",
+        "content_hash": "fnv1a64:d10912e3ee9cfcf8",
+        "review_status": "not_required",
+        "flow_lock_mode": "core",
+        "export_format": "json",
+        "export_path": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/flow/revisions/rev-0001/flow-lock.json",
+        "relative_path": "flow/revisions/rev-0001/flow-lock.json",
+        "created_at_ms": 1700000000000,
+        "apply_state": "applied",
+        "applied_at_ms": 1700000000000
+      }
+    ]
+  },
+  "artifact_paths": {
+    "manifest": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/manifest.json",
+    "manifest_relative_path": "manifest.json",
+    "flow_current": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/flow/revisions/rev-0001/flow-lock.json",
+    "flow_current_relative_path": "flow/revisions/rev-0001/flow-lock.json",
+    "flow_revisions": [
+      "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/flow/revisions/rev-0001/flow-lock.json"
+    ],
+    "flow_revision_relative_paths": [
+      "flow/revisions/rev-0001/flow-lock.json"
+    ]
+  },
+  "activations": {
+    "root": {
+      "run_id": "worker:artifact/0",
+      "activation_id": "root",
+      "node_id": "root",
+      "adapter": "tmux",
+      "tmux_target": "host-a:%7.%8",
+      "session_id": "host-a",
+      "window_id": "%7",
+      "window_name": "flow-a",
+      "pane_id": "%8",
+      "metadata_path": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/activations/act-sha256-86761540f38802992978c00f7155ac45d2d89dcb81b76b91684d702eed276cad-root/metadata.json",
+      "pipe_path": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/activations/act-sha256-86761540f38802992978c00f7155ac45d2d89dcb81b76b91684d702eed276cad-root/transcript.pipe.log",
+      "final_capture_path": "/tmp/humanize-fixtures/run-sha256-2db064d53bf7950c9948d394baf2dd1f149fba2954aa6a647bcd2dbeb25f35a4-worker_artifact_0/activations/act-sha256-86761540f38802992978c00f7155ac45d2d89dcb81b76b91684d702eed276cad-root/final-capture.txt",
+      "relative_paths": {
+        "metadata": "activations/act-sha256-86761540f38802992978c00f7155ac45d2d89dcb81b76b91684d702eed276cad-root/metadata.json",
+        "transcript_pipe": "activations/act-sha256-86761540f38802992978c00f7155ac45d2d89dcb81b76b91684d702eed276cad-root/transcript.pipe.log",
+        "final_capture": "activations/act-sha256-86761540f38802992978c00f7155ac45d2d89dcb81b76b91684d702eed276cad-root/final-capture.txt"
+      },
+      "started_at_ms": 1700000000000,
+      "ended_at_ms": null,
+      "termination_reason": null,
+      "capture_phase": "capturing",
+      "pipe_acknowledged": true,
+      "capture_complete": false,
+      "preservation_status": "capturing",
+      "resource_cleanup_status": "pending",
+      "resource_cleanup_error": null
+    }
+  },
+  "preservation_errors": [],
+  "preservation_blocked": false,
+  "completion": {
+    "flow_complete": true,
+    "expected_tmux_activations": [
+      "root"
+    ],
+    "complete_tmux_activations": [],
+    "incomplete_tmux_activations": [
+      "root"
+    ],
+    "complete": false
+  }
+}

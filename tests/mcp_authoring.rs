@@ -1,13 +1,33 @@
 mod support;
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use humanize_plugin::mcp::{McpServer, McpSurface};
+use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::json;
 
 use support::mcp::{
-    assert_prefixed_hex, assert_tool_error, blank_inline_readme_flow, call_tool, diagnostic_codes,
-    lock_valid_flow, missing_readme_flow, node_less_missing_readme_flow, readme_resource,
-    structured, valid_flow,
+    RecordingRunner, assert_prefixed_hex, assert_tool_error, blank_inline_readme_flow, call_tool,
+    diagnostic_codes, lock_valid_flow, missing_readme_flow, node_less_missing_readme_flow,
+    readme_resource, structured, valid_flow,
 };
+
+static NEXT_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
+
+fn isolated_server() -> McpServer<RecordingRunner> {
+    let index = NEXT_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("mcp-authoring-assets-{index}"));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    McpServer::with_tmux_runner_and_run_asset_store(
+        RecordingRunner::default(),
+        RunAssetStore::new(RunAssetSink::Root(root)),
+    )
+}
 
 #[test]
 fn flow_suggest_schema_covers_goal_nodes_and_artifact() {
@@ -25,7 +45,7 @@ fn flow_suggest_schema_covers_goal_nodes_and_artifact() {
 }
 #[test]
 fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let suggested = call_tool(
         &mut server,
@@ -110,7 +130,7 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
 
 #[test]
 fn flow_check_accepts_node_action_descriptor() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -156,7 +176,7 @@ fn flow_check_accepts_node_action_descriptor() {
 
 #[test]
 fn flow_action_export_uses_snake_case_after_lock() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let locked = call_tool(
         &mut server,
@@ -231,7 +251,7 @@ fn flow_action_export_uses_snake_case_after_lock() {
 }
 #[test]
 fn flow_repair_returns_mechanical_patches_and_unranked_candidates() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -284,7 +304,7 @@ fn flow_repair_returns_mechanical_patches_and_unranked_candidates() {
 
 #[test]
 fn flow_repair_keeps_fatal_input_patch_free() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -318,7 +338,7 @@ fn flow_repair_keeps_fatal_input_patch_free() {
 
 #[test]
 fn propose_flow_update_locks_flow_and_reports_review_risk() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let proposed = call_tool(
         &mut server,
@@ -352,7 +372,7 @@ fn propose_flow_update_locks_flow_and_reports_review_risk() {
 
 #[test]
 fn flow_check_rejects_unknown_action_driver_at_parse_time() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -387,7 +407,7 @@ fn flow_check_rejects_unknown_action_driver_at_parse_time() {
 
 #[test]
 fn flow_suggest_flow_round_trips_through_lock_and_export() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let suggested = call_tool(
         &mut server,
@@ -448,7 +468,7 @@ fn flow_suggest_flow_round_trips_through_lock_and_export() {
 }
 #[test]
 fn flow_suggest_rejects_blank_goal() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -469,7 +489,7 @@ fn flow_suggest_rejects_blank_goal() {
 }
 #[test]
 fn flow_check_rejects_effectful_predicate_diagnostics() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -502,7 +522,7 @@ fn flow_check_rejects_effectful_predicate_diagnostics() {
 #[test]
 fn flow_check_rejects_missing_readme_in_core_and_strict() {
     for (id, mode) in [(1, "core"), (2, "strict")] {
-        let mut server = McpServer::new();
+        let mut server = isolated_server();
 
         let response = call_tool(
             &mut server,
@@ -522,7 +542,7 @@ fn flow_check_rejects_missing_readme_in_core_and_strict() {
 }
 #[test]
 fn flow_check_rejects_node_less_non_empty_flow_missing_readme() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -539,7 +559,7 @@ fn flow_check_rejects_node_less_non_empty_flow_missing_readme() {
 }
 #[test]
 fn flow_check_rejects_blank_inline_readme() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -557,7 +577,7 @@ fn flow_check_rejects_blank_inline_readme() {
 }
 #[test]
 fn flow_check_keeps_core_warning_diagnostics_successful() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -585,7 +605,7 @@ fn flow_check_keeps_core_warning_diagnostics_successful() {
 }
 #[test]
 fn flow_lock_rejects_missing_readme() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -604,7 +624,7 @@ fn flow_lock_rejects_missing_readme() {
 }
 #[test]
 fn flow_lock_rejects_node_less_non_empty_flow_missing_readme() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -621,7 +641,7 @@ fn flow_lock_rejects_node_less_non_empty_flow_missing_readme() {
 }
 #[test]
 fn flow_apply_rejects_missing_readme() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -639,7 +659,7 @@ fn flow_apply_rejects_missing_readme() {
 }
 #[test]
 fn flow_apply_rejects_node_less_non_empty_flow_missing_readme() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -656,7 +676,7 @@ fn flow_apply_rejects_node_less_non_empty_flow_missing_readme() {
 }
 #[test]
 fn flow_apply_rejects_empty_and_non_object_flows() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let empty = call_tool(
         &mut server,
@@ -692,7 +712,7 @@ fn flow_apply_rejects_empty_and_non_object_flows() {
 }
 #[test]
 fn flow_apply_rejects_effectful_predicate_with_diagnostics() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -724,7 +744,7 @@ fn flow_apply_rejects_effectful_predicate_with_diagnostics() {
 }
 #[test]
 fn flow_apply_records_valid_flow_lock_for_export() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let applied = call_tool(
         &mut server,
@@ -785,7 +805,7 @@ fn flow_apply_records_valid_flow_lock_for_export() {
 }
 #[test]
 fn apply_flow_lock_requires_and_records_lock_provenance() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
 
@@ -853,7 +873,7 @@ fn apply_flow_lock_requires_and_records_lock_provenance() {
 }
 #[test]
 fn apply_flow_lock_rejects_unknown_lock_without_runtime_apply() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let started = call_tool(
         &mut server,
@@ -898,7 +918,7 @@ fn apply_flow_lock_rejects_unknown_lock_without_runtime_apply() {
 }
 #[test]
 fn apply_flow_lock_rejects_hash_mismatch_without_runtime_apply() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
 
@@ -954,7 +974,7 @@ fn apply_flow_lock_rejects_hash_mismatch_without_runtime_apply() {
 
 #[test]
 fn apply_flow_lock_missing_run_returns_start_run_guidance() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
 
@@ -990,7 +1010,7 @@ fn apply_flow_lock_missing_run_returns_start_run_guidance() {
 
 #[test]
 fn apply_flow_lock_unknown_lock_takes_precedence_over_missing_run() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let response = call_tool(
         &mut server,
@@ -1016,7 +1036,7 @@ fn apply_flow_lock_unknown_lock_takes_precedence_over_missing_run() {
 
 #[test]
 fn apply_flow_lock_hash_mismatch_takes_precedence_over_missing_run() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
 
@@ -1052,7 +1072,7 @@ fn apply_flow_lock_hash_mismatch_takes_precedence_over_missing_run() {
 }
 #[test]
 fn apply_flow_lock_accepts_flow_lock_id_alias_for_stored_lock() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
     let started = call_tool(
@@ -1085,10 +1105,10 @@ fn apply_flow_lock_accepts_flow_lock_id_alias_for_stored_lock() {
 }
 #[test]
 fn apply_flow_lock_rejects_lock_created_in_another_server() {
-    let mut authoring_server = McpServer::new();
+    let mut authoring_server = isolated_server();
     let (lock_id, content_hash) = lock_valid_flow(&mut authoring_server, 1);
 
-    let mut runtime_server = McpServer::new();
+    let mut runtime_server = isolated_server();
     let started = call_tool(
         &mut runtime_server,
         1,

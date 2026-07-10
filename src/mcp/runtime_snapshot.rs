@@ -18,7 +18,6 @@ impl McpServerState {
             if let Some(warnings) = self.actuation_warnings.get(&run.run_id) {
                 run.actuation_warnings = warnings.clone();
             }
-
             let timeline = self
                 .runtime()
                 .events()

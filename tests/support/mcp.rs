@@ -2,7 +2,8 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::rc::Rc;
@@ -11,6 +12,20 @@ use std::time::Duration;
 use humanize_plugin::adapters::tmux::{CommandOutput, CommandRunner, TmuxError};
 use humanize_plugin::mcp::McpServer;
 use serde_json::{Value, json};
+
+thread_local! {
+    static SIMULATED_PIPE_CAPTURES: RefCell<BTreeMap<String, SimulatedPipeCapture>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+struct SimulatedPipeCapture {
+    root: std::path::PathBuf,
+    completion_relative: String,
+    nonce: String,
+    transcript_dev: u64,
+    transcript_ino: u64,
+    initial_len: u64,
+    file: File,
+}
 
 #[derive(Clone, Default)]
 pub struct RecordingRunner {
@@ -31,9 +46,127 @@ impl RecordingRunner {
 }
 impl CommandRunner for RecordingRunner {
     fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        let output = self.outputs.borrow_mut().pop_front().unwrap_or_default();
+        if argv.get(1).map(String::as_str) == Some("pipe-pane") && output.is_success() {
+            acknowledge_pipe_command(&argv);
+        }
         self.calls.borrow_mut().push(argv);
-        Ok(self.outputs.borrow_mut().pop_front().unwrap_or_default())
+        Ok(output)
     }
+
+    fn pipe_sink_helper_is_external(&self) -> bool {
+        false
+    }
+
+    fn pipe_sink_producer_closed(&self, target: &str) {
+        complete_pipe_command(target);
+    }
+}
+
+pub fn acknowledge_pipe_command(argv: &[String]) {
+    let Some(command) = argv.get(5) else {
+        return;
+    };
+    let Some(root) = shell_arg_after(command, "--root") else {
+        return;
+    };
+    let Some(ack_relative) = shell_arg_after(command, "--ack-relative") else {
+        return;
+    };
+    let Some(ack_nonce) = shell_arg_after(command, "--ack-nonce") else {
+        return;
+    };
+    let Some(completion_relative) = shell_arg_after(command, "--completion-relative") else {
+        return;
+    };
+    let Some(transcript_relative) = shell_arg_after(command, "--relative") else {
+        return;
+    };
+    let Some(dev) = shell_arg_after(command, "--dev").and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let Some(ino) = shell_arg_after(command, "--ino").and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let transcript_path = std::path::Path::new(&root).join(transcript_relative);
+    let Ok(file) = OpenOptions::new().append(true).open(&transcript_path) else {
+        return;
+    };
+    let initial_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let ack_path = std::path::Path::new(&root).join(ack_relative);
+    if let Some(parent) = ack_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = json!({
+        "nonce": ack_nonce,
+        "pid": std::process::id(),
+        "transcript_dev": dev,
+        "transcript_ino": ino
+    });
+    let _ = fs::write(ack_path, format!("{payload}\n"));
+    let target = argv.get(4).cloned().unwrap_or_default();
+    SIMULATED_PIPE_CAPTURES.with(|captures| {
+        captures.borrow_mut().insert(
+            target,
+            SimulatedPipeCapture {
+                root: std::path::PathBuf::from(root),
+                completion_relative,
+                nonce: ack_nonce,
+                transcript_dev: dev,
+                transcript_ino: ino,
+                initial_len,
+                file,
+            },
+        );
+    });
+}
+
+pub fn complete_pipe_command(target: &str) {
+    let capture = SIMULATED_PIPE_CAPTURES.with(|captures| captures.borrow_mut().remove(target));
+    let Some(capture) = capture else {
+        return;
+    };
+    let _ = capture.file.sync_all();
+    let transcript_len = capture
+        .file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(capture.initial_len);
+    let completion_path = capture.root.join(capture.completion_relative);
+    let payload = json!({
+        "nonce": capture.nonce,
+        "pid": std::process::id(),
+        "process_start_time_ticks": current_process_start_time_ticks(),
+        "transcript_dev": capture.transcript_dev,
+        "transcript_ino": capture.transcript_ino,
+        "initial_len": capture.initial_len,
+        "bytes_appended": transcript_len.saturating_sub(capture.initial_len),
+        "transcript_len": transcript_len
+    });
+    let _ = fs::write(completion_path, format!("{payload}\n"));
+}
+
+fn current_process_start_time_ticks() -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
+    stat.rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn shell_arg_after(command: &str, flag: &str) -> Option<String> {
+    let rest = command.split_once(flag)?.1.trim_start();
+    if let Some(rest) = rest.strip_prefix('\'') {
+        let value = rest.split('\'').next()?;
+        return Some(value.to_string());
+    }
+    rest.split_whitespace().next().map(str::to_string)
 }
 pub fn call_tool<R: CommandRunner>(
     server: &mut McpServer<R>,

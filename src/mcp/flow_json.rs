@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 pub(crate) fn flow_draft_json(draft: &flow::FlowDraft) -> Value {
     json!({
         "nodes": draft.nodes.iter().map(flow_node_json).collect::<Vec<_>>(),
-        "contracts": draft.contracts.iter().map(flow_contract_json).collect::<Vec<_>>(),
+        "contracts": draft.contracts.iter().map(|contract| flow_contract_json(draft, contract)).collect::<Vec<_>>(),
         "routes": draft.routes.iter().map(flow_route_json).collect::<Vec<_>>(),
         "resources": draft.resources.iter().map(flow_resource_json).collect::<Vec<_>>(),
         "imports": draft.imports.iter().map(flow_import_json).collect::<Vec<_>>(),
@@ -43,7 +43,7 @@ fn node_action_json(action: &flow::NodeAction) -> Value {
     Value::Object(object)
 }
 
-fn flow_contract_json(contract: &flow::FlowContract) -> Value {
+fn flow_contract_json(draft: &flow::FlowDraft, contract: &flow::FlowContract) -> Value {
     let mut object = Map::new();
     object.insert("id".into(), json!(contract.id));
     insert_optional_string(
@@ -55,6 +55,13 @@ fn flow_contract_json(contract: &flow::FlowContract) -> Value {
         "artifacts".into(),
         Value::Array(contract.artifacts.iter().map(flow_artifact_json).collect()),
     );
+    let effects = flow::flow_draft_contract_effects(draft, &contract.id);
+    if !effects.is_empty() {
+        object.insert(
+            "effects".into(),
+            Value::Array(effects.iter().map(flow_effect_json).collect()),
+        );
+    }
     Value::Object(object)
 }
 
@@ -67,6 +74,13 @@ fn flow_artifact_json(artifact: &flow::ContractArtifact) -> Value {
         artifact.schema_resource_id.as_deref(),
     );
     Value::Object(object)
+}
+
+fn flow_effect_json(effect: &flow::EffectRequirement) -> Value {
+    json!({
+        "id": effect.id,
+        "required": effect.required,
+    })
 }
 
 fn flow_route_json(route: &flow::FlowRoute) -> Value {

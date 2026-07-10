@@ -139,6 +139,80 @@ pub struct EffectRequirement {
     pub required: bool,
 }
 
+const CONTRACT_EFFECTS_EXTENSION_PREFIX: &str = "humanize.contract_effects:";
+
+pub fn flow_draft_contract_effects(draft: &FlowDraft, contract_id: &str) -> Vec<EffectRequirement> {
+    draft
+        .extensions
+        .iter()
+        .filter_map(|extension| parse_contract_effects_extension(extension, contract_id))
+        .flatten()
+        .collect()
+}
+
+pub fn set_flow_draft_contract_effects(
+    draft: &mut FlowDraft,
+    contract_id: &str,
+    effects: Vec<EffectRequirement>,
+) {
+    draft
+        .extensions
+        .retain(|extension| !extension_is_for_contract_effects(extension, contract_id));
+    if effects.is_empty() {
+        return;
+    }
+    let effects = effects
+        .into_iter()
+        .map(|effect| {
+            serde_json::json!({
+                "id": effect.id,
+                "required": effect.required,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "contract_id": contract_id,
+        "effects": effects,
+    });
+    draft.extensions.push(format!(
+        "{}{}",
+        CONTRACT_EFFECTS_EXTENSION_PREFIX,
+        serde_json::to_string(&payload).expect("contract effects extension should serialize")
+    ));
+}
+
+fn extension_is_for_contract_effects(extension: &str, contract_id: &str) -> bool {
+    parse_contract_effects_extension(extension, contract_id).is_some()
+}
+
+fn parse_contract_effects_extension(
+    extension: &str,
+    contract_id: &str,
+) -> Option<Vec<EffectRequirement>> {
+    let payload = extension.strip_prefix(CONTRACT_EFFECTS_EXTENSION_PREFIX)?;
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let object = value.as_object()?;
+    if object.get("contract_id")?.as_str()? != contract_id {
+        return None;
+    }
+    let effects = object
+        .get("effects")?
+        .as_array()?
+        .iter()
+        .filter_map(|effect| {
+            let object = effect.as_object()?;
+            Some(EffectRequirement {
+                id: object.get("id")?.as_str()?.to_string(),
+                required: object
+                    .get("required")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(effects)
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum StopGate {
     Required,
@@ -476,6 +550,9 @@ impl NodeContract {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let effect_requirements = contract
+                    .map(|contract| flow_draft_contract_effects(draft, &contract.id))
+                    .unwrap_or_default();
                 let completion_policy = contract
                     .and_then(|contract| contract.completion.as_ref())
                     .map(CompletionPolicy::from_contract_completion)
@@ -494,7 +571,7 @@ impl NodeContract {
                     accepts,
                     completion_policy,
                     artifact_requirements,
-                    effect_requirements: Vec::new(),
+                    effect_requirements,
                     stop_gate,
                 }
             })
@@ -1373,6 +1450,9 @@ fn route_for_each_is_artifact_driven(expression: &str) -> bool {
 }
 
 fn is_authoring_extension_kind(extension: &str) -> bool {
+    if extension.starts_with(CONTRACT_EFFECTS_EXTENSION_PREFIX) {
+        return true;
+    }
     matches!(
         extension,
         "Node"

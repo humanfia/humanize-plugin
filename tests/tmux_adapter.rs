@@ -1,8 +1,12 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
+use std::thread;
+use std::time::Duration;
 
 use humanize_plugin::adapters::hooks::{
     DriverDecision, HookAction, StopHookInput, build_stop_hook_payload,
@@ -11,13 +15,18 @@ use humanize_plugin::adapters::lifecycle::{
     AgentLifecycleAdapter, LifecycleCleanupAction, LifecycleStatus,
 };
 use humanize_plugin::adapters::tmux::{
-    CommandOutput, CommandRunner, TmuxActivationMetadata, TmuxActivationRequest, TmuxAdapter,
-    TmuxError, TmuxInputTransactionConfig, TmuxPane, TmuxPaneIdentity, TmuxPaneMetadataMismatch,
-    TmuxSession, TmuxWindow,
+    CommandOutput, CommandRunner, SystemCommandRunner, TmuxActivationMetadata,
+    TmuxActivationRequest, TmuxAdapter, TmuxError, TmuxInputTransactionConfig, TmuxPane,
+    TmuxPaneIdentity, TmuxPaneMetadataMismatch, TmuxSession, TmuxWindow,
 };
 use humanize_plugin::input_ledger::{
     MachineInputLedger, MachineInputStatus, machine_input_payload_hash,
 };
+use humanize_plugin::pipe_sink::{PipeSinkIdentity, pipe_sink_identity};
+
+thread_local! {
+    static OPEN_PIPE_ACK_FILES: RefCell<Vec<File>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Clone, Default)]
 struct RecordingRunner {
@@ -59,6 +68,189 @@ fn test_temp_dir(name: &str) -> PathBuf {
         fs::remove_dir_all(&path).unwrap();
     }
     path
+}
+
+#[derive(Clone)]
+struct AckRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    ack_path: PathBuf,
+}
+
+#[derive(Clone, Default)]
+struct RealPipeRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    child: Rc<RefCell<Option<Child>>>,
+    stdin: Rc<RefCell<Option<ChildStdin>>>,
+}
+
+impl RealPipeRunner {
+    fn write_pipe(&self, bytes: &[u8]) {
+        self.stdin
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    fn close_pipe(&self) {
+        self.stdin.borrow_mut().take();
+        if let Some(mut child) = self.child.borrow_mut().take() {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+impl CommandRunner for RealPipeRunner {
+    fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        match argv.get(1).map(String::as_str) {
+            Some("pipe-pane") => {
+                let command = argv.get(5).cloned().unwrap_or_default();
+                let mut child = Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                *self.stdin.borrow_mut() = child.stdin.take();
+                *self.child.borrow_mut() = Some(child);
+            }
+            Some("kill-pane") => self.close_pipe(),
+            _ => {}
+        }
+        self.calls.borrow_mut().push(argv);
+        Ok(CommandOutput::success(""))
+    }
+}
+
+impl AckRunner {
+    fn new(ack_path: PathBuf) -> Self {
+        Self {
+            calls: Rc::new(RefCell::new(Vec::new())),
+            ack_path,
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.borrow().clone()
+    }
+}
+
+#[derive(Clone)]
+struct ForgedAckRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    ack_path: PathBuf,
+    payload: &'static str,
+}
+
+#[derive(Clone, Default)]
+struct EchoCommandFailureRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    pipe_commands: Rc<RefCell<Vec<String>>>,
+}
+
+impl EchoCommandFailureRunner {
+    fn pipe_commands(&self) -> Vec<String> {
+        self.pipe_commands.borrow().clone()
+    }
+}
+
+impl ForgedAckRunner {
+    fn new(ack_path: PathBuf, payload: &'static str) -> Self {
+        Self {
+            calls: Rc::new(RefCell::new(Vec::new())),
+            ack_path,
+            payload,
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl CommandRunner for ForgedAckRunner {
+    fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        if argv.get(1).map(String::as_str) == Some("pipe-pane") {
+            if let Some(parent) = self.ack_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&self.ack_path, self.payload).unwrap();
+        }
+        self.calls.borrow_mut().push(argv);
+        Ok(CommandOutput::success(""))
+    }
+}
+
+impl CommandRunner for AckRunner {
+    fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        if argv.get(1).map(String::as_str) == Some("pipe-pane") {
+            let Some(command) = argv.get(5) else {
+                self.calls.borrow_mut().push(argv);
+                return Ok(CommandOutput::success(""));
+            };
+            let root = shell_arg_after(command, "--root").unwrap();
+            let relative = shell_arg_after(command, "--relative").unwrap();
+            let ack_relative = shell_arg_after(command, "--ack-relative").unwrap();
+            let ack_nonce = shell_arg_after(command, "--ack-nonce").unwrap();
+            let dev = shell_arg_after(command, "--dev")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            let ino = shell_arg_after(command, "--ino")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            let transcript_path = PathBuf::from(&root).join(relative);
+            let file = OpenOptions::new()
+                .append(true)
+                .open(&transcript_path)
+                .unwrap();
+            let ack_path = PathBuf::from(&root).join(ack_relative);
+            if let Some(parent) = self.ack_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            assert_eq!(ack_path, self.ack_path);
+            let payload = serde_json::json!({
+                "nonce": ack_nonce,
+                "pid": std::process::id(),
+                "transcript_dev": dev,
+                "transcript_ino": ino
+            });
+            fs::write(&self.ack_path, format!("{payload}\n")).unwrap();
+            OPEN_PIPE_ACK_FILES.with(|files| files.borrow_mut().push(file));
+        }
+        self.calls.borrow_mut().push(argv);
+        Ok(CommandOutput::success(""))
+    }
+}
+
+impl CommandRunner for EchoCommandFailureRunner {
+    fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        if argv.get(1).map(String::as_str) == Some("pipe-pane") {
+            let command = argv.get(5).cloned().unwrap_or_default();
+            self.pipe_commands.borrow_mut().push(command.clone());
+            self.calls.borrow_mut().push(argv);
+            return Ok(CommandOutput::failure(format!(
+                "wrapper echoed helper command: {command}"
+            )));
+        }
+        self.calls.borrow_mut().push(argv);
+        Ok(CommandOutput::success(""))
+    }
+}
+
+fn shell_arg_after(command: &str, flag: &str) -> Option<String> {
+    let rest = command.split_once(flag)?.1.trim_start();
+    if let Some(rest) = rest.strip_prefix('\'') {
+        let value = rest.split('\'').next()?;
+        return Some(value.to_string());
+    }
+    rest.split_whitespace().next().map(str::to_string)
 }
 
 fn assert_creation_path_rejects_session_name(session_id: &str, expected_error: &str) {
@@ -476,6 +668,304 @@ fn tmux_adapter_builds_argv_for_pane_window_and_session_cleanup() {
             vec!["tmux", "kill-pane", "-t", "host-a:%1.%2"],
             vec!["tmux", "kill-window", "-t", "host-a:%1"],
             vec!["tmux", "kill-session", "-t", "host-a"],
+        ])
+    );
+}
+
+#[test]
+fn tmux_adapter_starts_durable_pipe_for_owned_pane() {
+    let root = test_temp_dir("tmux-pipe-start");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let ack_relative = "activations/root/pipe.ready";
+    let runner = AckRunner::new(root.join(ack_relative));
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    adapter
+        .start_pipe_capture(&pane, &root, transcript_relative, &identity, ack_relative)
+        .unwrap();
+
+    let calls = runner.calls();
+    assert_eq!(
+        &calls[0][..5],
+        ["tmux", "pipe-pane", "-o", "-t", "host-a:%1.%2"]
+    );
+    assert!(calls[0][5].contains("--pipe-sink"));
+    assert!(calls[0][5].contains("--root"));
+    assert!(calls[0][5].contains("--relative"));
+    assert!(calls[0][5].contains(transcript_relative));
+    assert!(!calls[0][5].contains(transcript_path.to_string_lossy().as_ref()));
+    assert!(!calls[0][5].contains("cat >>"));
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn tmux_adapter_rejects_durable_pipe_capture_before_helper_launch() {
+    let root = test_temp_dir("tmux-pipe-unsupported-platform");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let runner = RecordingRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    let error = adapter
+        .start_pipe_capture(
+            &pane,
+            &root,
+            transcript_relative,
+            &identity,
+            "activations/root/pipe.ready",
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("not supported"));
+    assert!(runner.calls().is_empty());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn tmux_adapter_waits_for_durable_pipe_completion_after_producer_eof() {
+    let root = test_temp_dir("tmux-pipe-completion");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "prefix\n").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let runner = RealPipeRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone())
+        .with_pipe_sink_executable(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .with_pipe_capture_timeouts(Duration::from_secs(2), Duration::from_secs(2));
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    let capture = adapter
+        .start_pipe_capture_with_completion(
+            &pane,
+            &root,
+            transcript_relative,
+            &identity,
+            "activations/root/pipe.ready",
+            "activations/root/pipe.complete",
+        )
+        .unwrap();
+    runner.write_pipe(b"body\ntrailing bytes\n");
+    adapter.kill_pane(&pane).unwrap();
+    let completion = adapter.wait_for_pipe_capture_completion(&capture).unwrap();
+
+    assert_eq!(completion.bytes_appended, 20);
+    assert_eq!(completion.transcript_len, 27);
+    assert_eq!(
+        fs::read_to_string(transcript_path).unwrap(),
+        "prefix\nbody\ntrailing bytes\n"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn tmux_adapter_rejects_pipe_completion_before_producer_eof() {
+    let root = test_temp_dir("tmux-pipe-completion-timeout");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let runner = RealPipeRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone())
+        .with_pipe_sink_executable(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .with_pipe_capture_timeouts(Duration::from_secs(2), Duration::from_millis(50));
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    let capture = adapter
+        .start_pipe_capture_with_completion(
+            &pane,
+            &root,
+            transcript_relative,
+            &identity,
+            "activations/root/pipe.ready",
+            "activations/root/pipe.complete",
+        )
+        .unwrap();
+    runner.write_pipe(b"not closed\n");
+    let err = adapter
+        .wait_for_pipe_capture_completion(&capture)
+        .expect_err("open producer must not be reported complete");
+    runner.close_pipe();
+
+    assert!(err.to_string().contains("pipe sink completion failed"));
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn tmux_adapter_real_tmux_pipe_drains_before_completion() {
+    let root = test_temp_dir("tmux-real-pipe-completion");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let session_id = format!(
+        "humanize-pipe-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _cleanup = TmuxSessionCleanup(session_id.clone());
+    let adapter = TmuxAdapter::with_runner(SystemCommandRunner)
+        .with_pipe_sink_executable(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .with_pipe_capture_timeouts(Duration::from_secs(2), Duration::from_secs(3));
+    let (_, _, pane) = adapter
+        .create_session_with_window_pane(&session_id, "run-real-pipe", "flow-a", "root")
+        .unwrap();
+    let capture = adapter
+        .start_pipe_capture_with_completion(
+            &pane,
+            &root,
+            transcript_relative,
+            &identity,
+            "activations/root/pipe.ready",
+            "activations/root/pipe.complete",
+        )
+        .unwrap();
+
+    adapter
+        .send_keys_literal(&pane, "printf 'durable trailing marker\\n'")
+        .unwrap();
+    adapter.send_key(&pane, "Enter").unwrap();
+    thread::sleep(Duration::from_millis(150));
+    let final_capture = adapter.capture_pane(&pane).unwrap();
+    adapter.kill_pane(&pane).unwrap();
+    let completion = adapter.wait_for_pipe_capture_completion(&capture).unwrap();
+
+    assert!(final_capture.contains("durable trailing marker"));
+    assert!(
+        fs::read_to_string(&transcript_path)
+            .unwrap()
+            .contains("durable trailing marker")
+    );
+    assert!(completion.bytes_appended > 0);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+struct TmuxSessionCleanup(String);
+
+#[cfg(all(unix, target_os = "linux"))]
+impl Drop for TmuxSessionCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[test]
+fn tmux_adapter_rejects_forged_pipe_acknowledgement() {
+    let root = test_temp_dir("tmux-pipe-forged-ack");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let ack_relative = "activations/root/pipe.ready";
+    let runner = ForgedAckRunner::new(root.join(ack_relative), "ready\n");
+    let adapter = TmuxAdapter::with_runner(runner);
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    let err = adapter
+        .start_pipe_capture(
+            &pane,
+            &root,
+            transcript_relative,
+            &PipeSinkIdentity {
+                dev: 7,
+                ino: 8,
+                uid: 9,
+                mode: 0o600,
+                nlink: 1,
+            },
+            ack_relative,
+        )
+        .expect_err("forged acknowledgement must be rejected");
+
+    assert!(err.to_string().contains("pipe sink setup failed"));
+}
+
+#[test]
+fn tmux_adapter_redacts_pipe_ack_command_and_nonce_from_errors() {
+    let root = test_temp_dir("tmux-pipe-ack-redaction");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let ack_relative = "activations/root/pipe.ready";
+    let runner = ForgedAckRunner::new(root.join(ack_relative), "not-json\n");
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    let err = adapter
+        .start_pipe_capture(&pane, &root, transcript_relative, &identity, ack_relative)
+        .expect_err("invalid acknowledgement must be rejected");
+
+    let command = runner.calls()[0][5].clone();
+    let nonce = shell_arg_after(&command, "--ack-nonce").unwrap();
+    let message = err.to_string();
+    assert!(!message.contains("--ack-nonce"));
+    assert!(!message.contains(&nonce));
+    assert!(!message.contains(&command));
+}
+
+#[test]
+fn tmux_adapter_redacts_pipe_command_failure_stderr() {
+    let root = test_temp_dir("tmux-pipe-failure-redaction");
+    let transcript_relative = "activations/root/transcript.pipe.log";
+    let transcript_path = root.join(transcript_relative);
+    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    fs::write(&transcript_path, "").unwrap();
+    let identity = pipe_sink_identity(&transcript_path).unwrap();
+    let ack_relative = "activations/root/pipe.ready";
+    let runner = EchoCommandFailureRunner::default();
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    let err = adapter
+        .start_pipe_capture(&pane, &root, transcript_relative, &identity, ack_relative)
+        .expect_err("pipe-pane command failure must be rejected");
+
+    let command = runner.pipe_commands().pop().unwrap();
+    let nonce = shell_arg_after(&command, "--ack-nonce").unwrap();
+    let message = err.to_string();
+    assert!(!message.contains("--ack-nonce"));
+    assert!(!message.contains(&nonce));
+    assert!(!message.contains(&command));
+    assert!(message.contains("pipe sink setup failed"));
+}
+
+#[test]
+fn tmux_adapter_captures_pane_before_pane_kill() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::success("final transcript\n"),
+        CommandOutput::success(""),
+    ]);
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let pane = TmuxPane::new_in_session("host-a", "%1", "activation-a", "%2");
+
+    assert_eq!(adapter.capture_pane(&pane).unwrap(), "final transcript\n");
+    adapter.kill_pane(&pane).unwrap();
+
+    assert_eq!(
+        runner.calls(),
+        argv(vec![
+            vec!["tmux", "capture-pane", "-p", "-t", "host-a:%1.%2"],
+            vec!["tmux", "kill-pane", "-t", "host-a:%1.%2"],
         ])
     );
 }

@@ -983,6 +983,19 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn set_run_status(
+        &mut self,
+        run_id: impl Into<String>,
+        status: RunStatus,
+    ) -> Result<(), RuntimeError> {
+        let run_id = run_id.into();
+        self.require_run(&run_id)?;
+        if self.state.run_status(&run_id) != Some(status) {
+            self.append(EventPayload::RunStatusChanged { run_id, status });
+        }
+        Ok(())
+    }
+
     pub fn state(&self) -> &RuntimeState {
         &self.state
     }

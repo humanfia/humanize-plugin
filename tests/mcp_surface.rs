@@ -1,12 +1,27 @@
 mod support;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use humanize_plugin::mcp::{AUTHORING_TOOL_NAMES, McpServer, McpSurface, REVIEW_TOOL_NAMES};
 use serde_json::{Value, json};
 
 use support::mcp::{call_tool, readme_resource};
+
+static NEXT_STDIO_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
+
+fn child_asset_root(name: &str) -> PathBuf {
+    let index = NEXT_STDIO_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("{name}-{index}"));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    root
+}
 
 fn assert_required_alias_group(schema: &Value, aliases: &[&str]) {
     let all_of = schema["allOf"]
@@ -494,7 +509,9 @@ fn cli_list_tools_emits_json_tool_descriptors() {
 }
 #[test]
 fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
+    let asset_root = child_asset_root("mcp-surface-stdio-assets");
     let mut child = Command::new(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .env("SFORGE_PATCH_DIR", &asset_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

@@ -5,6 +5,7 @@ use crate::flow;
 use crate::input_ledger::MachineInputRecord;
 use crate::runtime::{self, ControlCommand};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{
     FlowReviewStatus, McpServer, RunArchive, ToolCallResult, ToolError, content_hash,
@@ -15,6 +16,9 @@ use super::{
 impl<R: CommandRunner> McpServer<R> {
     pub(super) fn run_flow(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         let run_id = require_string(arguments, &["run_id", "runId"])?;
+        if let Some(blocked) = self.run_asset_blocked_result(run_id, "run_flow") {
+            return Ok(blocked);
+        }
         let review_required = optional_bool(arguments, &["review_required", "reviewRequired"])?
             .unwrap_or_else(|| {
                 arguments.get("flow").is_some()
@@ -23,13 +27,23 @@ impl<R: CommandRunner> McpServer<R> {
                     || arguments.get("lock_id").is_some()
                     || arguments.get("lockId").is_some()
             });
-        let flow_binding = self.flow_lock_binding_from_arguments(arguments)?;
+        let mut flow_binding = self.flow_lock_binding_from_arguments(arguments)?;
         let agent_command = agent_command_from_arguments(arguments)?;
         let nodes = match flow_binding.as_ref() {
             Some((lock_id, _)) => self.locked_flow_node_specs(lock_id)?,
             None => node_specs(arguments)?,
         };
+        if nodes.is_empty() {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "error": "flow package has no executable nodes"
+            })));
+        }
         validate_start_run_preconditions(self.state.runtime(), run_id, &nodes)?;
+        if flow_binding.is_none() {
+            flow_binding = Some(self.lock_nodes_only_flow(run_id, &nodes)?);
+        }
 
         if review_required {
             let Some((lock_id, content_hash)) = flow_binding.as_ref() else {
@@ -69,18 +83,78 @@ impl<R: CommandRunner> McpServer<R> {
             }
         }
 
+        if let Err(err) = self.ensure_run_asset_manifest(run_id) {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "run_manifest",
+                    "error": err.message
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
+
+        let prepared_revision = if let Some((lock_id, content_hash)) = flow_binding.as_ref() {
+            let review_status = self.run_review_status_name(lock_id, review_required);
+            match self.prepare_run_flow_revision(run_id, lock_id, content_hash, &review_status) {
+                Ok(revision_id) => Some(revision_id),
+                Err(err) => {
+                    let message = err.message;
+                    self.record_asset_preservation_error(
+                        run_id,
+                        None,
+                        None,
+                        "flow_package",
+                        &message,
+                    );
+                    return Ok(ToolCallResult::error(json!({
+                        "ok": false,
+                        "run_id": run_id,
+                        "flow_lock_id": lock_id,
+                        "content_hash": content_hash,
+                        "asset_preservation": {
+                            "status": "failed",
+                            "stage": "flow_package",
+                            "error": message
+                        },
+                        "error": "run asset preservation failed"
+                    })));
+                }
+            }
+        } else {
+            None
+        };
+
         let expected_activation_ids = nodes
             .iter()
             .map(|node| node.id().to_string())
             .collect::<Vec<_>>();
-        let tmux = self.start_run_tmux_metadata(run_id, arguments, &expected_activation_ids)?;
+        let tmux = match self.start_run_tmux_metadata(run_id, arguments, &expected_activation_ids) {
+            Ok(tmux) => tmux,
+            Err(err) if self.run_has_asset_preservation_failure(run_id) => {
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "preservation_error",
+                        "error": "run asset preservation failed"
+                    },
+                    "error": err.message
+                })));
+            }
+            Err(err) => return Err(err),
+        };
         let (activation_ids, report) = if let Some((lock_id, content_hash)) = flow_binding.as_ref()
         {
             self.state.tick_control(ControlCommand::StartRun {
                 run_id: run_id.to_string(),
                 nodes: Vec::new(),
             });
-            self.state
+            if let Err(err) = self
+                .state
                 .runtime_mut()
                 .apply_flow_lock(
                     run_id,
@@ -88,8 +162,14 @@ impl<R: CommandRunner> McpServer<R> {
                     lock_id,
                     content_hash,
                 )
-                .map_err(ToolError::from_runtime)?;
-            let activation_ids = nodes
+                .map_err(ToolError::from_runtime)
+            {
+                if let Some(revision_id) = prepared_revision.as_deref() {
+                    self.mark_prepared_flow_revision_failed(run_id, revision_id, &err.message);
+                }
+                return Err(self.finalize_tmux_after_error(run_id, "runtime_apply_failed", err));
+            }
+            let activation_ids = match nodes
                 .iter()
                 .map(|node| {
                     self.state
@@ -97,7 +177,17 @@ impl<R: CommandRunner> McpServer<R> {
                         .activate_node(run_id, node, None)
                         .map_err(ToolError::from_runtime)
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(activation_ids) => activation_ids,
+                Err(err) => {
+                    return Err(self.finalize_tmux_after_error(
+                        run_id,
+                        "activation_create_failed",
+                        err,
+                    ));
+                }
+            };
             let report = self.state.tick_control(ControlCommand::ResumeRun {
                 run_id: run_id.to_string(),
             });
@@ -113,6 +203,28 @@ impl<R: CommandRunner> McpServer<R> {
             });
             (activation_ids, report)
         };
+        if let Some(revision_id) = prepared_revision.as_deref() {
+            if let Err(err) = self.commit_run_flow_revision(run_id, revision_id) {
+                let message = err.message;
+                self.record_asset_preservation_error(run_id, None, None, "flow_package", &message);
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                let tmux_cleanup = self.cleanup_all_tmux_panes_for_run(run_id, "flow_package")?;
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "tmux_cleanup": tmux_cleanup.structured,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "flow_package",
+                        "error": message
+                    },
+                    "error": "run asset preservation failed"
+                })));
+            }
+        }
         self.state
             .remember_tmux_allocation(run_id, &tmux.window, &tmux.panes);
         if let Some(command) = agent_command {
@@ -127,6 +239,8 @@ impl<R: CommandRunner> McpServer<R> {
         let actuation = self.actuate_locked_flow(run_id, &activation_ids)?;
 
         let run_status = self.run_status_string(run_id)?;
+        let run_assets = self.run_assets_json(run_id);
+
         Ok(ToolCallResult::ok(json!({
             "ok": true,
             "run_id": run_id,
@@ -139,6 +253,7 @@ impl<R: CommandRunner> McpServer<R> {
             "actuation_warnings": actuation.warnings,
             "flow_lock_id": flow_binding.as_ref().map(|(lock_id, _)| lock_id.as_str()),
             "content_hash": flow_binding.as_ref().map(|(_, content_hash)| content_hash.as_str()),
+            "run_assets": run_assets,
             "pipeline": report.pipeline
         })))
     }
@@ -148,6 +263,24 @@ impl<R: CommandRunner> McpServer<R> {
             return Err(ToolError::invalid("flow lock not found"));
         };
         Ok(node_specs_from_locked_draft(lock.draft()))
+    }
+
+    fn lock_nodes_only_flow(
+        &mut self,
+        run_id: &str,
+        nodes: &[runtime::NodeSpec],
+    ) -> Result<(String, String), ToolError> {
+        let draft = nodes_only_flow_draft(run_id, nodes)?;
+        let lock = flow::flow_lock(&draft, flow::FlowCheckMode::Core).map_err(|err| {
+            ToolError::invalid(format!(
+                "nodes-only flow lock failed: {}",
+                diagnostic_codes_text(&err.diagnostics)
+            ))
+        })?;
+        let lock_id = lock.id().to_string();
+        let content_hash = content_hash(lock.normalized_content());
+        self.state.flow_locks.insert(lock_id.clone(), lock);
+        Ok((lock_id, content_hash))
     }
 
     pub(super) fn run_status(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -190,6 +323,25 @@ impl<R: CommandRunner> McpServer<R> {
     }
 
     pub(super) fn resume_run(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        if self.run_has_asset_preservation_failure(run_id) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": "resume_run",
+                "run_status": "failed",
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "preservation_error",
+                    "error": "run asset preservation failed"
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
         self.control_run(arguments, "resume_run", |run_id| {
             ControlCommand::ResumeRun {
                 run_id: run_id.to_string(),
@@ -198,9 +350,83 @@ impl<R: CommandRunner> McpServer<R> {
     }
 
     pub(super) fn stop_run(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        self.control_run(arguments, "stop_run", |run_id| ControlCommand::StopRun {
-            run_id: run_id.to_string(),
-        })
+        let run_id = require_string(arguments, &["run_id", "runId"])?;
+        if !self.state.runtime().has_run(run_id) {
+            return Ok(ToolCallResult::error(run_not_found_guidance(run_id)));
+        }
+        let prior_asset_error = self.asset_preservation_error_json(run_id, "preservation_error");
+        let report = if prior_asset_error.is_none() {
+            Some(self.state.tick_control(ControlCommand::StopRun {
+                run_id: run_id.to_string(),
+            }))
+        } else {
+            None
+        };
+        let tmux_cleanup = self.cleanup_all_tmux_panes_for_run(run_id, "forced_stop")?;
+        let mut run_status = self.run_status_string(run_id)?;
+
+        if let Some(asset_error) = prior_asset_error {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            run_status = self.run_status_string(run_id)?;
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": "stop_run",
+                "run_status": run_status,
+                "tmux_cleanup": tmux_cleanup.structured,
+                "asset_preservation": asset_error,
+                "error": "run asset preservation failed",
+                "pipeline": report.as_ref().map(|report| json!(report.pipeline)).unwrap_or(Value::Null)
+            })));
+        }
+
+        if let Some(asset_error) = tmux_cleanup.preservation_error {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            run_status = self.run_status_string(run_id)?;
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": "stop_run",
+                "run_status": run_status,
+                "tmux_cleanup": tmux_cleanup.structured,
+                "asset_preservation": asset_error,
+                "error": "run asset preservation failed",
+                "pipeline": report.as_ref().map(|report| json!(report.pipeline)).unwrap_or(Value::Null)
+            })));
+        }
+
+        if let Some(cleanup_error) = tmux_cleanup.cleanup_error {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            run_status = self.run_status_string(run_id)?;
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": "stop_run",
+                "run_status": run_status,
+                "tmux_cleanup": tmux_cleanup.structured,
+                "resource_cleanup": cleanup_error,
+                "error": "tmux resource cleanup failed",
+                "pipeline": report.as_ref().map(|report| json!(report.pipeline)).unwrap_or(Value::Null)
+            })));
+        }
+
+        Ok(ToolCallResult::ok(json!({
+            "ok": true,
+            "run_id": run_id,
+            "control": "stop_run",
+            "run_status": run_status,
+            "tmux_cleanup": tmux_cleanup.structured,
+            "pipeline": report.as_ref().map(|report| json!(report.pipeline)).unwrap_or(Value::Null)
+        })))
     }
 
     pub(super) fn observe_stop(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -209,6 +435,13 @@ impl<R: CommandRunner> McpServer<R> {
         let reason = require_string(arguments, &["reason"])?;
         if !self.state.runtime().has_run(run_id) {
             return Ok(ToolCallResult::error(run_not_found_guidance(run_id)));
+        }
+        if let Some(blocked) = self.run_asset_blocked_result(run_id, "observe_stop") {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(blocked);
         }
         if !self
             .state
@@ -233,8 +466,39 @@ impl<R: CommandRunner> McpServer<R> {
         );
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
         self.actuate_locked_flow(run_id, &[])?;
-        let tmux_cleanup = self.cleanup_tmux_pane_after_stop(run_id, activation_id, &report)?;
+        let tmux_cleanup =
+            self.cleanup_tmux_pane_after_stop(run_id, activation_id, reason, &report)?;
         let run_status = self.run_status_string(run_id)?;
+
+        if let Some(asset_error) = tmux_cleanup.preservation_error {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "activation_id": activation_id,
+                "run_status": run_status,
+                "stop_decisions": stop_decisions_json(activation_id, &report.stop_decisions),
+                "tmux_allocations": tmux_allocations,
+                "tmux_cleanup": tmux_cleanup.structured,
+                "asset_preservation": asset_error,
+                "error": "run asset preservation failed",
+                "pipeline": report.pipeline
+            })));
+        }
+
+        if let Some(cleanup_error) = tmux_cleanup.cleanup_error {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "activation_id": activation_id,
+                "run_status": run_status,
+                "stop_decisions": stop_decisions_json(activation_id, &report.stop_decisions),
+                "tmux_allocations": tmux_allocations,
+                "tmux_cleanup": tmux_cleanup.structured,
+                "resource_cleanup": cleanup_error,
+                "error": "tmux resource cleanup failed",
+                "pipeline": report.pipeline
+            })));
+        }
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
@@ -243,7 +507,7 @@ impl<R: CommandRunner> McpServer<R> {
             "run_status": run_status,
             "stop_decisions": stop_decisions_json(activation_id, &report.stop_decisions),
             "tmux_allocations": tmux_allocations,
-            "tmux_cleanup": tmux_cleanup,
+            "tmux_cleanup": tmux_cleanup.structured,
             "pipeline": report.pipeline
         })))
     }
@@ -261,10 +525,59 @@ impl<R: CommandRunner> McpServer<R> {
         if !self.state.runtime().has_run(run_id) {
             return Ok(ToolCallResult::error(run_not_found_guidance(run_id)));
         }
+        if let Some(blocked) = self.run_asset_blocked_result(run_id, control) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(blocked);
+        }
         let report = self.state.tick_control(command(run_id));
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
+        if self.run_has_asset_preservation_failure(run_id) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            let run_status = self.run_status_string(run_id)?;
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": control,
+                "run_status": run_status,
+                "tmux_allocations": tmux_allocations,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "preservation_error",
+                    "error": "run asset preservation failed"
+                },
+                "error": "run asset preservation failed",
+                "pipeline": report.pipeline
+            })));
+        }
         self.actuate_locked_flow(run_id, &[])?;
-        let run_status = self.run_status_string(run_id)?;
+        let mut run_status = self.run_status_string(run_id)?;
+        if self.run_has_asset_preservation_failure(run_id) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            run_status = self.run_status_string(run_id)?;
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": control,
+                "run_status": run_status,
+                "tmux_allocations": tmux_allocations,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "preservation_error",
+                    "error": "run asset preservation failed"
+                },
+                "error": "run asset preservation failed",
+                "pipeline": report.pipeline
+            })));
+        }
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
@@ -363,8 +676,7 @@ impl<R: CommandRunner> McpServer<R> {
         let run = snapshot
             .run(run_id)
             .expect("checked run should be present in view snapshot");
-        serde_json::to_value(run)
-            .map_err(|_| ToolError::invalid("run context serialization failed"))
+        Ok(self.context_with_run_assets(run_id, run.to_context_json()))
     }
 
     fn run_status_string(&self, run_id: &str) -> Result<String, ToolError> {
@@ -374,6 +686,37 @@ impl<R: CommandRunner> McpServer<R> {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string())
+    }
+
+    pub(super) fn run_has_asset_preservation_failure(&self, run_id: &str) -> bool {
+        self.state
+            .run_assets
+            .get(run_id)
+            .map(|manifest| {
+                manifest.preservation_blocked || !manifest.preservation_errors.is_empty()
+            })
+            .unwrap_or(false)
+    }
+
+    fn asset_preservation_error_json(&self, run_id: &str, fallback_stage: &str) -> Option<Value> {
+        let manifest = self.state.run_assets.get(run_id)?;
+        if !manifest.preservation_blocked && manifest.preservation_errors.is_empty() {
+            return None;
+        }
+        if let Some(error) = manifest.preservation_errors.first() {
+            Some(json!({
+                "status": "failed",
+                "stage": error.stage,
+                "activation_id": error.activation_id,
+                "error": error.error
+            }))
+        } else {
+            Some(json!({
+                "status": "failed",
+                "stage": fallback_stage,
+                "error": "run asset preservation failed"
+            }))
+        }
     }
 
     pub(super) fn remember_run_archive(
@@ -413,6 +756,13 @@ impl<R: CommandRunner> McpServer<R> {
         run_id: &str,
         activation_ids: &[String],
     ) -> Result<RuntimeActuation, ToolError> {
+        if self.run_has_asset_preservation_failure(run_id) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Err(ToolError::invalid("run asset preservation failed"));
+        }
         let Some(lock_id) = self
             .state
             .runtime()
@@ -755,6 +1105,116 @@ fn node_specs_from_locked_draft(draft: &flow::FlowDraft) -> Vec<runtime::NodeSpe
     } else {
         initial_nodes
     }
+}
+
+fn nodes_only_flow_draft(
+    run_id: &str,
+    nodes: &[runtime::NodeSpec],
+) -> Result<flow::FlowDraft, ToolError> {
+    let mut flow_nodes = Vec::with_capacity(nodes.len());
+    let mut contracts = Vec::new();
+    let mut resources = vec![flow::FlowResource {
+        id: "readme.main".to_string(),
+        kind: flow::ResourceKind::Readme,
+        source: format!("inline:Runtime nodes-only flow for run {run_id}."),
+    }];
+    for node in nodes {
+        let artifacts = node.stop_contract().required_artifacts();
+        let effects = node.stop_contract().required_effects();
+        if artifacts.is_empty() && effects.is_empty() {
+            flow_nodes.push(flow::FlowNode {
+                id: node.id().to_string(),
+                ..flow::FlowNode::default()
+            });
+            continue;
+        }
+
+        let contract_id = format!("contract.{}", safe_flow_id_segment(node.id()));
+        flow_nodes.push(flow::FlowNode {
+            id: node.id().to_string(),
+            contract_id: Some(contract_id.clone()),
+            ..flow::FlowNode::default()
+        });
+        let contract_artifacts = artifacts
+            .iter()
+            .map(|artifact| {
+                let schema_resource_id = format!(
+                    "schema.{}.{}",
+                    safe_flow_id_segment(node.id()),
+                    safe_flow_id_segment(artifact)
+                );
+                resources.push(flow::FlowResource {
+                    id: schema_resource_id.clone(),
+                    kind: flow::ResourceKind::Schema,
+                    source: format!("inline:{artifact}"),
+                });
+                flow::ContractArtifact {
+                    id: artifact.clone(),
+                    schema_resource_id: Some(schema_resource_id),
+                }
+            })
+            .collect::<Vec<_>>();
+        contracts.push(flow::FlowContract {
+            id: contract_id,
+            completion: Some(flow::ContractCompletion::AllArtifacts),
+            artifacts: contract_artifacts,
+        });
+    }
+
+    let mut draft = flow::FlowDraft {
+        nodes: flow_nodes,
+        contracts,
+        resources,
+        ..flow::FlowDraft::default()
+    };
+    for node in nodes {
+        let effects = node
+            .stop_contract()
+            .required_effects()
+            .iter()
+            .map(|effect| flow::EffectRequirement {
+                id: effect.clone(),
+                required: true,
+            })
+            .collect::<Vec<_>>();
+        if !effects.is_empty() {
+            let contract_id = format!("contract.{}", safe_flow_id_segment(node.id()));
+            flow::set_flow_draft_contract_effects(&mut draft, &contract_id, effects);
+        }
+    }
+    Ok(draft)
+}
+
+fn safe_flow_id_segment(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return value.to_string();
+    }
+    let mut slug = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if slug.is_empty() {
+        slug.push_str("id");
+    }
+    slug.truncate(80);
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let hash = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("~sha256~{hash}~{slug}")
 }
 
 fn node_spec_from_contract(contract: &flow::NodeContract) -> runtime::NodeSpec {

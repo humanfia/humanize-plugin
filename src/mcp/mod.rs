@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, BufRead, Write};
+use std::io;
 
 use crate::adapters::tmux::{
-    CommandRunner, SystemCommandRunner, TmuxAdapter, TmuxPane, TmuxWindow,
+    CommandRunner, SystemCommandRunner, TmuxAdapter, TmuxPane, TmuxPipeCapture, TmuxWindow,
 };
 use crate::flow;
+use crate::run_assets::{RunAssetManifest, RunAssetStore};
 use crate::runtime::{
     self, BoardPatch, ControlCommand, DriverState, DriverTickInput, NodeSpec, Runtime, StopContract,
 };
@@ -12,24 +13,33 @@ use crate::view::VisualizationSnapshot;
 use serde_json::{Value, json};
 
 mod flow_json;
+mod flow_parse;
 mod flow_tools;
 mod review_tools;
 mod route_preview;
 mod runtime_control;
 mod runtime_snapshot;
+mod stdio;
 mod surface;
 mod tmux_tools;
 mod update_tools;
 mod view_tools;
 
+pub use stdio::{
+    serve_stdio, serve_stdio_signal_aware, serve_stdio_signal_aware_with_server,
+    serve_stdio_with_server,
+};
 pub use surface::{
     AUTHORING_TOOL_NAMES, McpSurface, McpToolDescriptor, REVIEW_TOOL_NAMES, RUNTIME_TOOL_NAMES,
 };
+
+use flow_parse::{flow_draft_arg, flow_draft_for_repair, flow_draft_is_empty};
 
 pub struct McpServer<R: CommandRunner = SystemCommandRunner> {
     surface: McpSurface,
     state: McpServerState,
     tmux_adapter: TmuxAdapter<R>,
+    run_asset_store: RunAssetStore,
 }
 
 impl McpServer<SystemCommandRunner> {
@@ -46,10 +56,15 @@ impl Default for McpServer<SystemCommandRunner> {
 
 impl<R: CommandRunner> McpServer<R> {
     pub fn with_tmux_runner(runner: R) -> Self {
+        Self::with_tmux_runner_and_run_asset_store(runner, RunAssetStore::runtime_default())
+    }
+
+    pub fn with_tmux_runner_and_run_asset_store(runner: R, run_asset_store: RunAssetStore) -> Self {
         Self {
             surface: McpSurface,
             state: McpServerState::default(),
             tmux_adapter: TmuxAdapter::with_runner(runner),
+            run_asset_store,
         }
     }
 
@@ -64,10 +79,39 @@ impl<R: CommandRunner> McpServer<R> {
 
         match method {
             "initialize" => Some(success_response(id, initialize_result())),
+            "shutdown" => Some(self.handle_shutdown(id)),
             "tools/list" => Some(success_response(id, self.surface.tools_list_json())),
             "tools/call" => Some(self.handle_tool_call(id, request.get("params"))),
             _ => Some(error_response(id, -32601, "method not found")),
         }
+    }
+
+    fn handle_shutdown(&mut self, id: Option<Value>) -> Value {
+        let cleanup = self.shutdown_active_tmux_assets("mcp_shutdown");
+        self.state.shutdown_requested = true;
+        match cleanup {
+            Ok(tmux_cleanup) => success_response(
+                id,
+                json!({
+                    "ok": true,
+                    "shutdown": true,
+                    "tmux_cleanup": tmux_cleanup
+                }),
+            ),
+            Err(err) => success_response(
+                id,
+                json!({
+                    "ok": false,
+                    "shutdown": true,
+                    "tmux_cleanup": self.state.shutdown_assets_summary,
+                    "error": err.message
+                }),
+            ),
+        }
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.state.shutdown_requested
     }
 
     fn handle_tool_call(&mut self, id: Option<Value>, params: Option<&Value>) -> Value {
@@ -136,26 +180,64 @@ impl<R: CommandRunner> McpServer<R> {
 
     fn start_run(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         let run_id = require_string(arguments, &["run_id", "runId"])?;
+        if let Some(blocked) = self.run_asset_blocked_result(run_id, "start_run") {
+            return Ok(blocked);
+        }
         let nodes = node_specs(arguments)?;
         validate_start_run_preconditions(self.state.runtime(), run_id, &nodes)?;
+        if let Err(err) = self.ensure_run_asset_manifest(run_id) {
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "run_manifest",
+                    "error": err.message
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
         let activation_ids = nodes
             .iter()
             .map(|node| node.id().to_string())
             .collect::<Vec<_>>();
-        let tmux = self.start_run_tmux_metadata(run_id, arguments, &activation_ids)?;
-        let activation_ids = self
-            .state
-            .runtime_mut()
-            .start_run(run_id, nodes)
-            .map_err(ToolError::from_runtime)?;
+        let tmux = match self.start_run_tmux_metadata(run_id, arguments, &activation_ids) {
+            Ok(tmux) => tmux,
+            Err(err) if self.run_has_asset_preservation_failure(run_id) => {
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "preservation_error",
+                        "error": "run asset preservation failed"
+                    },
+                    "error": err.message
+                })));
+            }
+            Err(err) => return Err(err),
+        };
+        let activation_ids = match self.state.runtime_mut().start_run(run_id, nodes) {
+            Ok(activation_ids) => activation_ids,
+            Err(err) => {
+                let original = ToolError::from_runtime(err);
+                return Err(self.finalize_tmux_after_error(
+                    run_id,
+                    "runtime_start_failed",
+                    original,
+                ));
+            }
+        };
         self.state
             .remember_tmux_allocation(run_id, &tmux.window, &tmux.panes);
+        let run_assets = self.run_assets_json(run_id);
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
             "run_id": run_id,
             "activation_ids": activation_ids,
-            "tmux": tmux.structured
+            "tmux": tmux.structured,
+            "run_assets": run_assets
         })))
     }
 
@@ -174,6 +256,7 @@ impl<R: CommandRunner> McpServer<R> {
                     .run(run_id)
                     .expect("checked run should be present in view snapshot")
                     .to_context_json();
+                let context = self.context_with_run_assets(run_id, context);
                 Ok(ToolCallResult::ok(
                     json!({ "ok": true, "run_id": run_id, "context": context }),
                 ))
@@ -183,11 +266,23 @@ impl<R: CommandRunner> McpServer<R> {
                 let runs = snapshot
                     .runs
                     .iter()
-                    .map(|run| run.to_context_json())
+                    .map(|run| self.context_with_run_assets(&run.run_id, run.to_context_json()))
                     .collect::<Vec<_>>();
                 Ok(ToolCallResult::ok(json!({ "ok": true, "runs": runs })))
             }
         }
+    }
+
+    fn context_with_run_assets(&self, run_id: &str, mut context: Value) -> Value {
+        if let Some(manifest) = self.state.run_assets.get(run_id)
+            && let Some(object) = context.as_object_mut()
+        {
+            object.insert(
+                "run_assets".to_string(),
+                serde_json::to_value(manifest).unwrap_or(Value::Null),
+            );
+        }
+        context
     }
 
     fn deliver_artifact(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -236,6 +331,9 @@ impl<R: CommandRunner> McpServer<R> {
             ],
         )?;
         let run_id = require_string(arguments, &["run_id", "runId"])?;
+        if let Some(blocked) = self.run_asset_blocked_result(run_id, "fanout_from_artifact") {
+            return Ok(blocked);
+        }
         let node_id = require_string(arguments, &["node_id", "nodeId"])?;
         let artifact_key = require_string(arguments, &["artifact_key", "artifactKey", "key"])?;
         let node = node_spec_from_arguments(node_id, arguments)?;
@@ -244,6 +342,49 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .fanout_from_artifact(run_id, &node, artifact_key)
             .map_err(ToolError::from_runtime)?;
+        let tmux_allocations = match self.allocate_missing_tmux_panes(run_id) {
+            Ok(allocations) => allocations,
+            Err(err) if self.run_has_asset_preservation_failure(run_id) => {
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "control": "fanout_from_artifact",
+                    "node_id": node_id,
+                    "artifact_key": artifact_key,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "preservation_error",
+                        "error": "run asset preservation failed"
+                    },
+                    "error": err.message
+                })));
+            }
+            Err(err) => return Err(err),
+        };
+        if self.run_has_asset_preservation_failure(run_id) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": "fanout_from_artifact",
+                "node_id": node_id,
+                "artifact_key": artifact_key,
+                "tmux_allocations": tmux_allocations,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "preservation_error",
+                    "error": "run asset preservation failed"
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
         let state = self.state.runtime().state();
         let activations = activation_ids
             .iter()
@@ -266,7 +407,8 @@ impl<R: CommandRunner> McpServer<R> {
             "artifact_key": artifact_key,
             "activation_count": activation_ids.len(),
             "activation_ids": activation_ids,
-            "activations": activations
+            "activations": activations,
+            "tmux_allocations": tmux_allocations
         })))
     }
 
@@ -321,6 +463,9 @@ impl<R: CommandRunner> McpServer<R> {
 
     fn activate_node(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         let run_id = require_string(arguments, &["run_id", "runId"])?;
+        if let Some(blocked) = self.run_asset_blocked_result(run_id, "activate_node") {
+            return Ok(blocked);
+        }
         let node_id = require_string(arguments, &["node_id", "nodeId"])?;
         let requested_activation_id =
             optional_string(arguments, &["activation_id", "activationId"])?;
@@ -337,12 +482,55 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .activate_node(run_id, &node, None)
             .map_err(ToolError::from_runtime)?;
+        let tmux_allocations = match self.allocate_missing_tmux_panes(run_id) {
+            Ok(allocations) => allocations,
+            Err(err) if self.run_has_asset_preservation_failure(run_id) => {
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "control": "activate_node",
+                    "node_id": node_id,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "preservation_error",
+                        "error": "run asset preservation failed"
+                    },
+                    "error": err.message
+                })));
+            }
+            Err(err) => return Err(err),
+        };
+        if self.run_has_asset_preservation_failure(run_id) {
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "control": "activate_node",
+                "node_id": node_id,
+                "activation_id": activation_id,
+                "tmux_allocations": tmux_allocations,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "preservation_error",
+                    "error": "run asset preservation failed"
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
             "run_id": run_id,
             "node_id": node_id,
-            "activation_id": activation_id
+            "activation_id": activation_id,
+            "tmux_allocations": tmux_allocations
         })))
     }
 
@@ -429,49 +617,170 @@ impl<R: CommandRunner> McpServer<R> {
             return Ok(ToolCallResult::error(structured));
         }
 
-        self.state
+        let review_status = self.run_review_status_name(lock_id, false);
+        let prepared_revision = match self.prepare_run_flow_revision(
+            run_id,
+            lock_id,
+            provided_content_hash,
+            &review_status,
+        ) {
+            Ok(revision_id) => revision_id,
+            Err(err) => {
+                let message = err.message;
+                self.record_asset_preservation_error(run_id, None, None, "flow_package", &message);
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                return Ok(ToolCallResult::error(json!({
+                    "ok": false,
+                    "run_id": run_id,
+                    "lock_id": lock_id,
+                    "flow_lock_id": lock_id,
+                    "content_hash": provided_content_hash,
+                    "asset_preservation": {
+                        "status": "failed",
+                        "stage": "flow_package",
+                        "error": message
+                    },
+                    "error": "run asset preservation failed"
+                })));
+            }
+        };
+        if let Err(err) = self
+            .state
             .runtime_mut()
             .apply_flow_lock(run_id, mode, lock_id, provided_content_hash)
-            .map_err(ToolError::from_runtime)?;
-        let review_status = self.run_review_status_name(lock_id, false);
+            .map_err(ToolError::from_runtime)
+        {
+            self.mark_prepared_flow_revision_failed(run_id, &prepared_revision, &err.message);
+            return Err(err);
+        }
+        if let Err(err) = self.commit_run_flow_revision(run_id, &prepared_revision) {
+            let message = err.message;
+            self.record_asset_preservation_error(run_id, None, None, "flow_package", &message);
+            let _ = self
+                .state
+                .runtime_mut()
+                .set_run_status(run_id, runtime::RunStatus::Failed);
+            return Ok(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "lock_id": lock_id,
+                "flow_lock_id": lock_id,
+                "content_hash": provided_content_hash,
+                "asset_preservation": {
+                    "status": "failed",
+                    "stage": "flow_package",
+                    "error": message
+                },
+                "error": "run asset preservation failed"
+            })));
+        }
+        let tmux_captures = self.capture_existing_tmux_panes(run_id)?;
         self.remember_run_archive(run_id, lock_id, provided_content_hash, review_status);
+        let run_assets = self.run_assets_json(run_id);
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
             "run_id": run_id,
             "mode": flow_lock_mode_name(mode),
             "lock_id": lock_id,
-            "content_hash": provided_content_hash
+            "content_hash": provided_content_hash,
+            "tmux_captures": tmux_captures,
+            "run_assets": run_assets
         })))
     }
 
     fn preview_flow_routes(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
         route_preview::preview_flow_routes(&self.state, arguments)
     }
-}
 
-pub fn serve_stdio<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
-    let mut server = McpServer::new();
+    fn ensure_run_asset_manifest(&mut self, run_id: &str) -> Result<(), ToolError> {
+        if self.state.run_assets.contains_key(run_id) {
+            return Ok(());
+        }
+        let manifest = self
+            .run_asset_store
+            .start_run_manifest(run_id)
+            .map_err(ToolError::from_run_asset)?;
+        self.state.run_assets.insert(run_id.to_string(), manifest);
+        Ok(())
+    }
 
-    while let Some(message) = read_wire_message(reader)? {
-        let request = match serde_json::from_str::<Value>(&message.body) {
-            Ok(request) => request,
-            Err(_) => {
-                write_wire_message(
-                    writer,
-                    message.format,
-                    &error_response(None, -32700, "parse error"),
-                )?;
-                continue;
-            }
-        };
+    fn prepare_run_flow_revision(
+        &mut self,
+        run_id: &str,
+        lock_id: &str,
+        content_hash: &str,
+        review_status: &str,
+    ) -> Result<String, ToolError> {
+        let lock = self
+            .state
+            .flow_locks
+            .get(lock_id)
+            .cloned()
+            .ok_or_else(|| ToolError::invalid("flow lock not found"))?;
+        self.ensure_run_asset_manifest(run_id)?;
+        let manifest = self
+            .state
+            .run_assets
+            .get_mut(run_id)
+            .expect("run asset manifest should exist after ensure");
+        let revision = self
+            .run_asset_store
+            .prepare_flow_revision(manifest, &lock, content_hash, review_status)
+            .map_err(ToolError::from_run_asset)?;
+        Ok(revision.revision_id)
+    }
 
-        if let Some(response) = server.handle_json_rpc(request) {
-            write_wire_message(writer, message.format, &response)?;
+    fn commit_run_flow_revision(
+        &mut self,
+        run_id: &str,
+        revision_id: &str,
+    ) -> Result<(), ToolError> {
+        let manifest = self
+            .state
+            .run_assets
+            .get_mut(run_id)
+            .ok_or_else(|| ToolError::invalid("run asset manifest not found"))?;
+        self.run_asset_store
+            .commit_flow_revision_applied(manifest, revision_id)
+            .map_err(ToolError::from_run_asset)?;
+        Ok(())
+    }
+
+    fn mark_prepared_flow_revision_failed(&mut self, run_id: &str, revision_id: &str, error: &str) {
+        if let Some(manifest) = self.state.run_assets.get_mut(run_id) {
+            let _ = self
+                .run_asset_store
+                .mark_flow_revision_failed(manifest, revision_id, error);
         }
     }
 
-    Ok(())
+    fn run_assets_json(&self, run_id: &str) -> Option<Value> {
+        self.state
+            .run_assets
+            .get(run_id)
+            .and_then(|manifest| serde_json::to_value(manifest).ok())
+    }
+
+    fn run_asset_blocked_result(&self, run_id: &str, control: &str) -> Option<ToolCallResult> {
+        if !self.run_has_asset_preservation_failure(run_id) {
+            return None;
+        }
+        Some(ToolCallResult::error(json!({
+            "ok": false,
+            "run_id": run_id,
+            "control": control,
+            "asset_preservation": {
+                "status": "failed",
+                "stage": "preservation_error",
+                "error": "run asset preservation failed"
+            },
+            "error": "run asset preservation failed"
+        })))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -484,10 +793,18 @@ struct McpServerState {
     messages: BTreeMap<String, Vec<Value>>,
     tmux_windows: BTreeMap<String, TmuxWindow>,
     tmux_panes: BTreeMap<(String, String), TmuxPane>,
+    tmux_pipe_captures: BTreeMap<(String, String), TmuxPipeCapture>,
+    tmux_final_captures: BTreeMap<(String, String), String>,
+    released_tmux_panes: BTreeSet<(String, String)>,
     run_archives: BTreeMap<String, RunArchive>,
     run_agent_commands: BTreeMap<String, String>,
     machine_inputs: BTreeMap<String, Vec<Value>>,
     actuation_warnings: BTreeMap<String, Vec<Value>>,
+    run_assets: BTreeMap<String, RunAssetManifest>,
+    shutdown_requested: bool,
+    shutdown_assets_finalized: bool,
+    shutdown_assets_error: Option<String>,
+    shutdown_assets_summary: Option<Value>,
     launched_activations: BTreeSet<(String, String)>,
     actuated_activations: BTreeSet<(String, String)>,
 }
@@ -664,84 +981,6 @@ fn run_not_found_guidance(run_id: &str) -> Value {
     })
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum WireFormat {
-    Line,
-    ContentLength,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct WireMessage {
-    format: WireFormat,
-    body: String,
-}
-
-fn read_wire_message<R: BufRead>(reader: &mut R) -> io::Result<Option<WireMessage>> {
-    loop {
-        let mut first_line = String::new();
-        if reader.read_line(&mut first_line)? == 0 {
-            return Ok(None);
-        }
-
-        if first_line.trim().is_empty() {
-            continue;
-        }
-
-        if let Some(length) = content_length(&first_line) {
-            loop {
-                let mut header = String::new();
-                if reader.read_line(&mut header)? == 0 {
-                    return Ok(None);
-                }
-                if header.trim().is_empty() {
-                    break;
-                }
-            }
-
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body)?;
-            let body = String::from_utf8(body)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-
-            return Ok(Some(WireMessage {
-                format: WireFormat::ContentLength,
-                body,
-            }));
-        }
-
-        return Ok(Some(WireMessage {
-            format: WireFormat::Line,
-            body: first_line.trim_end_matches(['\r', '\n']).to_string(),
-        }));
-    }
-}
-
-fn write_wire_message<W: Write>(
-    writer: &mut W,
-    format: WireFormat,
-    response: &Value,
-) -> io::Result<()> {
-    let body = response.to_string();
-    match format {
-        WireFormat::Line => {
-            writeln!(writer, "{body}")?;
-        }
-        WireFormat::ContentLength => {
-            write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len())?;
-        }
-    }
-    writer.flush()
-}
-
-fn content_length(line: &str) -> Option<usize> {
-    let (name, value) = line.split_once(':')?;
-    if name.trim().eq_ignore_ascii_case("content-length") {
-        value.trim().parse().ok()
-    } else {
-        None
-    }
-}
-
 const SERVER_INSTRUCTIONS: &str = "When a user asks to use Humanize or workflow, start with flow_suggest from the terse natural-language request, then call flow_check, flow_lock, prepare_flow_review, approve_flow_review with an approved or bypassed decision, and run_flow; do not substitute ordinary repo exploration for this workflow. Validate that the flow package includes a README before locking or running.";
 
 fn initialize_result() -> Value {
@@ -799,6 +1038,10 @@ impl ToolError {
 
     fn from_tmux(err: crate::adapters::tmux::TmuxError) -> Self {
         Self::invalid(format!("tmux {err}"))
+    }
+
+    fn from_run_asset(err: crate::run_assets::RunAssetError) -> Self {
+        Self::invalid(format!("run asset preservation {err}"))
     }
 
     fn from_view(err: io::Error) -> Self {
@@ -1049,6 +1292,21 @@ fn optional_string_field<'a>(
     Ok(None)
 }
 
+fn optional_bool_field(
+    object: &serde_json::Map<String, Value>,
+    names: &[&str],
+) -> Result<Option<bool>, ToolError> {
+    for name in names {
+        if let Some(value) = object.get(*name) {
+            return value
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| ToolError::invalid(format!("{name} must be a boolean")));
+        }
+    }
+    Ok(None)
+}
+
 fn optional_string_array(arguments: &Value, names: &[&str]) -> Result<Vec<String>, ToolError> {
     for name in names {
         if let Some(value) = arguments.get(*name) {
@@ -1163,38 +1421,6 @@ fn flow_repair_input_arg(arguments: &Value) -> Result<flow::FlowRepairInput, Too
     })
 }
 
-fn flow_draft_for_repair(
-    flow: &serde_json::Map<String, Value>,
-) -> Result<flow::FlowDraft, ToolError> {
-    Ok(flow::FlowDraft {
-        nodes: optional_array_field(flow, "nodes")?
-            .iter()
-            .map(parse_flow_node)
-            .collect::<Result<Vec<_>, _>>()?,
-        contracts: optional_array_field(flow, "contracts")?
-            .iter()
-            .map(parse_flow_contract)
-            .collect::<Result<Vec<_>, _>>()?,
-        routes: optional_array_field(flow, "routes")?
-            .iter()
-            .filter_map(|route| parse_flow_route(route).ok())
-            .collect::<Vec<_>>(),
-        resources: optional_array_field(flow, "resources")?
-            .iter()
-            .map(parse_flow_resource)
-            .collect::<Result<Vec<_>, _>>()?,
-        imports: optional_array_field(flow, "imports")?
-            .iter()
-            .map(parse_flow_import)
-            .collect::<Result<Vec<_>, _>>()?,
-        policies: parse_flow_policies(flow.get("policies"))?,
-        extensions: match flow.get("extensions") {
-            Some(value) => string_array(value, "extensions")?,
-            None => Vec::new(),
-        },
-    })
-}
-
 fn route_authoring_arg(
     arguments: &Value,
     flow: &serde_json::Map<String, Value>,
@@ -1238,48 +1464,6 @@ fn parse_route_predicate(value: &Value) -> Result<flow::RoutePredicateDraft, Too
     }
 }
 
-fn flow_draft_arg(arguments: &Value) -> Result<flow::FlowDraft, ToolError> {
-    let flow = require_object_arg(arguments, &["flow"])?;
-
-    Ok(flow::FlowDraft {
-        nodes: optional_array_field(flow, "nodes")?
-            .iter()
-            .map(parse_flow_node)
-            .collect::<Result<Vec<_>, _>>()?,
-        contracts: optional_array_field(flow, "contracts")?
-            .iter()
-            .map(parse_flow_contract)
-            .collect::<Result<Vec<_>, _>>()?,
-        routes: optional_array_field(flow, "routes")?
-            .iter()
-            .map(parse_flow_route)
-            .collect::<Result<Vec<_>, _>>()?,
-        resources: optional_array_field(flow, "resources")?
-            .iter()
-            .map(parse_flow_resource)
-            .collect::<Result<Vec<_>, _>>()?,
-        imports: optional_array_field(flow, "imports")?
-            .iter()
-            .map(parse_flow_import)
-            .collect::<Result<Vec<_>, _>>()?,
-        policies: parse_flow_policies(flow.get("policies"))?,
-        extensions: match flow.get("extensions") {
-            Some(value) => string_array(value, "extensions")?,
-            None => Vec::new(),
-        },
-    })
-}
-
-fn flow_draft_is_empty(draft: &flow::FlowDraft) -> bool {
-    draft.nodes.is_empty()
-        && draft.contracts.is_empty()
-        && draft.routes.is_empty()
-        && draft.resources.is_empty()
-        && draft.imports.is_empty()
-        && draft.policies == flow::FlowPolicies::default()
-        && draft.extensions.is_empty()
-}
-
 fn optional_array_field<'a>(
     object: &'a serde_json::Map<String, Value>,
     name: &str,
@@ -1290,214 +1474,6 @@ fn optional_array_field<'a>(
             .map(Vec::as_slice)
             .ok_or_else(|| ToolError::invalid(format!("{name} must be an array"))),
         None => Ok(&[]),
-    }
-}
-
-fn parse_flow_node(value: &Value) -> Result<flow::FlowNode, ToolError> {
-    match value {
-        Value::String(id) => Ok(flow::FlowNode {
-            id: id.clone(),
-            ..flow::FlowNode::default()
-        }),
-        Value::Object(object) => Ok(flow::FlowNode {
-            id: string_field(object, &["id"])?.to_string(),
-            contract_id: optional_string_field(object, &["contract_id", "contractId"])?
-                .map(str::to_string),
-            action: object.get("action").map(parse_node_action).transpose()?,
-            write_scopes: match object
-                .get("write_scopes")
-                .or_else(|| object.get("writeScopes"))
-            {
-                Some(value) => parse_write_scopes(value, "write_scopes")?,
-                None => Vec::new(),
-            },
-            extensions: match object.get("extensions") {
-                Some(value) => string_array(value, "extensions")?,
-                None => Vec::new(),
-            },
-        }),
-        _ => Err(ToolError::invalid("nodes items must be strings or objects")),
-    }
-}
-
-fn parse_node_action(value: &Value) -> Result<flow::NodeAction, ToolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("action must be an object"))?;
-    Ok(flow::NodeAction {
-        driver: parse_node_driver(string_field(object, &["driver"])?)?,
-        prompt_ref: optional_string_field(object, &["prompt_ref", "promptRef"])?
-            .map(str::to_string),
-        resource_refs: optional_string_array_from_object(
-            object,
-            &["resource_refs", "resourceRefs"],
-        )?,
-        reads: match object.get("reads") {
-            Some(value) => string_array(value, "reads")?,
-            None => Vec::new(),
-        },
-        writes: match object.get("writes") {
-            Some(value) => string_array(value, "writes")?,
-            None => Vec::new(),
-        },
-        verdict_artifact: optional_string_field(object, &["verdict_artifact", "verdictArtifact"])?
-            .map(str::to_string),
-    })
-}
-
-fn parse_node_driver(value: &str) -> Result<flow::NodeDriver, ToolError> {
-    match value {
-        "agent" | "Agent" => Ok(flow::NodeDriver::Agent),
-        "script" | "Script" => Ok(flow::NodeDriver::Script),
-        "review" | "Review" => Ok(flow::NodeDriver::Review),
-        "human" | "Human" => Ok(flow::NodeDriver::Human),
-        value => Err(ToolError::invalid(format!(
-            "unknown action driver: {value}"
-        ))),
-    }
-}
-
-fn parse_flow_contract(value: &Value) -> Result<flow::FlowContract, ToolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("contracts items must be objects"))?;
-    Ok(flow::FlowContract {
-        id: string_field(object, &["id"])?.to_string(),
-        completion: optional_string_field(object, &["completion"])?
-            .map(parse_contract_completion)
-            .transpose()?,
-        artifacts: optional_array_field(object, "artifacts")?
-            .iter()
-            .map(parse_contract_artifact)
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn parse_contract_completion(value: &str) -> Result<flow::ContractCompletion, ToolError> {
-    match value {
-        "manual" | "Manual" => Ok(flow::ContractCompletion::Manual),
-        "all_artifacts" | "allArtifacts" | "AllArtifacts" => {
-            Ok(flow::ContractCompletion::AllArtifacts)
-        }
-        value => Err(ToolError::invalid(format!(
-            "unknown contract completion: {value}"
-        ))),
-    }
-}
-
-fn parse_contract_artifact(value: &Value) -> Result<flow::ContractArtifact, ToolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("artifacts items must be objects"))?;
-    Ok(flow::ContractArtifact {
-        id: string_field(object, &["id"])?.to_string(),
-        schema_resource_id: optional_string_field(
-            object,
-            &["schema_resource_id", "schemaResourceId"],
-        )?
-        .map(str::to_string),
-    })
-}
-
-fn parse_flow_route(value: &Value) -> Result<flow::FlowRoute, ToolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("routes items must be objects"))?;
-    Ok(flow::FlowRoute {
-        predicate: string_field(object, &["predicate"])?.to_string(),
-        for_each: optional_string_field(object, &["for_each", "forEach"])?.map(str::to_string),
-        activate: string_field(object, &["activate"])?.to_string(),
-    })
-}
-
-fn parse_flow_resource(value: &Value) -> Result<flow::FlowResource, ToolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("resources items must be objects"))?;
-    Ok(flow::FlowResource {
-        id: string_field(object, &["id"])?.to_string(),
-        kind: parse_resource_kind(string_field(object, &["kind"])?)?,
-        source: string_field(object, &["source"])?.to_string(),
-    })
-}
-
-fn parse_resource_kind(value: &str) -> Result<flow::ResourceKind, ToolError> {
-    match value {
-        "schema" | "Schema" => Ok(flow::ResourceKind::Schema),
-        "rule" | "Rule" => Ok(flow::ResourceKind::Rule),
-        "profile" | "Profile" => Ok(flow::ResourceKind::Profile),
-        "view" | "View" => Ok(flow::ResourceKind::View),
-        "prompt" | "Prompt" => Ok(flow::ResourceKind::Prompt),
-        "script" | "Script" => Ok(flow::ResourceKind::Script),
-        "flow" | "Flow" => Ok(flow::ResourceKind::Flow),
-        "readme" | "Readme" | "README" => Ok(flow::ResourceKind::Readme),
-        value => Err(ToolError::invalid(format!(
-            "unknown resource kind: {value}"
-        ))),
-    }
-}
-
-fn parse_flow_import(value: &Value) -> Result<flow::FlowImport, ToolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("imports items must be objects"))?;
-    Ok(flow::FlowImport {
-        resource_id: string_field(object, &["resource_id", "resourceId"])?.to_string(),
-        alias: optional_string_field(object, &["alias"])?.map(str::to_string),
-    })
-}
-
-fn parse_flow_policies(value: Option<&Value>) -> Result<flow::FlowPolicies, ToolError> {
-    let Some(value) = value else {
-        return Ok(flow::FlowPolicies::default());
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| ToolError::invalid("policies must be an object"))?;
-    let write_scopes = match object
-        .get("write_scopes")
-        .or_else(|| object.get("writeScopes"))
-    {
-        Some(value) => parse_write_scopes(value, "write_scopes")?,
-        None => Vec::new(),
-    };
-    Ok(flow::FlowPolicies { write_scopes })
-}
-
-fn parse_write_scopes(value: &Value, name: &str) -> Result<Vec<flow::WriteScope>, ToolError> {
-    let scopes = value
-        .as_array()
-        .ok_or_else(|| ToolError::invalid(format!("{name} must be an array")))?;
-    scopes.iter().map(parse_write_scope).collect()
-}
-
-fn parse_write_scope(value: &Value) -> Result<flow::WriteScope, ToolError> {
-    match value {
-        Value::String(value) if value == "workspace" => Ok(flow::WriteScope::Workspace),
-        Value::String(value) if value == "system" => Ok(flow::WriteScope::System),
-        Value::String(value) if value.starts_with("artifact:") => Ok(flow::WriteScope::Artifact(
-            value.trim_start_matches("artifact:").to_string(),
-        )),
-        Value::String(value) if value.starts_with("resource:") => Ok(flow::WriteScope::Resource(
-            value.trim_start_matches("resource:").to_string(),
-        )),
-        Value::Object(object) => {
-            let kind = string_field(object, &["kind", "type"])?;
-            match kind {
-                "artifact" => Ok(flow::WriteScope::Artifact(
-                    string_field(object, &["value", "id"])?.to_string(),
-                )),
-                "resource" => Ok(flow::WriteScope::Resource(
-                    string_field(object, &["value", "id"])?.to_string(),
-                )),
-                "workspace" => Ok(flow::WriteScope::Workspace),
-                "system" => Ok(flow::WriteScope::System),
-                value => Err(ToolError::invalid(format!("unknown write scope: {value}"))),
-            }
-        }
-        _ => Err(ToolError::invalid(
-            "write scope items must be strings or objects",
-        )),
     }
 }
 

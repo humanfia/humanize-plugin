@@ -1,8 +1,12 @@
+use std::env;
 use std::error::Error;
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::adapters::lifecycle::{
     AdapterCapabilities, AgentLifecycleAdapter, LifecycleCleanup, LifecycleCleanupAction,
@@ -12,11 +16,49 @@ use crate::input_ledger::{
     MachineInputClock, MachineInputLedger, MachineInputRecord, MachineInputSubmission,
     machine_input_payload_hash, machine_input_transaction_id, normalize_machine_input_text,
 };
+use crate::pipe_sink::{
+    PipeSinkCompletionPayload, PipeSinkIdentity, PipeSinkReady,
+    ensure_durable_pipe_capture_supported, pipe_sink_identity, remove_pipe_sink_ack_under_root,
+    verify_pipe_sink_completion_under_root, verify_pipe_sink_ready_ack_under_root,
+};
 
 #[derive(Debug, Clone)]
 pub struct TmuxAdapter<R: CommandRunner = SystemCommandRunner> {
     runner: R,
     input_config: TmuxInputTransactionConfig,
+    pipe_sink_executable: Option<PathBuf>,
+    pipe_ready_timeout: Duration,
+    pipe_completion_timeout: Duration,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct TmuxPipeCapture {
+    root: PathBuf,
+    transcript_relative_path: PathBuf,
+    completion_relative_path: PathBuf,
+    transcript_identity: PipeSinkIdentity,
+    nonce: String,
+    helper_pid: u32,
+    helper_process_start_time_ticks: u64,
+    external_helper: bool,
+}
+
+impl fmt::Debug for TmuxPipeCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TmuxPipeCapture")
+            .field("root", &self.root)
+            .field("transcript_relative_path", &self.transcript_relative_path)
+            .field("completion_relative_path", &self.completion_relative_path)
+            .field("transcript_identity", &self.transcript_identity)
+            .field("helper_pid", &self.helper_pid)
+            .field(
+                "helper_process_start_time_ticks",
+                &self.helper_process_start_time_ticks,
+            )
+            .field("external_helper", &self.external_helper)
+            .finish()
+    }
 }
 
 impl TmuxAdapter<SystemCommandRunner> {
@@ -30,6 +72,9 @@ impl Default for TmuxAdapter<SystemCommandRunner> {
         Self {
             runner: SystemCommandRunner,
             input_config: TmuxInputTransactionConfig::runtime(),
+            pipe_sink_executable: None,
+            pipe_ready_timeout: Duration::from_secs(2),
+            pipe_completion_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -39,7 +84,27 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Self {
             runner,
             input_config: TmuxInputTransactionConfig::runtime(),
+            pipe_sink_executable: None,
+            pipe_ready_timeout: Duration::from_secs(2),
+            pipe_completion_timeout: Duration::from_secs(2),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_pipe_sink_executable(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.pipe_sink_executable = Some(executable.into());
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_pipe_capture_timeouts(
+        mut self,
+        ready_timeout: Duration,
+        completion_timeout: Duration,
+    ) -> Self {
+        self.pipe_ready_timeout = ready_timeout;
+        self.pipe_completion_timeout = completion_timeout;
+        self
     }
 
     pub fn with_input_transaction_config(
@@ -299,8 +364,11 @@ impl<R: CommandRunner> TmuxAdapter<R> {
     pub fn kill_pane(&self, pane: &TmuxPane) -> Result<(), TmuxError> {
         validate_owned_session_id("pane", pane.session_id())?;
         let target = pane_target(pane);
-        self.run_checked(argv(["tmux", "kill-pane", "-t"], [target.as_str()]))?;
-        Ok(())
+        let result = self.run_checked(argv(["tmux", "kill-pane", "-t"], [target.as_str()]));
+        if result.is_ok() {
+            self.runner.pipe_sink_producer_closed(&target);
+        }
+        result.map(|_| ())
     }
 
     pub fn kill_window(&self, window: &TmuxWindow) -> Result<(), TmuxError> {
@@ -440,6 +508,168 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             [target.as_str()],
         ))?;
         Ok(output.stdout)
+    }
+
+    pub fn start_pipe(&self, pane: &TmuxPane, path: &Path) -> Result<(), TmuxError> {
+        ensure_durable_pipe_capture_supported().map_err(|err| TmuxError::Io {
+            argv: vec!["pipe-sink".to_string()],
+            message: err.to_string(),
+        })?;
+        let root = path.parent().ok_or_else(|| TmuxError::Io {
+            argv: vec!["pipe-sink".to_string()],
+            message: "transcript path must have a parent".to_string(),
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| TmuxError::Io {
+                argv: vec!["pipe-sink".to_string()],
+                message: "transcript path must have a utf-8 file name".to_string(),
+            })?;
+        let identity = pipe_sink_identity(path).map_err(|err| TmuxError::Io {
+            argv: vec!["pipe-sink".to_string()],
+            message: err.to_string(),
+        })?;
+        self.start_pipe_capture(
+            pane,
+            root,
+            file_name,
+            &identity,
+            format!(".{file_name}.ready"),
+        )
+    }
+
+    pub fn start_pipe_capture(
+        &self,
+        pane: &TmuxPane,
+        root: &Path,
+        relative_path: impl AsRef<Path>,
+        identity: &PipeSinkIdentity,
+        ack_relative_path: impl AsRef<Path>,
+    ) -> Result<(), TmuxError> {
+        let ack_relative_path = ack_relative_path.as_ref();
+        let completion_relative_path = default_pipe_completion_path(ack_relative_path);
+        self.start_pipe_capture_with_completion(
+            pane,
+            root,
+            relative_path,
+            identity,
+            ack_relative_path,
+            completion_relative_path,
+        )
+        .map(|_| ())
+    }
+
+    pub fn start_pipe_capture_with_completion(
+        &self,
+        pane: &TmuxPane,
+        root: &Path,
+        relative_path: impl AsRef<Path>,
+        identity: &PipeSinkIdentity,
+        ack_relative_path: impl AsRef<Path>,
+        completion_relative_path: impl AsRef<Path>,
+    ) -> Result<TmuxPipeCapture, TmuxError> {
+        ensure_durable_pipe_capture_supported().map_err(|err| TmuxError::Io {
+            argv: vec!["pipe-sink".to_string()],
+            message: err.to_string(),
+        })?;
+        validate_owned_session_id("pane", pane.session_id())?;
+        let target = pane_target(pane);
+        let relative_path = relative_path.as_ref();
+        let ack_relative_path = ack_relative_path.as_ref();
+        let completion_relative_path = completion_relative_path.as_ref();
+        let sink = match &self.pipe_sink_executable {
+            Some(executable) => executable.clone(),
+            None => env::current_exe().map_err(|err| TmuxError::Io {
+                argv: vec!["current-exe".to_string()],
+                message: err.to_string(),
+            })?,
+        };
+        let ack_nonce = pipe_ack_nonce();
+        let command = format!(
+            "{} --pipe-sink --root {} --relative {} --dev {} --ino {} --uid {} --mode {} --nlink {} --ack-relative {} --completion-relative {} --ack-nonce {}",
+            shell_single_quote(&sink),
+            shell_single_quote(root),
+            shell_single_quote(relative_path),
+            identity.dev,
+            identity.ino,
+            identity.uid,
+            identity.mode,
+            identity.nlink,
+            shell_single_quote(ack_relative_path),
+            shell_single_quote(completion_relative_path),
+            shell_single_quote_str(&ack_nonce)
+        );
+        let argv = argv(
+            ["tmux", "pipe-pane", "-o", "-t", target.as_str()],
+            [command.as_str()],
+        );
+        let redacted_argv = pipe_sink_redacted_argv(target.as_str());
+        self.run_checked(argv.clone())
+            .map_err(|err| redact_pipe_sink_error(err, &redacted_argv))?;
+        let ready = wait_for_pipe_ack(
+            root,
+            ack_relative_path,
+            &ack_nonce,
+            identity,
+            &sink,
+            &redacted_argv,
+            self.pipe_ready_timeout,
+        )?;
+        Ok(TmuxPipeCapture {
+            root: root.to_path_buf(),
+            transcript_relative_path: relative_path.to_path_buf(),
+            completion_relative_path: completion_relative_path.to_path_buf(),
+            transcript_identity: *identity,
+            nonce: ack_nonce,
+            helper_pid: ready.pid,
+            helper_process_start_time_ticks: ready.process_start_time_ticks,
+            external_helper: self.runner.pipe_sink_helper_is_external(),
+        })
+    }
+
+    pub fn wait_for_pipe_capture_completion(
+        &self,
+        capture: &TmuxPipeCapture,
+    ) -> Result<PipeSinkCompletionPayload, TmuxError> {
+        let argv = vec!["pipe-sink".to_string(), "<completion-redacted>".to_string()];
+        let deadline = Instant::now() + self.pipe_completion_timeout;
+        let completion = loop {
+            match verify_pipe_sink_completion_under_root(
+                &capture.root,
+                &capture.completion_relative_path,
+                &capture.transcript_relative_path,
+                &capture.nonce,
+                &capture.transcript_identity,
+                capture.helper_pid,
+                capture.helper_process_start_time_ticks,
+            ) {
+                Ok(completion) => break completion,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if capture.external_helper
+                        && !helper_process_matches(
+                            capture.helper_pid,
+                            capture.helper_process_start_time_ticks,
+                        )
+                        .map_err(|_| pipe_completion_error(&argv))?
+                    {
+                        return Err(pipe_completion_error(&argv));
+                    }
+                }
+                Err(_) => {
+                    let _ = wait_for_pipe_helper_exit(capture, deadline);
+                    return Err(pipe_completion_error(&argv));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(pipe_completion_error(&argv));
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        wait_for_pipe_helper_exit(capture, deadline).map_err(|_| pipe_completion_error(&argv))?;
+        remove_pipe_sink_ack_under_root(&capture.root, &capture.completion_relative_path)
+            .map_err(|_| pipe_completion_error(&argv))?;
+        Ok(completion)
     }
 
     fn validate_exact_pane(&self, metadata: &TmuxActivationMetadata) -> Result<(), TmuxError> {
@@ -963,6 +1193,14 @@ impl PaneActivation {
 
 pub trait CommandRunner: Clone {
     fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError>;
+
+    #[doc(hidden)]
+    fn pipe_sink_helper_is_external(&self) -> bool {
+        true
+    }
+
+    #[doc(hidden)]
+    fn pipe_sink_producer_closed(&self, _target: &str) {}
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -1186,6 +1424,171 @@ fn metadata_pane_target(metadata: &TmuxActivationMetadata) -> String {
         metadata.window_id(),
         metadata.pane_id()
     )
+}
+
+fn shell_single_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    shell_single_quote_str(&value)
+}
+
+fn shell_single_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn wait_for_pipe_ack(
+    root: &Path,
+    ack_relative_path: &Path,
+    expected_nonce: &str,
+    identity: &PipeSinkIdentity,
+    sink: &Path,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<PipeSinkReady, TmuxError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match verify_pipe_sink_ready_ack_under_root(
+            root,
+            ack_relative_path,
+            expected_nonce,
+            identity,
+            sink,
+        ) {
+            Ok(ready) => return Ok(ready),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_err) => {
+                return Err(TmuxError::Io {
+                    argv: argv.to_vec(),
+                    message: "pipe sink setup failed".to_string(),
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(TmuxError::Io {
+                argv: argv.to_vec(),
+                message: format!(
+                    "pipe sink did not acknowledge readiness: {}",
+                    root.join(ack_relative_path).display()
+                ),
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn default_pipe_completion_path(ack_relative_path: &Path) -> PathBuf {
+    let file_name = ack_relative_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("pipe.ready");
+    ack_relative_path.with_file_name(format!("{file_name}.complete"))
+}
+
+fn pipe_completion_error(argv: &[String]) -> TmuxError {
+    TmuxError::Io {
+        argv: argv.to_vec(),
+        message: "pipe sink completion failed".to_string(),
+    }
+}
+
+fn wait_for_pipe_helper_exit(capture: &TmuxPipeCapture, deadline: Instant) -> std::io::Result<()> {
+    if !capture.external_helper {
+        return Ok(());
+    }
+    while helper_process_matches(capture.helper_pid, capture.helper_process_start_time_ticks)? {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pipe sink completion failed",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn helper_process_matches(pid: u32, expected_start_time_ticks: u64) -> std::io::Result<bool> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pipe sink process identity verification failed",
+            )
+        })?;
+    let actual_start_time_ticks = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pipe sink process identity verification failed",
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pipe sink process identity verification failed",
+            )
+        })?;
+    Ok(actual_start_time_ticks == expected_start_time_ticks)
+}
+
+#[cfg(not(all(unix, target_os = "linux")))]
+fn helper_process_matches(_: u32, _: u64) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable tmux transcript capture is not supported on this platform",
+    ))
+}
+
+fn pipe_sink_redacted_argv(target: &str) -> Vec<String> {
+    argv(
+        ["tmux", "pipe-pane", "-o", "-t", target],
+        ["<pipe-sink-command-redacted>"],
+    )
+}
+
+fn redact_pipe_sink_error(err: TmuxError, redacted_argv: &[String]) -> TmuxError {
+    match err {
+        TmuxError::Io { .. } => TmuxError::Io {
+            argv: redacted_argv.to_vec(),
+            message: "pipe sink setup failed".to_string(),
+        },
+        TmuxError::CommandFailed { status, .. } => TmuxError::CommandFailed {
+            argv: redacted_argv.to_vec(),
+            status,
+            stderr: "pipe sink setup failed".to_string(),
+        },
+        other => other,
+    }
+}
+
+fn pipe_ack_nonce() -> String {
+    let mut bytes = [0_u8; 16];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+    let fallback = format!(
+        "{}-{}-{:?}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos(),
+        std::thread::current().id()
+    );
+    fallback
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn sleep_if_needed(duration: Duration) {

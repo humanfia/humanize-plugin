@@ -1,13 +1,35 @@
 mod support;
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use humanize_plugin::mcp::McpServer;
+use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::{Value, json};
 
-use support::mcp::{call_tool, http_get, populate_view_run, structured, valid_flow};
+use support::mcp::{
+    RecordingRunner, call_tool, http_get, populate_view_run, structured, valid_flow,
+};
+
+static NEXT_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
+
+fn isolated_server() -> McpServer<RecordingRunner> {
+    let index = NEXT_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("mcp-view-assets-{index}"));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    McpServer::with_tmux_runner_and_run_asset_store(
+        RecordingRunner::default(),
+        RunAssetStore::new(RunAssetSink::Root(root)),
+    )
+}
 
 #[test]
 fn view_terminal_returns_dashboard_for_runtime_snapshot() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     populate_view_run(&mut server, "run-view");
 
     let viewed = call_tool(&mut server, 4, "view_terminal", json!({}));
@@ -26,7 +48,7 @@ fn view_terminal_returns_dashboard_for_runtime_snapshot() {
 }
 #[test]
 fn view_snapshot_returns_filterable_structured_snapshot() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     populate_view_run(&mut server, "run-view-a");
     populate_view_run(&mut server, "run-view-b");
 
@@ -70,7 +92,7 @@ fn view_snapshot_returns_filterable_structured_snapshot() {
 
 #[test]
 fn prepare_flow_review_returns_document_and_snapshot_sections() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let prepared = call_tool(
         &mut server,
@@ -111,7 +133,7 @@ fn prepare_flow_review_returns_document_and_snapshot_sections() {
 
 #[test]
 fn approve_flow_review_records_bypass_reason_and_rejects_missing_reason() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let prepared = call_tool(
         &mut server,
@@ -162,7 +184,7 @@ fn approve_flow_review_records_bypass_reason_and_rejects_missing_reason() {
 
 #[test]
 fn view_browser_rejects_non_loopback_host() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
 
     let viewed = call_tool(
         &mut server,
@@ -184,7 +206,7 @@ fn view_browser_rejects_non_loopback_host() {
 }
 #[test]
 fn view_browser_serves_html_and_snapshot_json_from_local_port() {
-    let mut server = McpServer::new();
+    let mut server = isolated_server();
     populate_view_run(&mut server, "run-browser");
 
     let viewed = call_tool(
