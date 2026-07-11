@@ -30,7 +30,7 @@ Use MCP tools as the compiler and runtime interface:
 
 1. `flow_suggest`: get a valid skeleton from the terse task.
 2. Edit the returned draft in memory to add nodes, contracts, actions,
-   resources, and routes that fit the task.
+   work profiles, resources, QoS intent, and routes that fit the task.
 3. `flow_check`: validate the full draft. Use `strict` when the flow will be
    shared or run for a long time.
 4. `flow_repair`: ask for mechanical patches or candidate repairs when
@@ -82,12 +82,13 @@ primitives directly:
 
 | Primitive | Purpose |
 | --- | --- |
-| `nodes` | Work units: agent, script, review, or human. |
+| `nodes` | Work units: agent, script, review, or human. Add `work_profile` when intent or execution traits matter. |
 | `contracts` | Required delivery for a node. Use `all_artifacts` when stopping must depend on artifacts. |
 | `routes` | Runtime activation rules. Use predicates over artifacts, verdicts, or state. |
 | `resources` | README, prompts, schemas, scripts, views, and packaged subflows. |
 | `imports` | Reusable flow resources or schema aliases. |
 | `policies` | Write boundaries for artifacts, resources, workspace, and system state. |
+| `qos` | Run intent: `interactive`, `standard`, or `background`, with optional `completion_target`. |
 
 Prefer a small graph over a large instruction blob. A good flow has a frozen
 task contract, bounded work nodes, explicit artifacts, measurable checks, and
@@ -119,8 +120,12 @@ a review or guard that decides whether to continue, branch, or finish.
 - Include a README resource in every package. It should explain intent,
   prerequisites, expected artifacts, review gates, and how to rerun or inspect
   the flow.
-- If the workspace has `.flowbench/humanize-flow`, write the exported locked
-  flow, review pointer, run id, and any terminal archive there.
+- Use Work Profile intents `produce`, `evaluate`, `explore`, `synthesize`, and
+  `coordinate` to describe node work. Set workspace, tool, and network access
+  traits only when the default would be misleading.
+- Use `record_hook_fact` for native hook telemetry such as
+  `compaction_pending` and `compaction_finished`; it updates the session
+  `context_generation` without changing runtime state.
 
 ## Common Shapes
 

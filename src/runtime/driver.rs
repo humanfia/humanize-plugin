@@ -146,7 +146,27 @@ pub struct DriverRender {
 pub struct DriverTickReport {
     pub pipeline: Vec<&'static str>,
     pub stop_decisions: Vec<StopDecision>,
+    pub route_decisions: Vec<RouteDecision>,
     pub render: DriverRender,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RouteDecision {
+    pub run_id: String,
+    pub flow_lock_id: String,
+    pub route_index: usize,
+    pub route_id: String,
+    pub predicate: String,
+    pub for_each: Option<String>,
+    pub source_artifact: Option<RouteSourceArtifact>,
+    pub planned_activation_ids: Vec<String>,
+    pub applied_activation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RouteSourceArtifact {
+    pub key: String,
+    pub artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -182,6 +202,7 @@ impl DriverState {
         self.handle_control(&input.controls, input.completion_mode);
 
         let mut stop_decisions = Vec::new();
+        let mut route_decisions = Vec::new();
         let mut pending_stop_observations = input.stop_observations.clone();
         let mut action_budget = input.loop_budget.action_limit;
         for _ in 0..input.loop_budget.tick_limit {
@@ -192,7 +213,7 @@ impl DriverState {
             progressed |= !decisions.is_empty();
             stop_decisions.extend(decisions);
 
-            progressed |= self.route(&input.route_locks, &mut action_budget);
+            progressed |= self.route(&input.route_locks, &mut action_budget, &mut route_decisions);
             progressed |= self.actuate(&mut action_budget);
             progressed |= self.complete(&mut action_budget);
 
@@ -206,6 +227,7 @@ impl DriverState {
         DriverTickReport {
             pipeline,
             stop_decisions,
+            route_decisions,
             render,
         }
     }
@@ -370,7 +392,12 @@ impl DriverState {
         });
     }
 
-    fn route(&mut self, route_locks: &[flow::FlowLock], action_budget: &mut u64) -> bool {
+    fn route(
+        &mut self,
+        route_locks: &[flow::FlowLock],
+        action_budget: &mut u64,
+        route_decisions: &mut Vec<RouteDecision>,
+    ) -> bool {
         if route_locks.is_empty() || *action_budget == 0 {
             return false;
         }
@@ -412,6 +439,12 @@ impl DriverState {
                 let Some(route) = lock.draft().routes.get(preview.route_index) else {
                     continue;
                 };
+                let planned_activation_ids = preview
+                    .planned_activations
+                    .iter()
+                    .map(|activation| activation.activation_id.clone())
+                    .collect::<Vec<_>>();
+                let source_artifact = route_source_artifact(&self.runtime.state, &run_id, route);
                 let activated = match route.for_each.as_deref() {
                     Some(for_each) => {
                         let Some(artifact_key) = route_for_each_artifact_key(for_each) else {
@@ -432,6 +465,17 @@ impl DriverState {
                 if activated.is_empty() {
                     continue;
                 }
+                route_decisions.push(RouteDecision {
+                    run_id: run_id.clone(),
+                    flow_lock_id: lock.id().to_string(),
+                    route_index: preview.route_index,
+                    route_id: format!("route-{}", preview.route_index),
+                    predicate: route.predicate.clone(),
+                    for_each: route.for_each.clone(),
+                    source_artifact,
+                    planned_activation_ids,
+                    applied_activation_ids: activated.clone(),
+                });
                 *action_budget = (*action_budget).saturating_sub(activated.len() as u64);
                 progressed = true;
             }
@@ -675,6 +719,40 @@ impl DriverState {
 fn route_for_each_artifact_key(for_each: &str) -> Option<&str> {
     for_each
         .trim()
+        .strip_prefix("artifact.")
+        .filter(|key| !key.is_empty())
+}
+
+fn route_source_artifact(
+    state: &RuntimeState,
+    run_id: &str,
+    route: &flow::FlowRoute,
+) -> Option<RouteSourceArtifact> {
+    let key = route
+        .for_each
+        .as_deref()
+        .and_then(route_for_each_artifact_key)
+        .or_else(|| route_predicate_artifact_key(&route.predicate))?;
+    let artifact_id = state
+        .latest_artifact_by_slot_index
+        .get(&(run_id.to_string(), key.to_string()))
+        .cloned();
+    Some(RouteSourceArtifact {
+        key: key.to_string(),
+        artifact_id,
+    })
+}
+
+fn route_predicate_artifact_key(predicate: &str) -> Option<&str> {
+    let predicate = predicate.trim();
+    if let Some(path) = predicate
+        .strip_prefix("exists(")
+        .and_then(|value| value.strip_suffix(')'))
+        .map(str::trim)
+    {
+        return path.strip_prefix("artifact.").filter(|key| !key.is_empty());
+    }
+    predicate
         .strip_prefix("artifact.")
         .filter(|key| !key.is_empty())
 }

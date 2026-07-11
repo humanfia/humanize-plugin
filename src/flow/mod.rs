@@ -1,6 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
 mod export;
+mod profile;
+
+pub use profile::{
+    FlowQosIntent, NetworkAccess, QosUrgency, ToolExecution, WorkIntent, WorkProfile,
+    WorkspaceAccess, flow_draft_qos, flow_node_work_profile, set_flow_draft_qos,
+    set_flow_node_work_profile,
+};
+pub(crate) use profile::{extension_is_flow_qos, extension_is_node_work_profile};
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct FlowDraft {
@@ -723,6 +731,22 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
                 DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
             ));
         }
+    }
+
+    if flow_draft_qos(draft)
+        .completion_target
+        .as_deref()
+        .is_some_and(|target| target.trim().is_empty())
+    {
+        diagnostics.push(Diagnostic::error(
+            DiagnosticDomain::Policy,
+            "FLOW_EMPTY_QOS_COMPLETION_TARGET",
+            "qos.completion_target",
+            "QoS completion target must not be empty",
+            "Remove completion_target for open-ended work or provide a non-empty artifact, board, or time target.",
+            "Consumers need a meaningful target when QoS declares one.",
+            DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
+        ));
     }
 
     for (index, route) in draft.routes.iter().enumerate() {
@@ -1450,7 +1474,10 @@ fn route_for_each_is_artifact_driven(expression: &str) -> bool {
 }
 
 fn is_authoring_extension_kind(extension: &str) -> bool {
-    if extension.starts_with(CONTRACT_EFFECTS_EXTENSION_PREFIX) {
+    if extension.starts_with(CONTRACT_EFFECTS_EXTENSION_PREFIX)
+        || extension_is_flow_qos(extension)
+        || extension_is_node_work_profile(extension)
+    {
         return true;
     }
     matches!(
@@ -1474,6 +1501,7 @@ fn draft_is_non_empty_package(draft: &FlowDraft) -> bool {
         || !draft.resources.is_empty()
         || !draft.imports.is_empty()
         || !draft.policies.write_scopes.is_empty()
+        || !flow_draft_qos(draft).is_default()
         || !draft.extensions.is_empty()
 }
 

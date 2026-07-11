@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adapters::tmux::{CommandRunner, TmuxPane, TmuxSession, TmuxWindow};
 use crate::run_assets::{
-    RunAssetActivationFailureUpdate, RunAssetActivationUpdate, RunAssetTmuxTarget,
+    RunAssetActivationFailureUpdate, RunAssetActivationUpdate, RunAssetTmuxTarget, SessionRelation,
 };
 use crate::runtime;
 use serde_json::{Value, json};
@@ -49,6 +49,16 @@ impl<R: CommandRunner> McpServer<R> {
                 session_id,
                 window_name,
             } => {
+                if let Some(manifest) = self.state.run_assets.get_mut(run_id) {
+                    self.run_asset_store
+                        .record_session_association(
+                            manifest,
+                            session_id.as_str(),
+                            SessionRelation::Orchestrates,
+                            None,
+                        )
+                        .map_err(ToolError::from_run_asset)?;
+                }
                 let expected = activation_ids
                     .iter()
                     .map(|activation_id| (activation_id.clone(), activation_id.clone()))

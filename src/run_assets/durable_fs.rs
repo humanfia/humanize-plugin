@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -164,6 +164,7 @@ fn atomic_write_private_with_directory_sync(
         ensure_private_dir(parent)?;
     }
     reject_existing_symlink(path)?;
+    reject_existing_non_regular(path)?;
     let temp_path = temp_sibling_path(path);
     reject_existing_symlink(&temp_path)?;
     let write_result =
@@ -180,6 +181,121 @@ fn atomic_write_private_with_directory_sync(
         let _ = fs::remove_file(&temp_path);
     }
     write_result
+}
+
+pub(super) fn read_regular_private(path: &Path) -> Result<Option<Vec<u8>>, RunAssetError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RunAssetError::new(format!(
+                "asset file {} is a symlink",
+                path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(RunAssetError::new(format!(
+                "asset file {} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(RunAssetError::new(format!(
+                "inspect asset file {} failed: {err}",
+                path.display()
+            )));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|err| {
+        RunAssetError::new(format!("open asset file {} failed: {err}", path.display()))
+    })?;
+    if !file
+        .metadata()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err(RunAssetError::new(format!(
+            "asset file {} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|err| {
+        RunAssetError::new(format!("read asset file {} failed: {err}", path.display()))
+    })?;
+    Ok(Some(bytes))
+}
+
+pub(super) fn append_private_line(path: &Path, line: &[u8]) -> Result<(), RunAssetError> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+        ensure_private_dir(parent)?;
+    }
+    let created = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RunAssetError::new(format!(
+                "asset file {} is a symlink",
+                path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(RunAssetError::new(format!(
+                "asset file {} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(_) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            return Err(RunAssetError::new(format!(
+                "inspect asset file {} failed: {err}",
+                path.display()
+            )));
+        }
+    };
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|err| {
+        RunAssetError::new(format!("open asset file {} failed: {err}", path.display()))
+    })?;
+    ensure_private_open_file(&file, path, 0o600)?;
+    if !file
+        .metadata()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err(RunAssetError::new(format!(
+            "asset file {} is not a regular file",
+            path.display()
+        )));
+    }
+    file.write_all(line).map_err(|err| {
+        RunAssetError::new(format!("write asset file {} failed: {err}", path.display()))
+    })?;
+    file.sync_all().map_err(|err| {
+        RunAssetError::new(format!("sync asset file {} failed: {err}", path.display()))
+    })?;
+    drop(file);
+    if created {
+        sync_parent_for(
+            path,
+            DirectorySyncEvent::FileCreated,
+            &mut sync_directory_event,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn write_create_new_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {
@@ -338,6 +454,21 @@ fn reject_existing_symlink(path: &Path) -> Result<(), RunAssetError> {
             path.display()
         ))),
         Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(RunAssetError::new(format!(
+            "inspect asset file {} failed: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn reject_existing_non_regular(path: &Path) -> Result<(), RunAssetError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(RunAssetError::new(format!(
+            "asset file {} is not a regular file",
+            path.display()
+        ))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(RunAssetError::new(format!(
             "inspect asset file {} failed: {err}",

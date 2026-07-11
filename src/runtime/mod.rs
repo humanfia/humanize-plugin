@@ -7,7 +7,7 @@ mod route_preview;
 
 pub use driver::{
     ControlCommand, DriverRender, DriverState, DriverTickInput, DriverTickReport, LoopBudget,
-    RunCompletionMode, TickBudget,
+    RouteDecision, RouteSourceArtifact, RunCompletionMode, TickBudget,
 };
 pub use route_preview::{PlannedActivationPreview, RoutePreview, preview_flow_routes};
 

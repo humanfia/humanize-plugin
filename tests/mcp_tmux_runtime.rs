@@ -1,5 +1,6 @@
 mod support;
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,7 +9,7 @@ use humanize_plugin::mcp::McpServer;
 use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::json;
 
-use support::mcp::{RecordingRunner, call_tool, lock_flow, structured};
+use support::mcp::{RecordingRunner, SideEffectRunner, call_tool, lock_flow, structured};
 
 static NEXT_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -719,6 +720,92 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
             "Enter"
         ]])
         .remove(0)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_flow_propagates_durable_machine_input_store_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let index = NEXT_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("mcp-tmux-runtime-machine-input-store-{index}"));
+    if root.exists() {
+        fs::remove_dir_all(&root).unwrap();
+    }
+    let run_id = "run-machine-input-store-failure";
+    let store = RunAssetStore::new(RunAssetSink::Root(root));
+    let ledger_path = store.run_root(run_id).unwrap().join("machine-inputs.jsonl");
+    let runner = SideEffectRunner::with_outputs(
+        vec![
+            CommandOutput::failure("missing session"),
+            CommandOutput::success("%7\t%8\n"),
+            CommandOutput::success(""),
+            CommandOutput::success("host-a\t%7\tflow-a\t%8\n"),
+            CommandOutput::success(""),
+            CommandOutput::success(""),
+        ],
+        move |argv| {
+            if argv.get(1).map(String::as_str) == Some("pipe-pane") {
+                fs::write(&ledger_path, "").unwrap();
+                let mut permissions = fs::metadata(&ledger_path).unwrap().permissions();
+                permissions.set_mode(0o400);
+                fs::set_permissions(&ledger_path, permissions).unwrap();
+            }
+        },
+    );
+    let mut server = McpServer::with_tmux_runner_and_run_asset_store(runner, store);
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": run_id,
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false,
+            "tmux": {
+                "enabled": true,
+                "session": "host-a",
+                "window": "flow-a",
+                "agent_command": "humanize-test-agent"
+            }
+        }),
+    );
+
+    assert!(
+        started["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("run asset preservation")
+    );
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": run_id
+        }),
+    );
+    assert_eq!(structured(&status)["context"]["run_status"], "failed");
+    let run_assets = &structured(&status)["context"]["run_assets"];
+    assert_eq!(
+        run_assets["preservation_errors"][0]["stage"],
+        "machine_input"
+    );
+    assert!(
+        run_assets["preservation_errors"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("machine input ledger")
+    );
+    assert_eq!(
+        run_assets["records"]["files"]["preservation"]["record_count"],
+        1
     );
 }
 

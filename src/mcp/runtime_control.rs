@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use super::{
     FlowReviewStatus, McpServer, RunArchive, ToolCallResult, ToolError, content_hash,
     diagnostic_codes_text, flow_check_mode_arg, flow_draft_arg, node_specs, optional_bool,
-    optional_string, require_string, run_not_found_guidance, validate_start_run_preconditions,
+    optional_string, require_string, run_not_found_guidance, runtime_qos_arg,
+    validate_start_run_preconditions,
 };
 
 impl<R: CommandRunner> McpServer<R> {
@@ -28,6 +29,7 @@ impl<R: CommandRunner> McpServer<R> {
                     || arguments.get("lockId").is_some()
             });
         let mut flow_binding = self.flow_lock_binding_from_arguments(arguments)?;
+        let explicit_qos = runtime_qos_arg(arguments)?;
         let agent_command = agent_command_from_arguments(arguments)?;
         let nodes = match flow_binding.as_ref() {
             Some((lock_id, _)) => self.locked_flow_node_specs(lock_id)?,
@@ -94,6 +96,16 @@ impl<R: CommandRunner> McpServer<R> {
                 },
                 "error": "run asset preservation failed"
             })));
+        }
+        let run_qos = explicit_qos.or_else(|| {
+            flow_binding
+                .as_ref()
+                .and_then(|(lock_id, _)| self.state.flow_locks.get(lock_id))
+                .map(|lock| flow::flow_draft_qos(lock.draft()))
+                .filter(|qos| !qos.is_default())
+        });
+        if let Some(qos) = run_qos {
+            self.record_run_qos_intent(run_id, &qos)?;
         }
 
         let prepared_revision = if let Some((lock_id, content_hash)) = flow_binding.as_ref() {
@@ -203,6 +215,8 @@ impl<R: CommandRunner> McpServer<R> {
             });
             (activation_ids, report)
         };
+        self.record_route_topology_decisions(&report)?;
+        self.record_new_runtime_events(run_id)?;
         if let Some(revision_id) = prepared_revision.as_deref() {
             if let Err(err) = self.commit_run_flow_revision(run_id, revision_id) {
                 let message = err.message;
@@ -362,6 +376,10 @@ impl<R: CommandRunner> McpServer<R> {
         } else {
             None
         };
+        if let Some(report) = report.as_ref() {
+            self.record_route_topology_decisions(report)?;
+        }
+        self.record_new_runtime_events(run_id)?;
         let tmux_cleanup = self.cleanup_all_tmux_panes_for_run(run_id, "forced_stop")?;
         let mut run_status = self.run_status_string(run_id)?;
 
@@ -464,6 +482,8 @@ impl<R: CommandRunner> McpServer<R> {
             activation_id,
             runtime::StopObservation::new(reason),
         );
+        self.record_route_topology_decisions(&report)?;
+        self.record_new_runtime_events(run_id)?;
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
         self.actuate_locked_flow(run_id, &[])?;
         let tmux_cleanup =
@@ -533,6 +553,8 @@ impl<R: CommandRunner> McpServer<R> {
             return Ok(blocked);
         }
         let report = self.state.tick_control(command(run_id));
+        self.record_route_topology_decisions(&report)?;
+        self.record_new_runtime_events(run_id)?;
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
         if self.run_has_asset_preservation_failure(run_id) {
             let _ = self
@@ -890,7 +912,7 @@ impl<R: CommandRunner> McpServer<R> {
                 {
                     Ok(transaction) => {
                         launch_transaction_id = Some(transaction.transaction_id().to_string());
-                        self.record_machine_input(run_id, "agent_launch", transaction.record());
+                        self.record_machine_input(run_id, "agent_launch", transaction.record())?;
                         self.state.launched_activations.insert(key.clone());
                     }
                     Err(err) => {
@@ -912,7 +934,7 @@ impl<R: CommandRunner> McpServer<R> {
             match self.tmux_adapter.send_input_transaction(&metadata, &prompt) {
                 Ok(transaction) => {
                     let prompt_transaction_id = transaction.transaction_id().to_string();
-                    self.record_machine_input(run_id, "node_prompt", transaction.record());
+                    self.record_machine_input(run_id, "node_prompt", transaction.record())?;
                     self.state.actuated_activations.insert(key);
                     actuation.sent.push(json!({
                         "activation_id": activation.activation_id,
@@ -965,7 +987,12 @@ impl<R: CommandRunner> McpServer<R> {
         }
     }
 
-    fn record_machine_input(&mut self, run_id: &str, role: &str, record: &MachineInputRecord) {
+    fn record_machine_input(
+        &mut self,
+        run_id: &str,
+        role: &str,
+        record: &MachineInputRecord,
+    ) -> Result<(), ToolError> {
         let mut value = serde_json::to_value(record).unwrap_or_else(|_| {
             json!({
                 "transaction_id": record.transaction_id,
@@ -980,6 +1007,37 @@ impl<R: CommandRunner> McpServer<R> {
             .entry(run_id.to_string())
             .or_default()
             .push(value);
+        if let Some(manifest) = self.state.run_assets.get_mut(run_id) {
+            let result = self
+                .run_asset_store
+                .record_machine_input(manifest, role, record);
+            if let Err(err) = result {
+                let message = err.to_string();
+                let preservation_result =
+                    if let Some(manifest) = self.state.run_assets.get_mut(run_id) {
+                        self.run_asset_store.record_preservation_error(
+                            manifest,
+                            Some(record.activation_id.as_str()),
+                            Some("machine_input"),
+                            "machine_input",
+                            &message,
+                        )
+                    } else {
+                        Ok(())
+                    };
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                if let Err(preservation_err) = preservation_result {
+                    return Err(ToolError::invalid(format!(
+                        "run asset preservation {message}; preserving machine input failure failed: {preservation_err}"
+                    )));
+                }
+                return Err(ToolError::from_run_asset(err));
+            }
+        }
+        Ok(())
     }
 }
 

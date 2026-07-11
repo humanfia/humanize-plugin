@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "run_id": "legacy-run",
+  "created_at_ms": 1700000000000,
+  "updated_at_ms": 1700000000000,
+  "sink": "root",
+  "root": "/tmp/humanize-fixtures/run-sha256-f0f1ff90a970a77c8eff2ea3235f5f180d176f42377ecc2985e15540b0638ead-legacy-run",
+  "manifest_path": "/tmp/humanize-fixtures/run-sha256-f0f1ff90a970a77c8eff2ea3235f5f180d176f42377ecc2985e15540b0638ead-legacy-run/manifest.json",
+  "storage": {
+    "raw_run_id": "legacy-run",
+    "run_directory": "run-sha256-f0f1ff90a970a77c8eff2ea3235f5f180d176f42377ecc2985e15540b0638ead-legacy-run",
+    "run_relative_path": "run-sha256-f0f1ff90a970a77c8eff2ea3235f5f180d176f42377ecc2985e15540b0638ead-legacy-run"
+  },
+  "protocol": {
+    "mcp_protocol_version": "2024-11-05",
+    "package_name": "humanize-plugin",
+    "package_version": "0.1.0"
+  },
+  "flow": {
+    "main_flow": true,
+    "status": "pending",
+    "complete": false,
+    "current_revision_id": null,
+    "current_export_path": null,
+    "current_export_relative_path": null,
+    "revisions": []
+  },
+  "artifact_paths": {
+    "manifest": "/tmp/humanize-fixtures/run-sha256-f0f1ff90a970a77c8eff2ea3235f5f180d176f42377ecc2985e15540b0638ead-legacy-run/manifest.json",
+    "manifest_relative_path": "manifest.json",
+    "flow_current": null,
+    "flow_current_relative_path": null,
+    "flow_revisions": [],
+    "flow_revision_relative_paths": []
+  },
+  "activations": {},
+  "preservation_errors": [],
+  "preservation_blocked": false,
+  "completion": {
+    "flow_complete": false,
+    "expected_tmux_activations": [],
+    "complete_tmux_activations": [],
+    "incomplete_tmux_activations": [],
+    "complete": false
+  }
+}

@@ -1,3 +1,4 @@
+use super::profile;
 use super::*;
 
 pub(super) fn normalized_lock_content(
@@ -47,19 +48,28 @@ fn normalize_draft(draft: &FlowDraft) -> String {
             .cmp(&right.resource_id)
             .then(left.alias.cmp(&right.alias))
     });
-    let mut extensions = draft.extensions.clone();
+    let mut extensions = draft
+        .extensions
+        .iter()
+        .filter(|extension| !profile::extension_is_flow_qos(extension))
+        .cloned()
+        .collect::<Vec<_>>();
     extensions.sort();
+    let qos = flow_draft_qos(draft);
 
-    format!(
-        "{{\"nodes\":{},\"contracts\":{},\"routes\":{},\"resources\":{},\"imports\":{},\"policies\":{},\"extensions\":{}}}",
-        normalize_nodes(&nodes),
-        normalize_contracts(draft, &contracts),
-        normalize_routes(&routes),
-        normalize_resources(&resources),
-        normalize_imports(&imports),
-        normalize_policies(&draft.policies),
-        normalize_strings(&extensions),
-    )
+    let mut fields = vec![
+        format!("\"nodes\":{}", normalize_nodes(&nodes)),
+        format!("\"contracts\":{}", normalize_contracts(draft, &contracts)),
+        format!("\"routes\":{}", normalize_routes(&routes)),
+        format!("\"resources\":{}", normalize_resources(&resources)),
+        format!("\"imports\":{}", normalize_imports(&imports)),
+        format!("\"policies\":{}", normalize_policies(&draft.policies)),
+    ];
+    if !qos.is_default() {
+        fields.push(format!("\"qos\":{}", normalize_qos(&qos)));
+    }
+    fields.push(format!("\"extensions\":{}", normalize_strings(&extensions)));
+    format!("{{{}}}", fields.join(","))
 }
 
 fn normalize_nodes(nodes: &[FlowNode]) -> String {
@@ -68,19 +78,55 @@ fn normalize_nodes(nodes: &[FlowNode]) -> String {
         .map(|node| {
             let mut write_scopes = node.write_scopes.clone();
             write_scopes.sort();
-            let mut extensions = node.extensions.clone();
+            let mut extensions = node
+                .extensions
+                .iter()
+                .filter(|extension| !profile::extension_is_node_work_profile(extension))
+                .cloned()
+                .collect::<Vec<_>>();
             extensions.sort();
-            format!(
-                "{{\"id\":{},\"contract_id\":{},\"action\":{},\"write_scopes\":{},\"extensions\":{}}}",
-                quote(&node.id),
-                quote_option(node.contract_id.as_deref()),
-                normalize_action(node.action.as_ref()),
-                normalize_write_scopes(&write_scopes),
-                normalize_strings(&extensions)
-            )
+            let work_profile = flow_node_work_profile(node);
+            let mut fields = vec![
+                format!("\"id\":{}", quote(&node.id)),
+                format!(
+                    "\"contract_id\":{}",
+                    quote_option(node.contract_id.as_deref())
+                ),
+                format!("\"action\":{}", normalize_action(node.action.as_ref())),
+            ];
+            if !work_profile.is_default() {
+                fields.push(format!(
+                    "\"work_profile\":{}",
+                    normalize_work_profile(&work_profile)
+                ));
+            }
+            fields.push(format!(
+                "\"write_scopes\":{}",
+                normalize_write_scopes(&write_scopes)
+            ));
+            fields.push(format!("\"extensions\":{}", normalize_strings(&extensions)));
+            format!("{{{}}}", fields.join(","))
         })
         .collect::<Vec<_>>();
     format!("[{}]", values.join(","))
+}
+
+fn normalize_work_profile(profile: &WorkProfile) -> String {
+    format!(
+        "{{\"intent\":{},\"workspace_access\":{},\"tool_execution\":{},\"network_access\":{}}}",
+        quote(profile.intent.as_str()),
+        quote(profile.workspace_access.as_str()),
+        quote(profile.tool_execution.as_str()),
+        quote(profile.network_access.as_str()),
+    )
+}
+
+fn normalize_qos(qos: &FlowQosIntent) -> String {
+    let mut fields = vec![format!("\"urgency\":{}", quote(qos.urgency.as_str()))];
+    if let Some(target) = qos.completion_target.as_deref() {
+        fields.push(format!("\"completion_target\":{}", quote(target)));
+    }
+    format!("{{{}}}", fields.join(","))
 }
 
 fn normalize_action(action: Option<&NodeAction>) -> String {

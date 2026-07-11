@@ -1,8 +1,15 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 
-use humanize_plugin::flow::{ContractArtifact, ContractCompletion, FlowContract};
+use humanize_plugin::flow::{
+    ContractArtifact, ContractCompletion, FlowContract, FlowDraft, FlowNode, FlowPolicies,
+};
 use humanize_plugin::mcp::serve_stdio;
+use humanize_plugin::run_assets::{
+    RunAssetArtifactPaths, RunAssetCompletion, RunAssetFlow, RunAssetManifest, RunAssetProtocol,
+    RunAssetSink, RunAssetStorage, RunAssetStore,
+};
 use humanize_plugin::view::RunSnapshot;
 
 #[test]
@@ -17,6 +24,88 @@ fn flow_contract_old_struct_literal_still_compiles() {
     };
 
     assert_eq!(contract.id, "contract.root");
+}
+
+#[test]
+fn flow_draft_and_node_old_struct_literals_still_compile() {
+    let node = FlowNode {
+        id: "root".to_string(),
+        contract_id: None,
+        action: None,
+        write_scopes: Vec::new(),
+        extensions: Vec::new(),
+    };
+    let draft = FlowDraft {
+        nodes: vec![node],
+        contracts: Vec::new(),
+        routes: Vec::new(),
+        resources: Vec::new(),
+        imports: Vec::new(),
+        policies: FlowPolicies::default(),
+        extensions: Vec::new(),
+    };
+
+    assert_eq!(draft.nodes[0].id, "root");
+}
+
+#[test]
+fn run_asset_manifest_old_struct_literal_still_compiles() {
+    let root = PathBuf::from("/tmp/humanize-compat/run");
+    let manifest = RunAssetManifest {
+        version: 1,
+        run_id: "run-a".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        sink: "root".to_string(),
+        root: root.clone(),
+        manifest_path: root.join("manifest.json"),
+        storage: RunAssetStorage {
+            raw_run_id: "run-a".to_string(),
+            run_directory: "run-a".to_string(),
+            run_relative_path: "run-a".to_string(),
+        },
+        protocol: RunAssetProtocol {
+            mcp_protocol_version: "2024-11-05".to_string(),
+            package_name: "humanize-plugin".to_string(),
+            package_version: "0.1.0".to_string(),
+        },
+        flow: RunAssetFlow {
+            main_flow: true,
+            status: "pending".to_string(),
+            complete: false,
+            current_revision_id: None,
+            current_export_path: None,
+            current_export_relative_path: None,
+            revisions: Vec::new(),
+        },
+        artifact_paths: RunAssetArtifactPaths {
+            manifest: root.join("manifest.json"),
+            manifest_relative_path: "manifest.json".to_string(),
+            flow_current: None,
+            flow_current_relative_path: None,
+            flow_revisions: Vec::new(),
+            flow_revision_relative_paths: Vec::new(),
+        },
+        activations: BTreeMap::new(),
+        preservation_errors: Vec::new(),
+        preservation_blocked: false,
+        completion: RunAssetCompletion::default(),
+    };
+
+    assert_eq!(manifest.run_id, "run-a");
+}
+
+#[test]
+#[allow(deprecated)]
+fn deprecated_sforge_patch_dir_sink_alias_still_compiles_without_runtime_default_coupling() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join("compat-sforge-sink");
+    let store = RunAssetStore::new(RunAssetSink::SforgePatchDir(root.clone()));
+
+    let run_root = store.run_root("run-a").unwrap();
+
+    assert!(run_root.starts_with(root));
 }
 
 #[test]

@@ -14,9 +14,14 @@ use crate::pipe_sink::PipeSinkIdentity;
 
 mod durable_fs;
 mod fault;
+mod records;
 
 use fault::RunAssetFaultKind;
 pub use fault::{RunAssetFault, RunAssetFaultPoint};
+pub use records::{
+    ActivationProbeState, HookFactInput, RunAssetRecordFile, RunAssetRecordIndex,
+    RunAssetSessionIndex, RunAssetSessionRelation, SessionRelation, TopologyDecisionInput,
+};
 
 pub const RUN_ASSET_PROTOCOL_VERSION: &str = "2024-11-05";
 pub const RUN_ASSET_PACKAGE_NAME: &str = "humanize-plugin";
@@ -80,10 +85,7 @@ impl RunAssetStore {
     pub fn run_root(&self, run_id: &str) -> Result<PathBuf, RunAssetError> {
         let safe_run_id = storage_segment("run", run_id);
         match self.selected_sink() {
-            SelectedRunAssetSink::SforgePatchDir(path) => Ok(path
-                .join(".flowbench")
-                .join("humanize-runner")
-                .join(safe_run_id)),
+            SelectedRunAssetSink::HumanizeRunsDir(path) => Ok(path.join(safe_run_id)),
             SelectedRunAssetSink::CacheHome(path) => Ok(path
                 .join(".cache")
                 .join("humanize")
@@ -165,6 +167,7 @@ impl RunAssetStore {
             completion: RunAssetCompletion::default(),
         };
         refresh_completion(&mut manifest);
+        records::record_manifest_started(&mut manifest, now)?;
         write_manifest_file_create_new(&manifest)?;
         Ok(manifest)
     }
@@ -254,6 +257,7 @@ impl RunAssetStore {
             .push(relative_path_string(&manifest.root, &revision_path));
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        records::record_flow_revision(&mut candidate, &revision, "prepared", now)?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(revision)
@@ -289,8 +293,9 @@ impl RunAssetStore {
         candidate.artifact_paths.flow_current_relative_path = Some(revision_relative_path);
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
-        write_manifest_file(&candidate)?;
         let revision = candidate.flow.revisions[index].clone();
+        records::record_flow_revision(&mut candidate, &revision, "applied", now)?;
+        write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(revision)
     }
@@ -324,6 +329,21 @@ impl RunAssetStore {
         candidate.preservation_blocked = true;
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        let preservation_error = candidate
+            .preservation_errors
+            .last()
+            .expect("pushed preservation error should exist")
+            .clone();
+        records::record_preservation_failure(&mut candidate, &preservation_error)?;
+        if let Some(revision) = candidate
+            .flow
+            .revisions
+            .iter()
+            .find(|revision| revision.revision_id == revision_id)
+            .cloned()
+        {
+            records::record_flow_revision(&mut candidate, &revision, "failed", now)?;
+        }
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(())
@@ -388,6 +408,26 @@ impl RunAssetStore {
             .insert(activation.activation_id.clone(), activation);
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        let activation = candidate
+            .activations
+            .get(&activation_id)
+            .expect("inserted activation should exist")
+            .clone();
+        records::record_tmux_activation(&mut candidate, &activation, "capture_started", now)?;
+        records::record_activation_probe(
+            &mut candidate,
+            &activation.activation_id,
+            &activation.node_id,
+            ActivationProbeState::Ready,
+            now,
+        )?;
+        records::record_session_relation(
+            &mut candidate,
+            &activation.session_id,
+            SessionRelation::Executes,
+            Some(&activation.activation_id),
+            now,
+        )?;
         self.fail_if_fault(RunAssetFaultPoint::StartActivationManifest, &activation_id)?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
@@ -460,6 +500,13 @@ impl RunAssetStore {
             .insert(activation.activation_id.clone(), activation);
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        records::record_activation_probe(
+            &mut candidate,
+            activation_id,
+            node_id,
+            ActivationProbeState::Planned,
+            now,
+        )?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(())
@@ -493,6 +540,7 @@ impl RunAssetStore {
         write_activation_metadata_file(&activation)?;
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        records::record_tmux_activation(&mut candidate, &activation, "capture_acknowledged", now)?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(activation)
@@ -539,6 +587,14 @@ impl RunAssetStore {
         write_activation_metadata_file(&activation)?;
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        records::record_tmux_activation(&mut candidate, &activation, "capture_completed", now)?;
+        records::record_activation_probe(
+            &mut candidate,
+            &activation.activation_id,
+            &activation.node_id,
+            ActivationProbeState::Closed,
+            now,
+        )?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(activation)
@@ -604,6 +660,14 @@ impl RunAssetStore {
         write_activation_metadata_file(&activation)?;
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        records::record_tmux_activation(&mut candidate, &activation, "capture_failed", now)?;
+        records::record_activation_probe(
+            &mut candidate,
+            &activation.activation_id,
+            &activation.node_id,
+            ActivationProbeState::Suspended,
+            now,
+        )?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(activation)
@@ -634,6 +698,12 @@ impl RunAssetStore {
         write_activation_metadata_file(&activation)?;
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        records::record_tmux_activation(
+            &mut candidate,
+            &activation,
+            &format!("resource_cleanup_{status}"),
+            now,
+        )?;
         write_manifest_file(&candidate)?;
         *manifest = candidate;
         Ok(activation)
@@ -671,6 +741,23 @@ impl RunAssetStore {
                 recorded_at_ms: now,
             });
         manifest.preservation_blocked = true;
+        let preservation_error = manifest
+            .preservation_errors
+            .last()
+            .expect("pushed preservation error should exist")
+            .clone();
+        records::record_preservation_failure(manifest, &preservation_error)?;
+        if let Some(activation_id) = activation_id
+            && let Some(activation) = manifest.activations.get(activation_id).cloned()
+        {
+            records::record_activation_probe(
+                manifest,
+                &activation.activation_id,
+                &activation.node_id,
+                ActivationProbeState::Suspended,
+                now,
+            )?;
+        }
         refresh_completion(manifest);
         let manifest_result = self.write_manifest(manifest);
         if let Some(activation) = updated_activation {
@@ -771,10 +858,134 @@ impl RunAssetStore {
         candidate.preservation_blocked = true;
         candidate.updated_at_ms = now;
         refresh_completion(&mut candidate);
+        let preservation_error = candidate
+            .preservation_errors
+            .last()
+            .expect("pushed preservation error should exist")
+            .clone();
+        records::record_preservation_failure(&mut candidate, &preservation_error)?;
+        records::record_activation_probe(
+            &mut candidate,
+            &activation.activation_id,
+            &activation.node_id,
+            ActivationProbeState::Suspended,
+            now,
+        )?;
         let _ = write_activation_metadata_file(&activation);
         let manifest_result = write_manifest_file(&candidate);
         *manifest = candidate;
         manifest_result
+    }
+
+    pub fn record_session_association(
+        &self,
+        manifest: &mut RunAssetManifest,
+        session_id: &str,
+        relation: SessionRelation,
+        activation_id: Option<&str>,
+    ) -> Result<(), RunAssetError> {
+        let now = self.now_ms();
+        records::record_session_relation(manifest, session_id, relation, activation_id, now)?;
+        self.write_manifest(manifest)
+    }
+
+    pub fn record_hook_fact(
+        &self,
+        manifest: &mut RunAssetManifest,
+        input: HookFactInput,
+    ) -> Result<u64, RunAssetError> {
+        let now = self.now_ms();
+        if let Some(activation_id) = input.activation_id.as_deref() {
+            if let Some(activation) = manifest.activations.get(activation_id)
+                && !activation.session_id.is_empty()
+                && activation.session_id != input.session_id
+            {
+                return Err(RunAssetError::new(format!(
+                    "hook session {} does not execute activation {activation_id}",
+                    input.session_id
+                )));
+            }
+            records::record_session_relation(
+                manifest,
+                &input.session_id,
+                SessionRelation::Executes,
+                Some(activation_id),
+                now,
+            )?;
+        }
+        let generation = records::record_hook_fact(manifest, input, now)?;
+        self.write_manifest(manifest)?;
+        Ok(generation)
+    }
+
+    pub fn record_runtime_event(
+        &self,
+        manifest: &mut RunAssetManifest,
+        event: &crate::runtime::Event,
+    ) -> Result<(), RunAssetError> {
+        let now = self.now_ms();
+        records::record_runtime_event(manifest, event, now)?;
+        self.write_manifest(manifest)
+    }
+
+    pub fn record_machine_input(
+        &self,
+        manifest: &mut RunAssetManifest,
+        role: &str,
+        record: &crate::input_ledger::MachineInputRecord,
+    ) -> Result<(), RunAssetError> {
+        let now = self.now_ms();
+        records::record_machine_input(manifest, role, record, now)?;
+        self.write_manifest(manifest)
+    }
+
+    pub fn record_qos_intent(
+        &self,
+        manifest: &mut RunAssetManifest,
+        qos: &crate::flow::FlowQosIntent,
+    ) -> Result<(), RunAssetError> {
+        let now = self.now_ms();
+        records::record_qos_intent(manifest, qos, now)?;
+        self.write_manifest(manifest)
+    }
+
+    pub fn record_topology_decision(
+        &self,
+        manifest: &mut RunAssetManifest,
+        input: TopologyDecisionInput,
+    ) -> Result<(), RunAssetError> {
+        let now = self.now_ms();
+        records::record_topology_decision(manifest, input, now)?;
+        self.write_manifest(manifest)
+    }
+
+    pub fn rebuild_record_index(
+        &self,
+        manifest: &RunAssetManifest,
+    ) -> Result<serde_json::Value, RunAssetError> {
+        records::rebuild_record_index(manifest).and_then(|index| {
+            serde_json::to_value(index).map_err(|err| {
+                RunAssetError::new(format!("serialize durable record index failed: {err}"))
+            })
+        })
+    }
+
+    pub fn manifest_json(
+        &self,
+        manifest: &RunAssetManifest,
+    ) -> Result<serde_json::Value, RunAssetError> {
+        let mut value = serde_json::to_value(manifest).map_err(|err| {
+            RunAssetError::new(format!("serialize run asset manifest failed: {err}"))
+        })?;
+        if let serde_json::Value::Object(object) = &mut value {
+            let record_index = records::record_index(manifest).and_then(|index| {
+                serde_json::to_value(index).map_err(|err| {
+                    RunAssetError::new(format!("serialize durable record index failed: {err}"))
+                })
+            })?;
+            object.insert("records".to_string(), record_index);
+        }
+        Ok(value)
     }
 
     fn write_manifest(&self, manifest: &mut RunAssetManifest) -> Result<(), RunAssetError> {
@@ -790,11 +1001,15 @@ impl RunAssetStore {
         }
     }
 
+    #[allow(deprecated)]
     fn selected_sink(&self) -> SelectedRunAssetSink {
         match &self.sink {
             RunAssetSink::Auto => selected_runtime_sink(),
+            RunAssetSink::HumanizeRunsDir(path) => {
+                SelectedRunAssetSink::HumanizeRunsDir(path.clone())
+            }
             RunAssetSink::SforgePatchDir(path) => {
-                SelectedRunAssetSink::SforgePatchDir(path.clone())
+                SelectedRunAssetSink::HumanizeRunsDir(path.clone())
             }
             RunAssetSink::CacheHome(path) => SelectedRunAssetSink::CacheHome(path.clone()),
             RunAssetSink::Root(path) => SelectedRunAssetSink::Root(path.clone()),
@@ -872,6 +1087,8 @@ fn existing_run_storage_error(run_id: &str, run_root: &Path) -> RunAssetError {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RunAssetSink {
     Auto,
+    HumanizeRunsDir(PathBuf),
+    #[deprecated(note = "use HumanizeRunsDir; runtime_default does not inspect SFORGE_PATCH_DIR")]
     SforgePatchDir(PathBuf),
     CacheHome(PathBuf),
     Root(PathBuf),
@@ -885,7 +1102,7 @@ enum RunAssetClock {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum SelectedRunAssetSink {
-    SforgePatchDir(PathBuf),
+    HumanizeRunsDir(PathBuf),
     CacheHome(PathBuf),
     Root(PathBuf),
 }
@@ -893,7 +1110,7 @@ enum SelectedRunAssetSink {
 impl SelectedRunAssetSink {
     fn name(&self) -> &'static str {
         match self {
-            Self::SforgePatchDir(_) => "sforge_patch_dir",
+            Self::HumanizeRunsDir(_) => "humanize_runs_dir",
             Self::CacheHome(_) => "cache_home",
             Self::Root(_) => "root",
         }
@@ -1085,11 +1302,11 @@ impl fmt::Display for RunAssetError {
 impl Error for RunAssetError {}
 
 fn selected_runtime_sink() -> SelectedRunAssetSink {
-    if let Some(path) = env::var_os("SFORGE_PATCH_DIR")
+    if let Some(path) = env::var_os("HUMANIZE_RUNS_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
     {
-        return SelectedRunAssetSink::SforgePatchDir(path);
+        return SelectedRunAssetSink::HumanizeRunsDir(path);
     }
 
     let home = env::var_os("HOME")
@@ -1158,6 +1375,21 @@ fn open_pipe_log_private(path: &Path) -> Result<PipeSinkIdentity, RunAssetError>
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {
     durable_fs::atomic_write_private(path, bytes)
+}
+
+pub(crate) fn append_private_line(path: &Path, line: &[u8]) -> Result<(), RunAssetError> {
+    durable_fs::append_private_line(path, line)
+}
+
+pub(crate) fn append_machine_input_ledger_direct(
+    path: &Path,
+    record: &crate::input_ledger::MachineInputRecord,
+) -> Result<(), RunAssetError> {
+    records::append_machine_input_ledger_direct(path, record)
+}
+
+pub(crate) fn read_regular_private(path: &Path) -> Result<Option<Vec<u8>>, RunAssetError> {
+    durable_fs::read_regular_private(path)
 }
 
 fn write_create_new_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {

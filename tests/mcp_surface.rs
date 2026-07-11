@@ -48,6 +48,7 @@ fn expected_tool_names() -> Vec<&'static str> {
         "deliver_artifact",
         "fanout_from_artifact",
         "record_effect",
+        "record_hook_fact",
         "patch_board",
         "activate_node",
         "send_message",
@@ -159,6 +160,7 @@ fn new_runtime_authoring_and_review_tool_groups_are_explicit() {
         "resume_run",
         "stop_run",
         "observe_stop",
+        "record_hook_fact",
     ] {
         assert!(runtime_names.contains(&name));
     }
@@ -511,7 +513,7 @@ fn cli_list_tools_emits_json_tool_descriptors() {
 fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
     let asset_root = child_asset_root("mcp-surface-stdio-assets");
     let mut child = Command::new(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
-        .env("SFORGE_PATCH_DIR", &asset_root)
+        .env("HUMANIZE_RUNS_DIR", &asset_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
