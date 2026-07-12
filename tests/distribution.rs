@@ -1,7 +1,13 @@
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
 
+use humanize_plugin::mcp::McpServer;
 use serde_json::Value;
+use serde_json::json;
+
+use support::mcp::{RecordingRunner, call_tool, structured};
 
 fn repo_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
@@ -131,8 +137,90 @@ fn readme_starts_with_production_install_flow_and_terse_prompt() {
 fn workflow_skill_explains_executable_tmux_agent_runs() {
     let skill = read_text("skills/humanize-workflows/SKILL.md");
 
-    assert!(skill.contains("tmux.agent_command"));
-    assert!(skill.contains("codex --dangerously-bypass-approvals-and-sandbox"));
-    assert!(skill.contains("autonomous tmux actuation directly launches agent nodes"));
-    assert!(skill.contains("script and review nodes require explicit orchestration"));
+    assert!(skill.contains("```sh\nexport HUMANIZE_TMUX_SESSION="));
+    assert!(skill.contains("HUMANIZE_TMUX_SESSION"));
+    assert!(skill.contains("HUMANIZE_AGENT_COMMAND"));
+    assert!(!skill.contains("\"HUMANIZE_TMUX_SESSION\":"));
+    assert!(skill.contains("Review nodes are agent-backed"));
+    assert!(skill.contains("Script action drivers are rejected before lock"));
+    assert!(skill.contains("When calling `deliver_artifact`, use the bare artifact id,"));
+    assert!(skill.contains("such as `baseline`, not the fact path `artifact.baseline`."));
+    assert!(!skill.contains("script and review nodes require explicit orchestration"));
+}
+
+#[test]
+fn workflow_skill_minimal_example_keeps_valid_adaptive_review_loop() {
+    let skill = read_text("skills/humanize-workflows/SKILL.md");
+    let example = fenced_block_after(&skill, "## Minimal Draft Example", "json");
+    let flow =
+        serde_json::from_str::<Value>(example).expect("minimal draft example should be valid JSON");
+
+    assert!(
+        flow["routes"]
+            .as_array()
+            .expect("minimal draft example should include routes")
+            .iter()
+            .any(
+                |route| route["predicate"] == "exists(artifact.review_continue)"
+                    && route["activate"] == "try_candidates"
+            )
+    );
+    assert!(!example.contains("artifact.review_verdict =="));
+    let resource_sources = flow["resources"]
+        .as_array()
+        .expect("minimal draft example should include resources")
+        .iter()
+        .filter_map(|resource| resource["source"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        resource_sources
+            .iter()
+            .any(|source| source.contains("artifact_key \"baseline\""))
+    );
+    assert!(
+        resource_sources
+            .iter()
+            .any(|source| source.contains("artifact_key \"candidates\""))
+    );
+    assert!(
+        resource_sources
+            .iter()
+            .any(|source| source.contains("artifact_key \"review_verdict\""))
+    );
+    assert!(
+        resource_sources
+            .iter()
+            .any(|source| source.contains("artifact_key \"review_continue\""))
+    );
+    assert!(!example.contains("Write artifact.review_continue"));
+
+    let mut server = McpServer::with_tmux_runner(RecordingRunner::default());
+    let checked = call_tool(
+        &mut server,
+        1,
+        "flow_check",
+        json!({
+            "flow": flow
+        }),
+    );
+
+    assert_eq!(structured(&checked)["ok"], true);
+    assert_eq!(structured(&checked)["diagnostics"], json!([]));
+}
+
+fn fenced_block_after<'a>(text: &'a str, anchor: &str, language: &str) -> &'a str {
+    let section = text
+        .split_once(anchor)
+        .unwrap_or_else(|| panic!("missing section {anchor}"))
+        .1;
+    let fence = format!("```{language}");
+    let after_fence = section
+        .split_once(&fence)
+        .unwrap_or_else(|| panic!("missing {language} fence after {anchor}"))
+        .1;
+    after_fence
+        .split_once("```")
+        .unwrap_or_else(|| panic!("missing closing fence after {anchor}"))
+        .0
+        .trim()
 }

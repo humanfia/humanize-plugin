@@ -456,13 +456,27 @@ pub fn flow_suggest(input: FlowSuggestInput) -> Result<FlowDraft, FlowSuggestErr
         input.nodes
     };
     let node_ids = unique_ascii_ids(&raw_nodes, "node");
+    let goal_separator = if matches!(goal.chars().last(), Some('.') | Some('!') | Some('?')) {
+        ""
+    } else {
+        "."
+    };
 
     let nodes = node_ids
         .iter()
         .map(|node_id| FlowNode {
             id: node_id.clone(),
             contract_id: Some(format!("contract.{node_id}")),
-            ..FlowNode::default()
+            action: Some(NodeAction {
+                driver: NodeDriver::Agent,
+                prompt_ref: Some(format!("prompt.{node_id}")),
+                resource_refs: vec!["readme.main".into()],
+                reads: Vec::new(),
+                writes: vec![format!("artifact.{artifact}")],
+                verdict_artifact: None,
+            }),
+            write_scopes: Vec::new(),
+            extensions: Vec::new(),
         })
         .collect::<Vec<_>>();
     let contracts = node_ids
@@ -485,6 +499,13 @@ pub fn flow_suggest(input: FlowSuggestInput) -> Result<FlowDraft, FlowSuggestErr
         id: format!("schema.{node_id}.{artifact}"),
         kind: ResourceKind::Schema,
         source: format!("inline:{artifact}"),
+    }));
+    resources.extend(node_ids.iter().map(|node_id| FlowResource {
+        id: format!("prompt.{node_id}"),
+        kind: ResourceKind::Prompt,
+        source: format!(
+            "inline:Run node {node_id} for goal: {goal}{goal_separator} Deliver artifact with artifact_key \"{artifact}\"."
+        ),
     }));
 
     Ok(FlowDraft {
@@ -878,6 +899,18 @@ pub fn flow_check(draft: &FlowDraft, mode: FlowCheckMode) -> CheckReport {
         }
 
         if let Some(action) = &node.action {
+            if action.driver == NodeDriver::Script {
+                diagnostics.push(Diagnostic::error(
+                    DiagnosticDomain::RuntimeCompat,
+                    "FLOW_UNSUPPORTED_SCRIPT_ACTION_DRIVER",
+                    format!("nodes[{}].action.driver", node.id),
+                    "script action drivers are not supported by autonomous tmux actuation",
+                    "Use an agent or review action with explicit prompt and artifact contracts.",
+                    "Runnable flows must not lock nodes that the runtime cannot autonomously actuate.",
+                    DiagnosticRepair::new(Repairability::GuidanceOnly, Vec::new()),
+                ));
+            }
+
             if let Some(prompt_ref) = &action.prompt_ref {
                 match resource_by_id.get(prompt_ref.as_str()) {
                     Some(ResourceKind::Prompt) => {}

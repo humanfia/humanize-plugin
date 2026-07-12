@@ -12,6 +12,7 @@ use crate::runtime::{
 use crate::view::VisualizationSnapshot;
 use serde_json::{Value, json};
 
+mod execution_defaults;
 mod flow_json;
 mod flow_parse;
 mod flow_tools;
@@ -26,6 +27,7 @@ mod tmux_tools;
 mod update_tools;
 mod view_tools;
 
+pub use execution_defaults::TmuxExecutionDefaults;
 pub use stdio::{
     serve_stdio, serve_stdio_signal_aware, serve_stdio_signal_aware_with_server,
     serve_stdio_with_server,
@@ -41,11 +43,16 @@ pub struct McpServer<R: CommandRunner = SystemCommandRunner> {
     state: McpServerState,
     tmux_adapter: TmuxAdapter<R>,
     run_asset_store: RunAssetStore,
+    execution_defaults: TmuxExecutionDefaults,
 }
 
 impl McpServer<SystemCommandRunner> {
     pub fn new() -> Self {
-        Self::with_tmux_runner(SystemCommandRunner)
+        Self::with_tmux_runner_run_asset_store_and_execution_defaults(
+            SystemCommandRunner,
+            RunAssetStore::runtime_default(),
+            TmuxExecutionDefaults::from_environment(),
+        )
     }
 }
 
@@ -61,11 +68,24 @@ impl<R: CommandRunner> McpServer<R> {
     }
 
     pub fn with_tmux_runner_and_run_asset_store(runner: R, run_asset_store: RunAssetStore) -> Self {
+        Self::with_tmux_runner_run_asset_store_and_execution_defaults(
+            runner,
+            run_asset_store,
+            TmuxExecutionDefaults::default(),
+        )
+    }
+
+    pub fn with_tmux_runner_run_asset_store_and_execution_defaults(
+        runner: R,
+        run_asset_store: RunAssetStore,
+        execution_defaults: TmuxExecutionDefaults,
+    ) -> Self {
         Self {
             surface: McpSurface,
             state: McpServerState::default(),
             tmux_adapter: TmuxAdapter::with_runner(runner),
             run_asset_store,
+            execution_defaults,
         }
     }
 
@@ -815,6 +835,7 @@ struct McpServerState {
     run_agent_commands: BTreeMap<String, String>,
     machine_inputs: BTreeMap<String, Vec<Value>>,
     actuation_warnings: BTreeMap<String, Vec<Value>>,
+    waiting_human: BTreeMap<String, Vec<Value>>,
     run_assets: BTreeMap<String, RunAssetManifest>,
     recorded_runtime_sequences: BTreeMap<String, u64>,
     shutdown_requested: bool,
@@ -997,7 +1018,7 @@ fn run_not_found_guidance(run_id: &str) -> Value {
     })
 }
 
-const SERVER_INSTRUCTIONS: &str = "When a user asks to use Humanize or workflow, start with flow_suggest from the terse natural-language request, then call flow_check, flow_lock, prepare_flow_review, approve_flow_review with an approved or bypassed decision, and run_flow; do not substitute ordinary repo exploration for this workflow. Validate that the flow package includes a README before locking or running.";
+const SERVER_INSTRUCTIONS: &str = "When a user asks to use Humanize or workflow, start with flow_suggest from the terse natural-language request, then call flow_check, flow_lock, prepare_flow_review, approve_flow_review with an approved or bypassed decision, and run_flow; do not substitute ordinary repo exploration for this workflow. Validate that the flow package includes a README before locking or running. Agent and review nodes require an autonomous tmux context from HUMANIZE_TMUX_SESSION and HUMANIZE_AGENT_COMMAND, or run_flow fails before starting.";
 
 fn initialize_result() -> Value {
     json!({

@@ -153,6 +153,7 @@ fn run_snapshot_old_struct_literal_still_compiles() {
         stop_decisions: Vec::new(),
         machine_inputs: Vec::new(),
         actuation_warnings: Vec::new(),
+        waiting_human: Vec::new(),
         why: None,
     };
 

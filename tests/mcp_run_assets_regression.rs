@@ -78,8 +78,8 @@ fn unlocked_dynamic_activation_is_registered_and_captured_for_tmux_run() {
 }
 
 #[test]
-fn routed_non_agent_activation_is_captured_when_tmux_is_allocated() {
-    let asset_root = test_temp_dir("mcp-assets-routed-script-capture");
+fn routed_plain_activation_is_captured_when_tmux_is_allocated() {
+    let asset_root = test_temp_dir("mcp-assets-routed-plain-capture");
     let runner = RecordingRunner::with_outputs(vec![
         CommandOutput::failure("missing session"),
         CommandOutput::success("%7\t%8\n"),
@@ -95,10 +95,7 @@ fn routed_non_agent_activation_is_captured_when_tmux_is_allocated() {
         json!({
             "nodes": [
                 { "id": "root" },
-                {
-                    "id": "finish",
-                    "action": { "driver": "script" }
-                }
+                { "id": "finish" }
             ],
             "resources": [support::mcp::readme_resource()],
             "routes": [
@@ -114,7 +111,7 @@ fn routed_non_agent_activation_is_captured_when_tmux_is_allocated() {
         2,
         "run_flow",
         json!({
-            "run_id": "run-routed-script",
+            "run_id": "run-routed-plain",
             "flow_lock_id": lock_id,
             "content_hash": content_hash,
             "review_required": false,
@@ -131,7 +128,7 @@ fn routed_non_agent_activation_is_captured_when_tmux_is_allocated() {
         3,
         "deliver_artifact",
         json!({
-            "run_id": "run-routed-script",
+            "run_id": "run-routed-plain",
             "activation_id": "root",
             "artifact_key": "ready",
             "payload": "true"
@@ -143,7 +140,7 @@ fn routed_non_agent_activation_is_captured_when_tmux_is_allocated() {
         &mut server,
         4,
         "resume_run",
-        json!({ "run_id": "run-routed-script" }),
+        json!({ "run_id": "run-routed-plain" }),
     );
 
     assert_eq!(structured(&resumed)["ok"], true);
@@ -151,7 +148,7 @@ fn routed_non_agent_activation_is_captured_when_tmux_is_allocated() {
         structured(&resumed)["tmux_allocations"][0]["activation_id"],
         "finish"
     );
-    let manifest = read_manifest(&asset_root, "run-routed-script");
+    let manifest = read_manifest(&asset_root, "run-routed-plain");
     assert_eq!(
         manifest["activations"]["finish"]["preservation_status"],
         "capturing"

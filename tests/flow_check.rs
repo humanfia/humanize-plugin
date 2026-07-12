@@ -160,7 +160,16 @@ fn flow_suggest_builds_default_valid_skeleton() {
         vec![FlowNode {
             id: "root".into(),
             contract_id: Some("contract.root".into()),
-            ..FlowNode::default()
+            action: Some(NodeAction {
+                driver: NodeDriver::Agent,
+                prompt_ref: Some("prompt.root".into()),
+                resource_refs: vec!["readme.main".into()],
+                reads: Vec::new(),
+                writes: vec!["artifact.result".into()],
+                verdict_artifact: None,
+            }),
+            write_scopes: Vec::new(),
+            extensions: Vec::new(),
         }]
     );
     assert_eq!(
@@ -187,13 +196,40 @@ fn flow_suggest_builds_default_valid_skeleton() {
                 kind: ResourceKind::Schema,
                 source: "inline:result".into(),
             },
+            FlowResource {
+                id: "prompt.root".into(),
+                kind: ResourceKind::Prompt,
+                source:
+                    "inline:Run node root for goal: Summarize release risk. Deliver artifact with artifact_key \"result\"."
+                        .into(),
+            },
         ]
     );
     assert_eq!(draft.routes, Vec::<FlowRoute>::new());
     assert_eq!(draft.imports, Vec::<FlowImport>::new());
     assert_eq!(draft.policies, FlowPolicies::default());
     assert_eq!(draft.extensions, Vec::<String>::new());
-    assert!(draft.nodes.iter().all(|node| node.action.is_none()));
+    assert_eq!(
+        draft.nodes[0].action,
+        Some(NodeAction {
+            driver: NodeDriver::Agent,
+            prompt_ref: Some("prompt.root".into()),
+            resource_refs: vec!["readme.main".into()],
+            reads: Vec::new(),
+            writes: vec!["artifact.result".into()],
+            verdict_artifact: None,
+        })
+    );
+    assert_eq!(
+        draft.resources[2],
+        FlowResource {
+            id: "prompt.root".into(),
+            kind: ResourceKind::Prompt,
+            source:
+                "inline:Run node root for goal: Summarize release risk. Deliver artifact with artifact_key \"result\"."
+                    .into(),
+        }
+    );
     assert_eq!(
         flow_check(&draft, FlowCheckMode::Core).diagnostics,
         Vec::new()
@@ -231,6 +267,50 @@ fn action_descriptor_is_valid_when_prompt_resource_refs_and_fact_paths_exist() {
     let report = flow_check(&draft, FlowCheckMode::Core);
 
     assert_eq!(report.diagnostics, Vec::new());
+}
+
+#[test]
+fn flow_check_rejects_script_action_driver_before_lock() {
+    let mut draft = valid_draft();
+    draft.resources.push(FlowResource {
+        id: "script.freeze".into(),
+        kind: ResourceKind::Script,
+        source: "scripts/freeze_task.sh".into(),
+    });
+    draft.nodes[0].id = "freeze_task".into();
+    draft.nodes[0].action = Some(NodeAction {
+        driver: NodeDriver::Script,
+        prompt_ref: None,
+        resource_refs: vec!["script.freeze".into()],
+        reads: Vec::new(),
+        writes: vec!["artifact.handoff".into()],
+        verdict_artifact: None,
+    });
+
+    let report = flow_check(&draft, FlowCheckMode::Core);
+
+    assert_eq!(
+        diagnostic_codes(&report.diagnostics),
+        vec!["FLOW_UNSUPPORTED_SCRIPT_ACTION_DRIVER"]
+    );
+    assert_eq!(
+        report.diagnostics[0].domain,
+        DiagnosticDomain::RuntimeCompat
+    );
+    assert_eq!(
+        report.diagnostics[0].severity_level,
+        DiagnosticSeverity::Error
+    );
+    assert_eq!(
+        report.diagnostics[0].location,
+        "nodes[freeze_task].action.driver"
+    );
+
+    let err = flow_lock(&draft, FlowCheckMode::Core).unwrap_err();
+    assert_eq!(
+        diagnostic_codes(&err.diagnostics),
+        vec!["FLOW_UNSUPPORTED_SCRIPT_ACTION_DRIVER"]
+    );
 }
 
 #[test]

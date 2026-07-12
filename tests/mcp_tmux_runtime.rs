@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use humanize_plugin::adapters::tmux::{CommandOutput, CommandRunner};
-use humanize_plugin::mcp::McpServer;
+use humanize_plugin::mcp::{McpServer, TmuxExecutionDefaults};
 use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::json;
 
@@ -29,6 +29,24 @@ fn isolated_server<R: CommandRunner>(runner: R) -> McpServer<R> {
 
 fn isolated_default_server() -> McpServer<RecordingRunner> {
     isolated_server(RecordingRunner::default())
+}
+
+fn isolated_server_with_defaults<R: CommandRunner>(
+    runner: R,
+    defaults: TmuxExecutionDefaults,
+) -> McpServer<R> {
+    let index = NEXT_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("temp")
+        .join(format!("mcp-tmux-runtime-assets-with-defaults-{index}"));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    McpServer::with_tmux_runner_run_asset_store_and_execution_defaults(
+        runner,
+        RunAssetStore::new(RunAssetSink::Root(root)),
+        defaults,
+    )
 }
 
 #[test]
@@ -311,12 +329,7 @@ fn resume_run_allocates_tmux_panes_for_route_created_activations() {
         json!({
             "nodes": [
                 { "id": "root" },
-                {
-                    "id": "finish",
-                    "action": {
-                        "driver": "agent"
-                    }
-                }
+                { "id": "finish" }
             ],
             "resources": [support::mcp::readme_resource()],
             "routes": [
@@ -483,12 +496,8 @@ fn observe_stop_releases_satisfied_tmux_activation_pane() {
 }
 
 #[test]
-fn run_flow_locked_agent_node_warns_without_agent_command() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::failure("missing session"),
-        CommandOutput::success("%7\t%8\n"),
-        CommandOutput::success(""),
-    ]);
+fn run_flow_locked_agent_node_requires_tmux_context_before_start() {
+    let runner = RecordingRunner::default();
     let mut server = isolated_server(runner.clone());
     let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
 
@@ -509,21 +518,211 @@ fn run_flow_locked_agent_node_warns_without_agent_command() {
         }),
     );
 
-    assert_eq!(structured(&started)["ok"], true);
-    assert_eq!(structured(&started)["actuation"]["sent"], json!([]));
+    assert_eq!(structured(&started)["ok"], false);
     assert_eq!(
-        structured(&started)["actuation_warnings"],
-        json!([
-            {
-                "activation_id": "root",
-                "node_id": "root",
-                "driver": "agent",
-                "message": "tmux.agent_command is required before autonomous agent actuation"
-            }
-        ])
+        structured(&started)["error"],
+        "autonomous tmux execution context required"
     );
+    assert_eq!(
+        structured(&started)["missing"],
+        json!(["tmux.agent_command"])
+    );
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": "run-agent-no-command"
+        }),
+    );
+    assert_eq!(status["error"]["code"], -32602);
+}
+
+#[test]
+fn run_flow_locked_agent_node_without_tmux_object_fails_before_start() {
+    let runner = RecordingRunner::default();
+    let mut server = isolated_server(runner.clone());
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-agent-no-tmux-object",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], false);
+    assert_eq!(
+        structured(&started)["error"],
+        "autonomous tmux execution context required"
+    );
+    assert_eq!(
+        structured(&started)["missing"],
+        json!(["tmux.session", "tmux.agent_command"])
+    );
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": "run-agent-no-tmux-object"
+        }),
+    );
+    assert_eq!(status["error"]["code"], -32602);
+}
+
+#[test]
+fn run_flow_locked_agent_node_respects_explicit_tmux_disabled_over_defaults() {
+    let runner = RecordingRunner::default();
+    let defaults = TmuxExecutionDefaults {
+        session: Some("host-a".into()),
+        window: None,
+        agent_command: Some("humanize-test-agent".into()),
+    };
+    let mut server = isolated_server_with_defaults(runner.clone(), defaults);
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-agent-disabled-tmux",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false,
+            "tmux": {
+                "enabled": false
+            }
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], false);
+    assert_eq!(
+        structured(&started)["error"],
+        "autonomous tmux execution context required"
+    );
+    assert_eq!(structured(&started)["missing"], json!(["tmux.enabled"]));
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": "run-agent-disabled-tmux"
+        }),
+    );
+    assert_eq!(status["error"]["code"], -32602);
+}
+
+#[test]
+fn run_flow_locked_agent_node_merges_explicit_session_with_default_command() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("explicit-host\t%7\trun-agent-partial-tmux\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("explicit-host\t%7\trun-agent-partial-tmux\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+    ]);
+    let defaults = TmuxExecutionDefaults {
+        session: Some("default-host".into()),
+        window: None,
+        agent_command: Some("humanize-test-agent".into()),
+    };
+    let mut server = isolated_server_with_defaults(runner.clone(), defaults);
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-agent-partial-tmux",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false,
+            "tmux": {
+                "enabled": true,
+                "session": "explicit-host"
+            }
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(structured(&started)["tmux"]["session_id"], "explicit-host");
+    assert_eq!(
+        structured(&started)["tmux"]["window_name"],
+        "run-agent-partial-tmux"
+    );
+    let sent = &structured(&started)["actuation"]["sent"][0];
+    assert_eq!(sent["agent_command"], "humanize-test-agent");
+    assert_eq!(sent["session_id"], "explicit-host");
     let calls = runner.calls();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[0],
+        argv(vec![vec!["tmux", "has-session", "-t", "explicit-host"]]).remove(0)
+    );
+}
+
+#[test]
+fn run_flow_locked_agent_node_uses_configured_default_tmux_context() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-agent-defaults\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-agent-defaults\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+    ]);
+    let defaults = TmuxExecutionDefaults {
+        session: Some("host-a".into()),
+        window: None,
+        agent_command: Some("humanize-test-agent".into()),
+    };
+    let mut server = isolated_server_with_defaults(runner.clone(), defaults);
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-agent-defaults",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false
+        }),
+    );
+
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(structured(&started)["tmux"]["enabled"], true);
+    assert_eq!(
+        structured(&started)["tmux"]["window_name"],
+        "run-agent-defaults"
+    );
+    assert_eq!(structured(&started)["actuation_warnings"], json!([]));
+    let sent = &structured(&started)["actuation"]["sent"][0];
+    assert_eq!(sent["driver"], "agent");
+    assert_eq!(sent["agent_command"], "humanize-test-agent");
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 9);
     assert_eq!(
         calls[0],
         argv(vec![vec!["tmux", "has-session", "-t", "host-a"]]).remove(0)
@@ -540,15 +739,119 @@ fn run_flow_locked_agent_node_warns_without_agent_command() {
             "-s",
             "host-a",
             "-n",
-            "flow-a",
+            "run-agent-defaults",
         ]])
         .remove(0)
     );
-    assert_eq!(
-        &calls[2][..5],
-        ["tmux", "pipe-pane", "-o", "-t", "host-a:%7.%8"]
+}
+
+#[test]
+fn run_flow_suggested_flow_uses_bare_artifact_key_for_stop_and_routes() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-suggested-route\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-suggested-route\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("%9\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-suggested-route\t%9\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-suggested-route\t%9\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+    ]);
+    let defaults = TmuxExecutionDefaults {
+        session: Some("host-a".into()),
+        window: None,
+        agent_command: Some("humanize-test-agent".into()),
+    };
+    let mut server = isolated_server_with_defaults(runner, defaults);
+    let suggested = call_tool(
+        &mut server,
+        1,
+        "flow_suggest",
+        json!({
+            "goal": "Draft a concise migration brief.",
+            "nodes": ["Collect facts", "Review output"],
+            "artifact": "Brief"
+        }),
     );
-    assert_pipe_command(&calls[2], "host-a:%7.%8");
+    let mut flow = structured(&suggested)["flow"].clone();
+    flow["routes"] = json!([
+        {
+            "predicate": "exists(artifact.brief)",
+            "activate": "review_output"
+        }
+    ]);
+    assert!(
+        flow["resources"][3]["source"]
+            .as_str()
+            .expect("prompt source should be a string")
+            .contains("artifact_key \"brief\"")
+    );
+    assert!(
+        !flow["resources"][3]["source"]
+            .as_str()
+            .expect("prompt source should be a string")
+            .contains("artifact.brief")
+    );
+    let (lock_id, content_hash) = lock_flow(&mut server, 2, flow);
+
+    let started = call_tool(
+        &mut server,
+        3,
+        "run_flow",
+        json!({
+            "run_id": "run-suggested-route",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false
+        }),
+    );
+    assert_eq!(
+        structured(&started)["activation_ids"],
+        json!(["collect_facts"])
+    );
+
+    let delivered = call_tool(
+        &mut server,
+        4,
+        "deliver_artifact",
+        json!({
+            "run_id": "run-suggested-route",
+            "activation_id": "collect_facts",
+            "artifact_key": "brief",
+            "payload": "ready"
+        }),
+    );
+    assert_eq!(structured(&delivered)["ok"], true);
+    assert_eq!(structured(&delivered)["artifact_key"], "brief");
+
+    let observed = call_tool(
+        &mut server,
+        5,
+        "observe_stop",
+        json!({
+            "run_id": "run-suggested-route",
+            "activation_id": "collect_facts",
+            "reason": "brief delivered"
+        }),
+    );
+    assert_eq!(structured(&observed)["ok"], true);
+    assert_eq!(
+        structured(&observed)["stop_decisions"][0]["decision"],
+        "allow"
+    );
+    assert_eq!(
+        structured(&observed)["tmux_allocations"][0]["activation_id"],
+        "review_output"
+    );
 }
 
 #[test]
@@ -723,6 +1026,131 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
     );
 }
 
+#[test]
+fn run_flow_locked_review_node_launches_agent_with_review_prompt() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::failure("missing session"),
+        CommandOutput::success("%7\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-review-defaults\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\trun-review-defaults\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+    ]);
+    let defaults = TmuxExecutionDefaults {
+        session: Some("host-a".into()),
+        window: None,
+        agent_command: Some("humanize-test-agent".into()),
+    };
+    let mut server = isolated_server_with_defaults(runner.clone(), defaults);
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_review_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-review-defaults",
+            "flow_lock_id": lock_id.clone(),
+            "content_hash": content_hash,
+            "review_required": false
+        }),
+    );
+
+    let expected_prompt = "Review the collected facts.\n\nResources:\nreadme.main (readme): Use Humanize to audit this library without editing files.";
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(structured(&started)["actuation_warnings"], json!([]));
+    let sent = &structured(&started)["actuation"]["sent"][0];
+    assert_eq!(sent["activation_id"], "review");
+    assert_eq!(sent["node_id"], "review");
+    assert_eq!(sent["driver"], "review");
+    assert_eq!(sent["agent_command"], "humanize-test-agent");
+
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": "run-review-defaults"
+        }),
+    );
+    let machine_inputs = structured(&status)["context"]["machine_inputs"]
+        .as_array()
+        .expect("machine inputs should be exposed in run status");
+    assert_eq!(machine_inputs[0]["role"], "agent_launch");
+    assert_eq!(machine_inputs[1]["role"], "node_prompt");
+    assert_eq!(machine_inputs[1]["normalized_text"], expected_prompt);
+    assert_eq!(runner.calls().len(), 9);
+
+    let exported = call_tool(
+        &mut server,
+        4,
+        "flow_export",
+        json!({
+            "flow_lock_id": lock_id,
+            "format": "json"
+        }),
+    );
+    let document = structured(&exported)["document"]
+        .as_str()
+        .expect("flow_export should include a document");
+    let exported_json = serde_json::from_str::<serde_json::Value>(document)
+        .expect("exported review flow should be JSON");
+    let content = exported_json["content"]
+        .as_str()
+        .expect("exported review flow should include normalized content");
+    assert!(content.contains("\"driver\":\"review\""));
+    assert!(content.contains("\"prompt_ref\":\"prompt.review\""));
+    assert!(content.contains("\"verdict_artifact\":\"artifact.review_verdict\""));
+}
+
+#[test]
+fn run_flow_locked_human_node_waits_without_tmux_actuation() {
+    let runner = RecordingRunner::default();
+    let mut server = isolated_server(runner.clone());
+    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_human_flow());
+
+    let started = call_tool(
+        &mut server,
+        2,
+        "run_flow",
+        json!({
+            "run_id": "run-human-wait",
+            "flow_lock_id": lock_id,
+            "content_hash": content_hash,
+            "review_required": false
+        }),
+    );
+
+    let waiting = json!([
+        {
+            "activation_id": "human_review",
+            "node_id": "human_review",
+            "driver": "human",
+            "status": "waiting_human",
+            "message": "human action is waiting for external input"
+        }
+    ]);
+    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(structured(&started)["tmux"]["enabled"], false);
+    assert_eq!(structured(&started)["actuation"]["sent"], json!([]));
+    assert_eq!(structured(&started)["actuation"]["waiting_human"], waiting);
+    assert_eq!(structured(&started)["actuation_warnings"], json!([]));
+    assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+
+    let status = call_tool(
+        &mut server,
+        3,
+        "run_status",
+        json!({
+            "run_id": "run-human-wait"
+        }),
+    );
+    assert_eq!(structured(&status)["context"]["waiting_human"], waiting);
+}
+
 #[cfg(unix)]
 #[test]
 fn run_flow_propagates_durable_machine_input_store_error() {
@@ -865,46 +1293,21 @@ fn run_status_exposes_stop_decision_detail_after_observe_stop() {
 }
 
 #[test]
-fn run_flow_locked_unsupported_driver_reports_actuation_warning_in_status() {
+fn flow_lock_rejects_unsupported_script_driver_before_run() {
     let mut server = isolated_default_server();
-    let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_script_flow());
-
-    let started = call_tool(
+    let locked = call_tool(
         &mut server,
-        2,
-        "run_flow",
+        1,
+        "flow_lock",
         json!({
-            "run_id": "run-script-warning",
-            "flow_lock_id": lock_id,
-            "content_hash": content_hash,
-            "review_required": false
+            "flow": locked_script_flow()
         }),
     );
 
-    let expected_warning = json!({
-        "activation_id": "root",
-        "node_id": "root",
-        "driver": "script",
-        "message": "action driver is not supported for autonomous tmux actuation"
-    });
-    assert_eq!(structured(&started)["ok"], true);
+    assert_eq!(locked["result"]["isError"], true);
     assert_eq!(
-        structured(&started)["actuation_warnings"],
-        json!([expected_warning])
-    );
-
-    let status = call_tool(
-        &mut server,
-        3,
-        "run_status",
-        json!({
-            "run_id": "run-script-warning"
-        }),
-    );
-
-    assert_eq!(
-        structured(&status)["context"]["actuation_warnings"],
-        json!([expected_warning])
+        structured(&locked)["diagnostics"][0]["code"],
+        "FLOW_UNSUPPORTED_SCRIPT_ACTION_DRIVER"
     );
 }
 
@@ -1117,6 +1520,56 @@ fn locked_script_flow() -> serde_json::Value {
                 "id": "script.collect",
                 "kind": "script",
                 "source": "scripts/collect.sh"
+            }
+        ]
+    })
+}
+
+fn locked_review_flow() -> serde_json::Value {
+    json!({
+        "nodes": [
+            {
+                "id": "review",
+                "action": {
+                    "driver": "review",
+                    "prompt_ref": "prompt.review",
+                    "resource_refs": ["readme.main"],
+                    "writes": ["artifact.review_verdict"],
+                    "verdict_artifact": "artifact.review_verdict"
+                }
+            }
+        ],
+        "resources": [
+            {
+                "id": "readme.main",
+                "kind": "readme",
+                "source": "inline:Use Humanize to audit this library without editing files."
+            },
+            {
+                "id": "prompt.review",
+                "kind": "prompt",
+                "source": "inline:Review the collected facts."
+            }
+        ]
+    })
+}
+
+fn locked_human_flow() -> serde_json::Value {
+    json!({
+        "nodes": [
+            {
+                "id": "human_review",
+                "action": {
+                    "driver": "human",
+                    "writes": ["artifact.human_decision"]
+                }
+            }
+        ],
+        "resources": [
+            {
+                "id": "readme.main",
+                "kind": "readme",
+                "source": "inline:Wait for a human decision before continuing."
             }
         ]
     })

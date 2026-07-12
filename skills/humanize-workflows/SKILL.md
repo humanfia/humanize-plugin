@@ -51,29 +51,25 @@ perfect-looking graph.
 
 ## Executable tmux Runs
 
-When a locked flow contains agent nodes, pass `tmux.agent_command` to
-`run_flow`. Resolve the current tmux session instead of hardcoding it, choose a
-unique workflow window for the run, and launch an interactive coding agent:
+The runtime autonomously maintains agent-backed nodes through tmux. Configure
+the MCP server with an execution context before starting a long-running flow:
 
-```json
-{
-  "run_id": "task-run",
-  "flow_lock_id": "flow-lock-id",
-  "tmux": {
-    "enabled": true,
-    "session": "current-session-name",
-    "window": "task-run",
-    "agent_command": "codex --dangerously-bypass-approvals-and-sandbox"
-  }
-}
+```sh
+export HUMANIZE_TMUX_SESSION="$(tmux display-message -p '#S')"
+export HUMANIZE_AGENT_COMMAND="agent-command"
 ```
 
-Use `tmux display-message -p '#S'` to discover the current session. The coding
-agent inherits the container environment and its installed Humanize MCP
-configuration. Current autonomous tmux actuation directly launches agent nodes;
-script and review nodes require explicit orchestration by the main agent or an
-agent node that performs and records the deterministic or review action. Treat
-an actuation warning as an execution gap, not as successful node completion.
+`HUMANIZE_TMUX_WINDOW` is optional; when it is absent, `run_flow` uses the
+`run_id` as the window name. A call with only `run_id`, `flow_lock_id`, and
+review identifiers is valid when these defaults are configured. If the context
+is missing, `run_flow` fails before starting the run.
+
+Agent and review action drivers are agent-backed and are actuated through tmux.
+Script action drivers are rejected before lock until they have an explicit
+runtime execution contract. For deterministic shell work, use an agent-backed
+node that runs the command, records the artifact, and stops under its contract.
+Treat any actuation warning as an execution gap, not as successful node
+completion.
 
 ## Flow Architecture
 
@@ -98,16 +94,17 @@ a review or guard that decides whether to continue, branch, or finish.
 
 - Start by naming the durable value: bug fix, benchmark improvement, migration
   patch, audit report, release packet, reproduction evidence, or test suite.
-- Freeze the operator-owned task contract early with a script or human node.
-  Later agent nodes should read this artifact instead of reinterpreting the
-  original request.
+- Freeze the operator-owned task contract early with an agent-backed node.
+  Later nodes should read this artifact instead of reinterpreting the original
+  request.
 - Make each agent node own one coherent lane. Use separate lanes for
   investigation, implementation, testing, documentation, performance
   hypotheses, or candidate variants.
-- Use script nodes for deterministic checks, materialization, benchmark runs,
-  route classification, archive creation, and evidence guards.
+- Use agent-backed nodes for deterministic checks, materialization, benchmark
+  runs, route classification, archive creation, and evidence guards.
 - Use review nodes for judgment: accept, revise, reject, promote, continue, or
-  finish. A review node should write a verdict artifact that routes can test.
+  finish. Review nodes are agent-backed and should write a verdict artifact
+  that routes can test.
 - Use routes for adaptation. Branch on reproduced vs not reproduced, patch vs
   no-code evidence, benchmark winner, review verdict, missing artifact, or
   validation failure.
@@ -148,8 +145,8 @@ For a measured optimization task, use a shape like this:
       "id": "capture_baseline",
       "contract_id": "contract.baseline",
       "action": {
-        "driver": "script",
-        "resource_refs": ["script.benchmark"],
+        "driver": "agent",
+        "prompt_ref": "prompt.baseline",
         "writes": ["artifact.baseline"]
       }
     },
@@ -170,7 +167,7 @@ For a measured optimization task, use a shape like this:
         "driver": "review",
         "prompt_ref": "prompt.review",
         "reads": ["artifact.baseline", "artifact.candidates"],
-        "writes": ["artifact.review_verdict"],
+        "writes": ["artifact.review_verdict", "artifact.review_continue"],
         "verdict_artifact": "artifact.review_verdict"
       }
     }
@@ -217,7 +214,7 @@ For a measured optimization task, use a shape like this:
       "activate": "review_selection"
     },
     {
-      "predicate": "artifact.review_verdict == \"continue\"",
+      "predicate": "exists(artifact.review_continue)",
       "activate": "try_candidates"
     }
   ],
@@ -228,19 +225,19 @@ For a measured optimization task, use a shape like this:
       "source": "inline:Measured optimization flow with baseline, candidate search, review, and loop."
     },
     {
+      "id": "prompt.baseline",
+      "kind": "prompt",
+      "source": "inline:Run the benchmark command and deliver the result with artifact_key \"baseline\"."
+    },
+    {
       "id": "prompt.optimize",
       "kind": "prompt",
-      "source": "inline:Generate and test one bounded candidate improvement."
+      "source": "inline:Generate and test one bounded candidate improvement, then deliver it with artifact_key \"candidates\"."
     },
     {
       "id": "prompt.review",
       "kind": "prompt",
-      "source": "inline:Choose finish or continue based on measured evidence."
-    },
-    {
-      "id": "script.benchmark",
-      "kind": "script",
-      "source": "inline:run benchmark command and write artifact.baseline"
+      "source": "inline:Deliver artifact_key \"review_verdict\" with finish or continue. Also deliver artifact_key \"review_continue\" only when another candidate is needed."
     },
     {
       "id": "schema.baseline",
@@ -256,13 +253,21 @@ For a measured optimization task, use a shape like this:
       "id": "schema.review_verdict",
       "kind": "schema",
       "source": "inline:verdict string finish or continue with reason"
+    },
+    {
+      "id": "schema.review_continue",
+      "kind": "schema",
+      "source": "inline:optional continue marker with reason"
     }
   ]
 }
 ```
 
 This is only a shape. Adapt the node names, artifacts, resources, and routes to
-the task. Keep contracts and schemas aligned with the actual artifacts.
+the task. Keep contracts and schemas aligned with the actual artifacts. In this
+example, the review node finishes by delivering only artifact key
+`review_verdict`; it continues by also delivering artifact key
+`review_continue`, which triggers another candidate run.
 
 ## Contract Rules
 
@@ -270,9 +275,10 @@ the task. Keep contracts and schemas aligned with the actual artifacts.
   output is side-effect work, use `manual` completion and still record evidence.
 - A README must be authored for the package. Do not rely on a placeholder that
   only repeats the terse user goal.
-- Artifact names should be semantic and stable, such as
-  `artifact.baseline`, `artifact.hypotheses`, `artifact.validation`,
-  `artifact.review_verdict`, and `artifact.archive`.
+- Flow fact paths should be semantic and stable, such as `artifact.baseline`,
+  `artifact.hypotheses`, `artifact.validation`, `artifact.review_verdict`, and
+  `artifact.archive`. When calling `deliver_artifact`, use the bare artifact id,
+  such as `baseline`, not the fact path `artifact.baseline`.
 - Schemas can be lightweight, but every required artifact should have either a
   schema resource or a concise prompt resource describing the expected shape.
 - Review and guard outputs should be route-friendly: use small verdict strings

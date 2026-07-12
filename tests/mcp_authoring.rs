@@ -69,21 +69,30 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
             {
                 "id": "collect_facts",
                 "contract_id": "contract.collect_facts",
+                "action": {
+                    "driver": "agent",
+                    "prompt_ref": "prompt.collect_facts",
+                    "resource_refs": ["readme.main"],
+                    "reads": [],
+                    "writes": ["artifact.brief"]
+                },
                 "write_scopes": [],
                 "extensions": []
             },
             {
                 "id": "review_output",
                 "contract_id": "contract.review_output",
+                "action": {
+                    "driver": "agent",
+                    "prompt_ref": "prompt.review_output",
+                    "resource_refs": ["readme.main"],
+                    "reads": [],
+                    "writes": ["artifact.brief"]
+                },
                 "write_scopes": [],
                 "extensions": []
             }
         ])
-    );
-    assert!(
-        structured(&suggested)["flow"]["nodes"][0]
-            .get("action")
-            .is_none()
     );
     assert_eq!(
         structured(&suggested)["flow"]["contracts"][0],
@@ -104,6 +113,22 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
             "id": "readme.main",
             "kind": "readme",
             "source": "inline:Draft a concise migration brief."
+        })
+    );
+    assert_eq!(
+        structured(&suggested)["flow"]["resources"][3],
+        json!({
+            "id": "prompt.collect_facts",
+            "kind": "prompt",
+            "source": "inline:Run node collect_facts for goal: Draft a concise migration brief. Deliver artifact with artifact_key \"brief\"."
+        })
+    );
+    assert_eq!(
+        structured(&suggested)["flow"]["resources"][4],
+        json!({
+            "id": "prompt.review_output",
+            "kind": "prompt",
+            "source": "inline:Run node review_output for goal: Draft a concise migration brief. Deliver artifact with artifact_key \"brief\"."
         })
     );
     assert_eq!(structured(&suggested)["flow"]["routes"], json!([]));
