@@ -64,7 +64,7 @@ unique workflow window for the run, and launch an interactive coding agent:
     "session": "current-session-name",
     "window": "task-run",
     "agent_command": "codex --dangerously-bypass-approvals-and-sandbox",
-    "agent_ready_pattern": "Use /skills to list available skills",
+    "agent_ready_pattern": "gpt-5.6-sol ultra",
     "agent_ready_timeout_ms": 60000,
     "prompt_submit_key_count": 2
   }
