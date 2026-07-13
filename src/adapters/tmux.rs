@@ -801,7 +801,7 @@ impl TmuxInputTransactionConfig {
             ledger: MachineInputLedger::runtime_default(),
             clock: MachineInputClock::realtime(),
             submit_key_count: 1,
-            prompt_to_submit_delay: Duration::from_millis(250),
+            prompt_to_submit_delay: Duration::from_secs(5),
             submit_key_delay: Duration::from_millis(250),
         }
     }
