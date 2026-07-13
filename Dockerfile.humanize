@@ -6,5 +6,8 @@ COPY . /src
 RUN cargo install --path /src --bin humanize-plugin-mcp --root /out --locked
 
 FROM flowbench-runtime:gpu-kernelws
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tmux \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/bin/humanize-plugin-mcp /usr/local/bin/humanize-plugin-mcp
 RUN humanize-plugin-mcp --version && humanize-plugin-mcp --list-tools >/dev/null && echo "humanize-plugin-mcp OK"
