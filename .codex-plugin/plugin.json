@@ -1,6 +1,6 @@
 {
   "name": "humanize-plugin",
-  "version": "0.1.0+codex.20260713164047",
+  "version": "0.1.0+codex.20260713170827",
   "description": "Humanize workflow authoring and runtime tools for local MCP clients.",
   "author": {
     "name": "humanfia",
