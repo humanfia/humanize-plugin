@@ -52,7 +52,8 @@ fn start_run_creates_pending_manifest_and_captures_non_agent_tmux_panes() {
             "tmux": {
                 "enabled": true,
                 "session": "host-a",
-                "window": "flow-a"
+                "window": "flow-a",
+                "agent_command": "humanize-test-agent"
             }
         }),
     );
@@ -141,7 +142,8 @@ fn apply_flow_lock_persists_current_flow_and_marks_manifest_complete() {
             "tmux": {
                 "enabled": true,
                 "session": "host-a",
-                "window": "flow-a"
+                "window": "flow-a",
+                "agent_command": "humanize-test-agent"
             }
         }),
     );
@@ -974,7 +976,8 @@ fn applied_manifest_commit_failure_finalizes_allocated_panes() {
             "tmux": {
                 "enabled": true,
                 "session": "host-a",
-                "window": "flow-a"
+                "window": "flow-a",
+                "agent_command": "humanize-test-agent"
             }
         }),
     );
@@ -1523,10 +1526,7 @@ fn routed_flow() -> Value {
             { "id": "root" },
             {
                 "id": "finish",
-                "contract_id": "contract.finish",
-                "action": {
-                    "driver": "agent"
-                }
+                "contract_id": "contract.finish"
             }
         ],
         "contracts": [
@@ -1589,10 +1589,7 @@ fn fanout_flow() -> Value {
             { "id": "root" },
             {
                 "id": "worker",
-                "contract_id": "contract.worker",
-                "action": {
-                    "driver": "agent"
-                }
+                "contract_id": "contract.worker"
             }
         ],
         "contracts": [

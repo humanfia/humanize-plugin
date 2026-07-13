@@ -4,6 +4,7 @@ use humanize_plugin::input_ledger::{
     MachineInputLedger, MachineInputRecord, MachineInputStatus, machine_input_payload_hash,
     normalize_machine_input_text,
 };
+use humanize_plugin::run_assets::RunAssetStore;
 use humanize_plugin::transcript::{
     TranscriptClassification, TranscriptClassifierConfig, TranscriptInputClassification,
     TranscriptMessage, TranscriptRole, classify_transcript_message, classify_transcript_messages,
@@ -67,9 +68,21 @@ fn machine_input_ledger_keeps_records_in_memory_and_renders_jsonl() {
 #[test]
 fn machine_input_ledger_runtime_default_path_is_under_cache_runs() {
     let path = MachineInputLedger::runtime_default_path("run-a");
+    let expected = RunAssetStore::runtime_default()
+        .run_root("run-a")
+        .unwrap()
+        .join("machine-inputs.jsonl");
 
+    assert_eq!(path, expected);
     assert_eq!(path.file_name().unwrap(), "machine-inputs.jsonl");
-    assert_eq!(path.parent().unwrap().file_name().unwrap(), "run-a");
+    assert!(
+        path.parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("run-sha256-")
+    );
     assert_eq!(
         path.parent()
             .unwrap()
@@ -99,9 +112,13 @@ fn machine_input_ledger_runtime_default_path_sanitizes_run_id_segment() {
 
     assert!(path_text.contains("/.cache/humanize/runs/"));
     assert!(!path_text.contains("/../"));
-    assert_ne!(
-        path.parent().unwrap().file_name().unwrap(),
-        "../escape/run-a"
+    assert!(
+        path.parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("run-sha256-")
     );
 }
 

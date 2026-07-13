@@ -20,7 +20,7 @@ use humanize_plugin::adapters::tmux::{
     TmuxPaneIdentity, TmuxPaneMetadataMismatch, TmuxSession, TmuxWindow,
 };
 use humanize_plugin::input_ledger::{
-    MachineInputLedger, MachineInputStatus, machine_input_payload_hash,
+    MachineInputLedger, MachineInputRecord, MachineInputStatus, machine_input_payload_hash,
 };
 use humanize_plugin::pipe_sink::{PipeSinkIdentity, pipe_sink_identity};
 
@@ -446,6 +446,38 @@ fn tmux_send_transaction_validates_exact_pane_sends_literal_text_and_records_led
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
         ])
     );
+}
+
+#[test]
+fn tmux_send_transaction_file_ledger_keeps_started_and_submitted_records() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success(""),
+    ]);
+    let root = test_temp_dir("machine-input-ledger-file-transaction");
+    fs::create_dir_all(&root).unwrap();
+    let ledger_path = root.join("machine-inputs.jsonl");
+    let ledger = MachineInputLedger::at_path(&ledger_path);
+    let adapter = TmuxAdapter::with_runner(runner)
+        .with_input_transaction_config(TmuxInputTransactionConfig::deterministic(ledger, 1_000));
+    let metadata =
+        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
+
+    let transaction = adapter
+        .send_input_transaction(&metadata, "inspect the repo")
+        .unwrap();
+
+    let records = fs::read_to_string(&ledger_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MachineInputRecord>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].transaction_id, transaction.transaction_id());
+    assert_eq!(records[0].status, MachineInputStatus::Started);
+    assert_eq!(records[1].transaction_id, transaction.transaction_id());
+    assert_eq!(records[1].status, MachineInputStatus::Submitted);
 }
 
 #[test]

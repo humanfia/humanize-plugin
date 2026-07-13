@@ -29,6 +29,7 @@ fn parse_flow_draft_object(
         Some(value) => string_array(value, "extensions")?,
         None => Vec::new(),
     };
+    let parsed_qos = parse_flow_qos(flow.get("qos"))?;
     let mut draft = flow::FlowDraft {
         nodes: optional_array_field(flow, "nodes")?
             .iter()
@@ -61,6 +62,7 @@ fn parse_flow_draft_object(
         extensions: Vec::new(),
     };
     draft.extensions.append(&mut extensions);
+    flow::set_flow_draft_qos(&mut draft, parsed_qos);
     for parsed in parsed_contracts {
         flow::set_flow_draft_contract_effects(&mut draft, &parsed.contract.id, parsed.effects);
     }
@@ -74,6 +76,7 @@ pub(super) fn flow_draft_is_empty(draft: &flow::FlowDraft) -> bool {
         && draft.resources.is_empty()
         && draft.imports.is_empty()
         && draft.policies == flow::FlowPolicies::default()
+        && flow::flow_draft_qos(draft) == flow::FlowQosIntent::default()
         && draft.extensions.is_empty()
 }
 
@@ -83,24 +86,101 @@ fn parse_flow_node(value: &Value) -> Result<flow::FlowNode, ToolError> {
             id: id.to_string(),
             ..flow::FlowNode::default()
         }),
-        Value::Object(object) => Ok(flow::FlowNode {
-            id: string_field(object, &["id"])?.to_string(),
-            contract_id: optional_string_field(object, &["contract_id", "contractId"])?
-                .map(str::to_string),
-            action: object.get("action").map(parse_node_action).transpose()?,
-            write_scopes: match object
-                .get("write_scopes")
-                .or_else(|| object.get("writeScopes"))
-            {
-                Some(value) => parse_write_scopes(value, "write_scopes")?,
-                None => Vec::new(),
-            },
-            extensions: match object.get("extensions") {
-                Some(value) => string_array(value, "extensions")?,
-                None => Vec::new(),
-            },
-        }),
+        Value::Object(object) => {
+            let parsed_work_profile = object
+                .get("work_profile")
+                .or_else(|| object.get("workProfile"))
+                .map(parse_work_profile)
+                .transpose()?
+                .unwrap_or_default();
+            let mut node = flow::FlowNode {
+                id: string_field(object, &["id"])?.to_string(),
+                contract_id: optional_string_field(object, &["contract_id", "contractId"])?
+                    .map(str::to_string),
+                action: object.get("action").map(parse_node_action).transpose()?,
+                write_scopes: match object
+                    .get("write_scopes")
+                    .or_else(|| object.get("writeScopes"))
+                {
+                    Some(value) => parse_write_scopes(value, "write_scopes")?,
+                    None => Vec::new(),
+                },
+                extensions: match object.get("extensions") {
+                    Some(value) => string_array(value, "extensions")?,
+                    None => Vec::new(),
+                },
+            };
+            flow::set_flow_node_work_profile(&mut node, parsed_work_profile);
+            Ok(node)
+        }
         _ => Err(ToolError::invalid("nodes items must be strings or objects")),
+    }
+}
+
+fn parse_work_profile(value: &Value) -> Result<flow::WorkProfile, ToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("work_profile must be an object"))?;
+    Ok(flow::WorkProfile {
+        intent: optional_string_field(object, &["intent"])?
+            .map(parse_work_intent)
+            .transpose()?
+            .unwrap_or(flow::WorkIntent::Produce),
+        workspace_access: optional_string_field(object, &["workspace_access", "workspaceAccess"])?
+            .map(parse_workspace_access)
+            .transpose()?
+            .unwrap_or(flow::WorkspaceAccess::ReadWrite),
+        tool_execution: optional_string_field(object, &["tool_execution", "toolExecution"])?
+            .map(parse_tool_execution)
+            .transpose()?
+            .unwrap_or(flow::ToolExecution::Allowed),
+        network_access: optional_string_field(object, &["network_access", "networkAccess"])?
+            .map(parse_network_access)
+            .transpose()?
+            .unwrap_or(flow::NetworkAccess::Restricted),
+    })
+}
+
+fn parse_work_intent(value: &str) -> Result<flow::WorkIntent, ToolError> {
+    match value {
+        "produce" | "Produce" => Ok(flow::WorkIntent::Produce),
+        "evaluate" | "Evaluate" => Ok(flow::WorkIntent::Evaluate),
+        "explore" | "Explore" => Ok(flow::WorkIntent::Explore),
+        "synthesize" | "Synthesize" => Ok(flow::WorkIntent::Synthesize),
+        "coordinate" | "Coordinate" => Ok(flow::WorkIntent::Coordinate),
+        value => Err(ToolError::invalid(format!("unknown work intent: {value}"))),
+    }
+}
+
+fn parse_workspace_access(value: &str) -> Result<flow::WorkspaceAccess, ToolError> {
+    match value {
+        "none" | "None" => Ok(flow::WorkspaceAccess::None),
+        "read_only" | "readOnly" | "ReadOnly" => Ok(flow::WorkspaceAccess::ReadOnly),
+        "read_write" | "readWrite" | "ReadWrite" => Ok(flow::WorkspaceAccess::ReadWrite),
+        value => Err(ToolError::invalid(format!(
+            "unknown workspace access: {value}"
+        ))),
+    }
+}
+
+fn parse_tool_execution(value: &str) -> Result<flow::ToolExecution, ToolError> {
+    match value {
+        "none" | "None" => Ok(flow::ToolExecution::None),
+        "allowed" | "Allowed" => Ok(flow::ToolExecution::Allowed),
+        value => Err(ToolError::invalid(format!(
+            "unknown tool execution: {value}"
+        ))),
+    }
+}
+
+fn parse_network_access(value: &str) -> Result<flow::NetworkAccess, ToolError> {
+    match value {
+        "none" | "None" => Ok(flow::NetworkAccess::None),
+        "restricted" | "Restricted" => Ok(flow::NetworkAccess::Restricted),
+        "open" | "Open" => Ok(flow::NetworkAccess::Open),
+        value => Err(ToolError::invalid(format!(
+            "unknown network access: {value}"
+        ))),
     }
 }
 
@@ -274,6 +354,35 @@ fn parse_flow_policies(value: Option<&Value>) -> Result<flow::FlowPolicies, Tool
             None => Vec::new(),
         },
     })
+}
+
+fn parse_flow_qos(value: Option<&Value>) -> Result<flow::FlowQosIntent, ToolError> {
+    let Some(value) = value else {
+        return Ok(flow::FlowQosIntent::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("qos must be an object"))?;
+    Ok(flow::FlowQosIntent {
+        urgency: optional_string_field(object, &["urgency"])?
+            .map(parse_qos_urgency)
+            .transpose()?
+            .unwrap_or(flow::QosUrgency::Standard),
+        completion_target: optional_string_field(
+            object,
+            &["completion_target", "completionTarget"],
+        )?
+        .map(str::to_string),
+    })
+}
+
+fn parse_qos_urgency(value: &str) -> Result<flow::QosUrgency, ToolError> {
+    match value {
+        "interactive" | "Interactive" => Ok(flow::QosUrgency::Interactive),
+        "standard" | "Standard" => Ok(flow::QosUrgency::Standard),
+        "background" | "Background" => Ok(flow::QosUrgency::Background),
+        value => Err(ToolError::invalid(format!("unknown QoS urgency: {value}"))),
+    }
 }
 
 fn parse_write_scopes(value: &Value, name: &str) -> Result<Vec<flow::WriteScope>, ToolError> {

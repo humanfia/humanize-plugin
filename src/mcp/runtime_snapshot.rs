@@ -18,6 +18,9 @@ impl McpServerState {
             if let Some(warnings) = self.actuation_warnings.get(&run.run_id) {
                 run.actuation_warnings = warnings.clone();
             }
+            if let Some(waiting_human) = self.waiting_human.get(&run.run_id) {
+                run.waiting_human = waiting_human.clone();
+            }
             let timeline = self
                 .runtime()
                 .events()

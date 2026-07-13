@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use crate::adapters::tmux::{CommandRunner, TmuxActivationMetadata};
+use crate::adapters::tmux::{CommandRunner, TmuxActivationMetadata, TmuxError};
 use crate::flow;
 use crate::input_ledger::MachineInputRecord;
 use crate::runtime::{self, ControlCommand};
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use super::{
     AgentActuationConfig, FlowReviewStatus, McpServer, RunArchive, ToolCallResult, ToolError,
     content_hash, diagnostic_codes_text, flow_check_mode_arg, flow_draft_arg, node_specs,
-    optional_bool, optional_string, require_string, run_not_found_guidance,
+    optional_bool, optional_string, require_string, run_not_found_guidance, runtime_qos_arg,
     validate_start_run_preconditions,
 };
 
@@ -29,8 +29,8 @@ impl<R: CommandRunner> McpServer<R> {
                     || arguments.get("lockId").is_some()
             });
         let mut flow_binding = self.flow_lock_binding_from_arguments(arguments)?;
-        let agent_command = agent_command_from_arguments(arguments)?;
         let agent_actuation = agent_actuation_config_from_arguments(arguments)?;
+        let explicit_qos = runtime_qos_arg(arguments)?;
         let nodes = match flow_binding.as_ref() {
             Some((lock_id, _)) => self.locked_flow_node_specs(lock_id)?,
             None => node_specs(arguments)?,
@@ -85,6 +85,13 @@ impl<R: CommandRunner> McpServer<R> {
             }
         }
 
+        let effective_arguments =
+            match self.effective_run_flow_arguments(run_id, arguments, flow_binding.as_ref())? {
+                Ok(arguments) => arguments,
+                Err(result) => return Ok(result),
+            };
+        let agent_command = agent_command_from_arguments(&effective_arguments)?;
+
         if let Err(err) = self.ensure_run_asset_manifest(run_id) {
             return Ok(ToolCallResult::error(json!({
                 "ok": false,
@@ -96,6 +103,16 @@ impl<R: CommandRunner> McpServer<R> {
                 },
                 "error": "run asset preservation failed"
             })));
+        }
+        let run_qos = explicit_qos.or_else(|| {
+            flow_binding
+                .as_ref()
+                .and_then(|(lock_id, _)| self.state.flow_locks.get(lock_id))
+                .map(|lock| flow::flow_draft_qos(lock.draft()))
+                .filter(|qos| !qos.is_default())
+        });
+        if let Some(qos) = run_qos {
+            self.record_run_qos_intent(run_id, &qos)?;
         }
 
         let prepared_revision = if let Some((lock_id, content_hash)) = flow_binding.as_ref() {
@@ -133,7 +150,11 @@ impl<R: CommandRunner> McpServer<R> {
             .iter()
             .map(|node| node.id().to_string())
             .collect::<Vec<_>>();
-        let tmux = match self.start_run_tmux_metadata(run_id, arguments, &expected_activation_ids) {
+        let tmux = match self.start_run_tmux_metadata(
+            run_id,
+            &effective_arguments,
+            &expected_activation_ids,
+        ) {
             Ok(tmux) => tmux,
             Err(err) if self.run_has_asset_preservation_failure(run_id) => {
                 return Ok(ToolCallResult::error(json!({
@@ -205,6 +226,8 @@ impl<R: CommandRunner> McpServer<R> {
             });
             (activation_ids, report)
         };
+        self.record_route_topology_decisions(&report)?;
+        self.record_new_runtime_events(run_id)?;
         if let Some(revision_id) = prepared_revision.as_deref() {
             if let Err(err) = self.commit_run_flow_revision(run_id, revision_id) {
                 let message = err.message;
@@ -253,7 +276,8 @@ impl<R: CommandRunner> McpServer<R> {
             "run_status": run_status,
             "tmux": tmux.structured,
             "actuation": {
-                "sent": actuation.sent
+                "sent": actuation.sent,
+                "waiting_human": actuation.waiting_human
             },
             "actuation_warnings": actuation.warnings,
             "flow_lock_id": flow_binding.as_ref().map(|(lock_id, _)| lock_id.as_str()),
@@ -268,6 +292,100 @@ impl<R: CommandRunner> McpServer<R> {
             return Err(ToolError::invalid("flow lock not found"));
         };
         Ok(node_specs_from_locked_draft(lock.draft()))
+    }
+
+    fn effective_run_flow_arguments(
+        &self,
+        run_id: &str,
+        arguments: &Value,
+        flow_binding: Option<&(String, String)>,
+    ) -> Result<Result<Value, ToolCallResult>, ToolError> {
+        let Some((lock_id, _)) = flow_binding else {
+            return Ok(Ok(arguments.clone()));
+        };
+        let Some(lock) = self.state.flow_locks.get(lock_id) else {
+            return Err(ToolError::invalid("flow lock not found"));
+        };
+        let unsupported = unsupported_autonomous_action_nodes(lock.draft());
+        if !unsupported.is_empty() {
+            return Ok(Err(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "flow_lock_id": lock_id,
+                "error": "locked flow contains action drivers that are not autonomously supported",
+                "unsupported_action_drivers": unsupported
+            }))));
+        }
+        if !draft_requires_autonomous_tmux(lock.draft()) {
+            return Ok(Ok(arguments.clone()));
+        }
+
+        match self.autonomous_tmux_arguments(run_id, arguments)? {
+            Ok(arguments) => Ok(Ok(arguments)),
+            Err(missing) => Ok(Err(ToolCallResult::error(json!({
+                "ok": false,
+                "run_id": run_id,
+                "flow_lock_id": lock_id,
+                "error": "autonomous tmux execution context required",
+                "missing": missing
+            })))),
+        }
+    }
+
+    fn autonomous_tmux_arguments(
+        &self,
+        run_id: &str,
+        arguments: &Value,
+    ) -> Result<Result<Value, Vec<&'static str>>, ToolError> {
+        let explicit = explicit_tmux_arguments(arguments)?;
+        if explicit == ExplicitTmuxArguments::Disabled {
+            return Ok(Err(vec!["tmux.enabled"]));
+        }
+        let mut session = explicit.session();
+        let mut window = explicit.window();
+        let mut agent_command = agent_command_from_arguments(arguments)?;
+
+        if session.is_none() {
+            session = self.execution_defaults.session.clone();
+        }
+        if window.is_none() {
+            window = self.execution_defaults.window.clone();
+        }
+        if agent_command.is_none() {
+            agent_command = self.execution_defaults.agent_command.clone();
+        }
+
+        let mut missing = Vec::new();
+        if session
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            missing.push("tmux.session");
+        }
+        if agent_command
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            missing.push("tmux.agent_command");
+        }
+        if !missing.is_empty() {
+            return Ok(Err(missing));
+        }
+
+        let mut effective_arguments = arguments.clone();
+        let object = effective_arguments
+            .as_object_mut()
+            .ok_or_else(|| ToolError::invalid("run_flow arguments must be an object"))?;
+        object.insert(
+            "tmux".into(),
+            json!({
+                "enabled": true,
+                "session": session.expect("session should be present after validation"),
+                "window": window.unwrap_or_else(|| run_id.to_string()),
+                "agent_command": agent_command.expect("agent command should be present after validation")
+            }),
+        );
+        Ok(Ok(effective_arguments))
     }
 
     fn lock_nodes_only_flow(
@@ -367,6 +485,10 @@ impl<R: CommandRunner> McpServer<R> {
         } else {
             None
         };
+        if let Some(report) = report.as_ref() {
+            self.record_route_topology_decisions(report)?;
+        }
+        self.record_new_runtime_events(run_id)?;
         let tmux_cleanup = self.cleanup_all_tmux_panes_for_run(run_id, "forced_stop")?;
         let mut run_status = self.run_status_string(run_id)?;
 
@@ -469,6 +591,8 @@ impl<R: CommandRunner> McpServer<R> {
             activation_id,
             runtime::StopObservation::new(reason),
         );
+        self.record_route_topology_decisions(&report)?;
+        self.record_new_runtime_events(run_id)?;
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
         self.actuate_locked_flow(run_id, &[])?;
         let tmux_cleanup =
@@ -538,6 +662,8 @@ impl<R: CommandRunner> McpServer<R> {
             return Ok(blocked);
         }
         let report = self.state.tick_control(command(run_id));
+        self.record_route_topology_decisions(&report)?;
+        self.record_new_runtime_events(run_id)?;
         let tmux_allocations = self.allocate_missing_tmux_panes(run_id)?;
         if self.run_has_asset_preservation_failure(run_id) {
             let _ = self
@@ -819,7 +945,22 @@ impl<R: CommandRunner> McpServer<R> {
             let Some(action) = node.action.as_ref() else {
                 continue;
             };
-            if action.driver != flow::NodeDriver::Agent {
+            if action.driver == flow::NodeDriver::Human {
+                self.push_waiting_human(
+                    run_id,
+                    json!({
+                        "activation_id": activation.activation_id,
+                        "node_id": activation.node_id,
+                        "driver": "human",
+                        "status": "waiting_human",
+                        "message": "human action is waiting for external input"
+                    }),
+                    &mut actuation,
+                );
+                self.state.actuated_activations.insert(key);
+                continue;
+            }
+            if !is_autonomous_agent_backed_driver(action.driver) {
                 self.push_actuation_warning(
                     run_id,
                     json!({
@@ -838,7 +979,7 @@ impl<R: CommandRunner> McpServer<R> {
                     json!({
                         "activation_id": activation.activation_id,
                         "node_id": activation.node_id,
-                        "driver": "agent",
+                        "driver": node_driver_name(action.driver),
                         "message": "tmux.agent_command is required before autonomous agent actuation"
                     }),
                     &mut actuation,
@@ -858,7 +999,7 @@ impl<R: CommandRunner> McpServer<R> {
                     json!({
                         "activation_id": activation.activation_id,
                         "node_id": activation.node_id,
-                        "driver": "agent",
+                        "driver": node_driver_name(action.driver),
                         "message": "tmux pane mapping is required for agent actuation"
                     }),
                     &mut actuation,
@@ -876,7 +1017,7 @@ impl<R: CommandRunner> McpServer<R> {
                     json!({
                         "activation_id": activation.activation_id,
                         "node_id": activation.node_id,
-                        "driver": "agent",
+                        "driver": node_driver_name(action.driver),
                         "message": "tmux pane mapping is required for agent actuation"
                     }),
                     &mut actuation,
@@ -902,9 +1043,16 @@ impl<R: CommandRunner> McpServer<R> {
                 {
                     Ok(transaction) => {
                         launch_transaction_id = Some(transaction.transaction_id().to_string());
-                        self.record_machine_input(run_id, "agent_launch", transaction.record());
+                        self.record_machine_input(run_id, "agent_launch", transaction.record())?;
                         self.state.launched_activations.insert(key.clone());
                         launched_now = true;
+                    }
+                    Err(err @ TmuxError::InputLedger { .. }) => {
+                        return Err(self.machine_input_preservation_error(
+                            run_id,
+                            &activation.activation_id,
+                            &err,
+                        ));
                     }
                     Err(err) => {
                         self.push_actuation_warning(
@@ -912,7 +1060,7 @@ impl<R: CommandRunner> McpServer<R> {
                             json!({
                                 "activation_id": activation.activation_id,
                                 "node_id": activation.node_id,
-                                "driver": "agent",
+                                "driver": node_driver_name(action.driver),
                                 "message": "tmux actuation failed before agent launch",
                                 "error": err.to_string()
                             }),
@@ -954,12 +1102,12 @@ impl<R: CommandRunner> McpServer<R> {
                 ) {
                 Ok(transaction) => {
                     let prompt_transaction_id = transaction.transaction_id().to_string();
-                    self.record_machine_input(run_id, "node_prompt", transaction.record());
+                    self.record_machine_input(run_id, "node_prompt", transaction.record())?;
                     self.state.actuated_activations.insert(key);
                     actuation.sent.push(json!({
                         "activation_id": activation.activation_id,
                         "node_id": activation.node_id,
-                        "driver": "agent",
+                        "driver": node_driver_name(action.driver),
                         "agent_command": agent_command,
                         "agent_ready_pattern": agent_actuation.ready_pattern,
                         "agent_launch_transaction_id": launch_transaction_id,
@@ -971,13 +1119,20 @@ impl<R: CommandRunner> McpServer<R> {
                         "window_name": window.name()
                     }));
                 }
+                Err(err @ TmuxError::InputLedger { .. }) => {
+                    return Err(self.machine_input_preservation_error(
+                        run_id,
+                        &activation.activation_id,
+                        &err,
+                    ));
+                }
                 Err(err) => {
                     self.push_actuation_warning(
                         run_id,
                         json!({
                             "activation_id": activation.activation_id,
                             "node_id": activation.node_id,
-                            "driver": "agent",
+                            "driver": node_driver_name(action.driver),
                             "message": "tmux actuation failed before prompt submission",
                             "error": err.to_string()
                         }),
@@ -988,6 +1143,27 @@ impl<R: CommandRunner> McpServer<R> {
         }
 
         Ok(actuation)
+    }
+
+    fn machine_input_preservation_error(
+        &mut self,
+        run_id: &str,
+        activation_id: &str,
+        error: &TmuxError,
+    ) -> ToolError {
+        let message = error.to_string();
+        self.record_asset_preservation_error(
+            run_id,
+            Some(activation_id),
+            Some("machine_input"),
+            "machine_input",
+            &message,
+        );
+        let _ = self
+            .state
+            .runtime_mut()
+            .set_run_status(run_id, runtime::RunStatus::Failed);
+        ToolError::invalid(format!("run asset preservation {message}"))
     }
 
     fn push_actuation_warning(
@@ -1009,7 +1185,31 @@ impl<R: CommandRunner> McpServer<R> {
         }
     }
 
-    fn record_machine_input(&mut self, run_id: &str, role: &str, record: &MachineInputRecord) {
+    fn push_waiting_human(
+        &mut self,
+        run_id: &str,
+        waiting: Value,
+        actuation: &mut RuntimeActuation,
+    ) {
+        if !actuation.waiting_human.contains(&waiting) {
+            actuation.waiting_human.push(waiting.clone());
+        }
+        let waiting_entries = self
+            .state
+            .waiting_human
+            .entry(run_id.to_string())
+            .or_default();
+        if !waiting_entries.contains(&waiting) {
+            waiting_entries.push(waiting);
+        }
+    }
+
+    fn record_machine_input(
+        &mut self,
+        run_id: &str,
+        role: &str,
+        record: &MachineInputRecord,
+    ) -> Result<(), ToolError> {
         let mut value = serde_json::to_value(record).unwrap_or_else(|_| {
             json!({
                 "transaction_id": record.transaction_id,
@@ -1024,6 +1224,37 @@ impl<R: CommandRunner> McpServer<R> {
             .entry(run_id.to_string())
             .or_default()
             .push(value);
+        if let Some(manifest) = self.state.run_assets.get_mut(run_id) {
+            let result = self
+                .run_asset_store
+                .record_machine_input(manifest, role, record);
+            if let Err(err) = result {
+                let message = err.to_string();
+                let preservation_result =
+                    if let Some(manifest) = self.state.run_assets.get_mut(run_id) {
+                        self.run_asset_store.record_preservation_error(
+                            manifest,
+                            Some(record.activation_id.as_str()),
+                            Some("machine_input"),
+                            "machine_input",
+                            &message,
+                        )
+                    } else {
+                        Ok(())
+                    };
+                let _ = self
+                    .state
+                    .runtime_mut()
+                    .set_run_status(run_id, runtime::RunStatus::Failed);
+                if let Err(preservation_err) = preservation_result {
+                    return Err(ToolError::invalid(format!(
+                        "run asset preservation {message}; preserving machine input failure failed: {preservation_err}"
+                    )));
+                }
+                return Err(ToolError::from_run_asset(err));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1031,6 +1262,58 @@ impl<R: CommandRunner> McpServer<R> {
 struct RuntimeActuation {
     sent: Vec<Value>,
     warnings: Vec<Value>,
+    waiting_human: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum ExplicitTmuxArguments {
+    Absent,
+    Disabled,
+    Enabled {
+        session: Option<String>,
+        window: Option<String>,
+    },
+}
+
+impl ExplicitTmuxArguments {
+    fn session(&self) -> Option<String> {
+        match self {
+            Self::Enabled { session, .. } => session.clone(),
+            Self::Absent | Self::Disabled => None,
+        }
+    }
+
+    fn window(&self) -> Option<String> {
+        match self {
+            Self::Enabled { window, .. } => window.clone(),
+            Self::Absent | Self::Disabled => None,
+        }
+    }
+}
+
+fn explicit_tmux_arguments(arguments: &Value) -> Result<ExplicitTmuxArguments, ToolError> {
+    let Some(value) = arguments.get("tmux") else {
+        return Ok(ExplicitTmuxArguments::Absent);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("tmux must be an object"))?;
+    let enabled = match object.get("enabled") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => return Err(ToolError::invalid("tmux.enabled must be a boolean")),
+        None => false,
+    };
+
+    if !enabled {
+        return Ok(ExplicitTmuxArguments::Disabled);
+    }
+
+    Ok(ExplicitTmuxArguments::Enabled {
+        session: super::optional_string_field(object, &["session", "session_id", "sessionId"])?
+            .map(str::to_string),
+        window: super::optional_string_field(object, &["window", "window_name", "windowName"])?
+            .map(str::to_string),
+    })
 }
 
 fn agent_command_from_arguments(arguments: &Value) -> Result<Option<String>, ToolError> {
@@ -1179,6 +1462,34 @@ fn node_driver_name(driver: flow::NodeDriver) -> &'static str {
         flow::NodeDriver::Review => "review",
         flow::NodeDriver::Human => "human",
     }
+}
+
+fn is_autonomous_agent_backed_driver(driver: flow::NodeDriver) -> bool {
+    matches!(driver, flow::NodeDriver::Agent | flow::NodeDriver::Review)
+}
+
+fn draft_requires_autonomous_tmux(draft: &flow::FlowDraft) -> bool {
+    draft.nodes.iter().any(|node| {
+        node.action
+            .as_ref()
+            .is_some_and(|action| is_autonomous_agent_backed_driver(action.driver))
+    })
+}
+
+fn unsupported_autonomous_action_nodes(draft: &flow::FlowDraft) -> Vec<Value> {
+    draft
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let action = node.action.as_ref()?;
+            (action.driver == flow::NodeDriver::Script).then(|| {
+                json!({
+                    "node_id": node.id.as_str(),
+                    "driver": node_driver_name(action.driver)
+                })
+            })
+        })
+        .collect()
 }
 
 fn resource_kind_name(kind: &flow::ResourceKind) -> &'static str {

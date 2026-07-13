@@ -77,6 +77,7 @@ pub struct RunSnapshot {
     pub stop_decisions: Vec<RuntimeStopDecisionSnapshot>,
     pub machine_inputs: Vec<Value>,
     pub actuation_warnings: Vec<Value>,
+    pub waiting_human: Vec<Value>,
     pub why: Option<String>,
 }
 
@@ -216,6 +217,7 @@ impl RunSnapshot {
             stop_decisions: Vec::new(),
             machine_inputs: Vec::new(),
             actuation_warnings: Vec::new(),
+            waiting_human: Vec::new(),
             why: None,
         }
     }
@@ -259,6 +261,7 @@ impl RunSnapshot {
             "stop_decisions": self.stop_decisions,
             "machine_inputs": self.machine_inputs,
             "actuation_warnings": self.actuation_warnings,
+            "waiting_human": self.waiting_human,
             "why": self.why
         })
     }

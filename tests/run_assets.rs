@@ -77,16 +77,13 @@ fn contract_draft_without_effects() -> FlowDraft {
 }
 
 #[test]
-fn sink_selection_prefers_sforge_patch_dir_with_deterministic_run_path() {
-    let patch_dir = test_temp_dir("run-assets-sforge");
-    let store = RunAssetStore::new(RunAssetSink::SforgePatchDir(patch_dir.clone()));
+fn explicit_humanize_runs_dir_uses_deterministic_run_path() {
+    let runs_dir = test_temp_dir("run-assets-humanize-runs-dir");
+    let store = RunAssetStore::new(RunAssetSink::HumanizeRunsDir(runs_dir.clone()));
 
     let root = store.run_root("run-a").unwrap();
 
-    let relative = root
-        .strip_prefix(patch_dir.join(".flowbench").join("humanize-runner"))
-        .unwrap()
-        .to_string_lossy();
+    let relative = root.strip_prefix(runs_dir).unwrap().to_string_lossy();
     assert!(relative.starts_with("run-sha256-"));
     assert!(relative.contains("-run-a"));
 }
@@ -332,6 +329,20 @@ fn run_manifest_fixtures_match_rust_struct_schema() {
         "tests/fixtures/run_assets/completed_manifest.json",
         fixture_completed_manifest(),
     );
+}
+
+#[test]
+fn pre_records_manifest_fixture_deserializes_without_record_index_field() {
+    let manifest_json = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/run_assets/pre_records_manifest.json"),
+    )
+    .unwrap();
+
+    let manifest: RunAssetManifest = serde_json::from_str(&manifest_json).unwrap();
+
+    assert_eq!(manifest.run_id, "legacy-run");
+    assert_eq!(manifest.storage.raw_run_id, "legacy-run");
 }
 
 #[test]

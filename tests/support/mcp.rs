@@ -44,6 +44,52 @@ impl RecordingRunner {
         self.calls.borrow().clone()
     }
 }
+
+#[derive(Clone)]
+pub struct SideEffectRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    outputs: Rc<RefCell<VecDeque<CommandOutput>>>,
+    on_call: RunnerSideEffect,
+}
+
+type RunnerSideEffect = Rc<dyn Fn(&[String])>;
+
+impl SideEffectRunner {
+    pub fn with_outputs(
+        outputs: Vec<CommandOutput>,
+        on_call: impl Fn(&[String]) + 'static,
+    ) -> Self {
+        Self {
+            calls: Rc::new(RefCell::new(Vec::new())),
+            outputs: Rc::new(RefCell::new(outputs.into())),
+            on_call: Rc::new(on_call),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl CommandRunner for SideEffectRunner {
+    fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
+        (self.on_call)(&argv);
+        let output = self.outputs.borrow_mut().pop_front().unwrap_or_default();
+        if argv.get(1).map(String::as_str) == Some("pipe-pane") && output.is_success() {
+            acknowledge_pipe_command(&argv);
+        }
+        self.calls.borrow_mut().push(argv);
+        Ok(output)
+    }
+
+    fn pipe_sink_helper_is_external(&self) -> bool {
+        false
+    }
+
+    fn pipe_sink_producer_closed(&self, target: &str) {
+        complete_pipe_command(target);
+    }
+}
 impl CommandRunner for RecordingRunner {
     fn run(&self, argv: Vec<String>) -> Result<CommandOutput, TmuxError> {
         let output = self.outputs.borrow_mut().pop_front().unwrap_or_default();

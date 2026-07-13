@@ -1,14 +1,13 @@
-use std::env;
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::run_assets::{RunAssetStore, append_machine_input_ledger_direct};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MachineInputRecord {
@@ -83,7 +82,11 @@ pub struct MachineInputLedger {
 
 impl MachineInputLedger {
     pub fn runtime_default() -> Self {
-        Self::new(MachineInputLedgerSink::RuntimeDefault)
+        Self::for_run_asset_store(RunAssetStore::runtime_default())
+    }
+
+    pub fn for_run_asset_store(store: RunAssetStore) -> Self {
+        Self::new(MachineInputLedgerSink::RunAssetStore(store))
     }
 
     pub fn at_path(path: impl Into<PathBuf>) -> Self {
@@ -97,21 +100,21 @@ impl MachineInputLedger {
     }
 
     pub fn runtime_default_path(run_id: &str) -> PathBuf {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".cache")
-            .join("humanize")
-            .join("runs")
-            .join(machine_input_run_path_segment(run_id))
+        RunAssetStore::runtime_default()
+            .run_root(run_id)
+            .unwrap_or_else(|_| PathBuf::from(".").join(machine_input_run_path_segment(run_id)))
             .join("machine-inputs.jsonl")
     }
 
     pub fn append(&self, record: MachineInputRecord) -> Result<(), MachineInputLedgerError> {
         match &self.sink {
-            MachineInputLedgerSink::RuntimeDefault => {
-                append_jsonl(&Self::runtime_default_path(&record.run_id), &record)
-            }
+            MachineInputLedgerSink::RunAssetStore(store) => append_jsonl(
+                &store
+                    .run_root(&record.run_id)
+                    .map_err(|err| MachineInputLedgerError::new(err.to_string()))?
+                    .join("machine-inputs.jsonl"),
+                &record,
+            ),
             MachineInputLedgerSink::JsonlPath(path) => append_jsonl(path, &record),
             MachineInputLedgerSink::Memory(records) => {
                 let mut records = records.lock().map_err(|_| {
@@ -129,7 +132,7 @@ impl MachineInputLedger {
                 .lock()
                 .map(|records| records.clone())
                 .unwrap_or_default(),
-            MachineInputLedgerSink::RuntimeDefault | MachineInputLedgerSink::JsonlPath(_) => {
+            MachineInputLedgerSink::RunAssetStore(_) | MachineInputLedgerSink::JsonlPath(_) => {
                 Vec::new()
             }
         }
@@ -156,7 +159,7 @@ impl MachineInputLedger {
 
 #[derive(Debug, Clone)]
 enum MachineInputLedgerSink {
-    RuntimeDefault,
+    RunAssetStore(RunAssetStore),
     JsonlPath(PathBuf),
     Memory(Arc<Mutex<Vec<MachineInputRecord>>>),
 }
@@ -268,28 +271,7 @@ fn is_safe_run_path_segment(run_id: &str) -> bool {
 }
 
 fn append_jsonl(path: &Path, record: &MachineInputRecord) -> Result<(), MachineInputLedgerError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            MachineInputLedgerError::new(format!(
-                "create machine input ledger directory {} failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| {
-            MachineInputLedgerError::new(format!(
-                "open machine input ledger {} failed: {err}",
-                path.display()
-            ))
-        })?;
-    let line = serde_json::to_string(record).map_err(|err| {
-        MachineInputLedgerError::new(format!("serialize ledger record failed: {err}"))
-    })?;
-    writeln!(file, "{line}").map_err(|err| {
+    append_machine_input_ledger_direct(path, record).map_err(|err| {
         MachineInputLedgerError::new(format!(
             "write machine input ledger {} failed: {err}",
             path.display()

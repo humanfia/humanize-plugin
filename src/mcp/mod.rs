@@ -3,9 +3,11 @@ use std::io;
 use std::time::Duration;
 
 use crate::adapters::tmux::{
-    CommandRunner, SystemCommandRunner, TmuxAdapter, TmuxPane, TmuxPipeCapture, TmuxWindow,
+    CommandRunner, SystemCommandRunner, TmuxAdapter, TmuxInputTransactionConfig, TmuxPane,
+    TmuxPipeCapture, TmuxWindow,
 };
 use crate::flow;
+use crate::input_ledger::MachineInputLedger;
 use crate::run_assets::{RunAssetManifest, RunAssetStore};
 use crate::runtime::{
     self, BoardPatch, ControlCommand, DriverState, DriverTickInput, NodeSpec, Runtime, StopContract,
@@ -13,9 +15,11 @@ use crate::runtime::{
 use crate::view::VisualizationSnapshot;
 use serde_json::{Value, json};
 
+mod execution_defaults;
 mod flow_json;
 mod flow_parse;
 mod flow_tools;
+mod record_tools;
 mod review_tools;
 mod route_preview;
 mod runtime_control;
@@ -26,6 +30,7 @@ mod tmux_tools;
 mod update_tools;
 mod view_tools;
 
+pub use execution_defaults::TmuxExecutionDefaults;
 pub use stdio::{
     serve_stdio, serve_stdio_signal_aware, serve_stdio_signal_aware_with_server,
     serve_stdio_with_server,
@@ -41,16 +46,16 @@ pub struct McpServer<R: CommandRunner = SystemCommandRunner> {
     state: McpServerState,
     tmux_adapter: TmuxAdapter<R>,
     run_asset_store: RunAssetStore,
+    execution_defaults: TmuxExecutionDefaults,
 }
 
 impl McpServer<SystemCommandRunner> {
     pub fn new() -> Self {
-        Self {
-            surface: McpSurface,
-            state: McpServerState::default(),
-            tmux_adapter: TmuxAdapter::new(),
-            run_asset_store: RunAssetStore::runtime_default(),
-        }
+        Self::with_tmux_runner_run_asset_store_and_execution_defaults(
+            SystemCommandRunner,
+            RunAssetStore::runtime_default(),
+            TmuxExecutionDefaults::from_environment(),
+        )
     }
 }
 
@@ -66,11 +71,28 @@ impl<R: CommandRunner> McpServer<R> {
     }
 
     pub fn with_tmux_runner_and_run_asset_store(runner: R, run_asset_store: RunAssetStore) -> Self {
+        Self::with_tmux_runner_run_asset_store_and_execution_defaults(
+            runner,
+            run_asset_store,
+            TmuxExecutionDefaults::default(),
+        )
+    }
+
+    pub fn with_tmux_runner_run_asset_store_and_execution_defaults(
+        runner: R,
+        run_asset_store: RunAssetStore,
+        execution_defaults: TmuxExecutionDefaults,
+    ) -> Self {
+        let input_config = TmuxInputTransactionConfig::runtime().with_ledger(
+            MachineInputLedger::for_run_asset_store(run_asset_store.clone()),
+        );
         Self {
             surface: McpSurface,
             state: McpServerState::default(),
-            tmux_adapter: TmuxAdapter::with_runner(runner),
+            tmux_adapter: TmuxAdapter::with_runner(runner)
+                .with_input_transaction_config(input_config),
             run_asset_store,
+            execution_defaults,
         }
     }
 
@@ -152,6 +174,7 @@ impl<R: CommandRunner> McpServer<R> {
             "deliver_artifact" => self.deliver_artifact(arguments),
             "fanout_from_artifact" => self.fanout_from_artifact(arguments),
             "record_effect" => self.record_effect(arguments),
+            "record_hook_fact" => self.record_hook_fact(arguments),
             "patch_board" => self.patch_board(arguments),
             "activate_node" => self.activate_node(arguments),
             "send_message" => self.send_message(arguments),
@@ -203,6 +226,9 @@ impl<R: CommandRunner> McpServer<R> {
                 "error": "run asset preservation failed"
             })));
         }
+        if let Some(qos) = runtime_qos_arg(arguments)? {
+            self.record_run_qos_intent(run_id, &qos)?;
+        }
         let activation_ids = nodes
             .iter()
             .map(|node| node.id().to_string())
@@ -234,6 +260,7 @@ impl<R: CommandRunner> McpServer<R> {
                 ));
             }
         };
+        self.record_new_runtime_events(run_id)?;
         self.state
             .remember_tmux_allocation(run_id, &tmux.window, &tmux.panes);
         let run_assets = self.run_assets_json(run_id);
@@ -285,7 +312,9 @@ impl<R: CommandRunner> McpServer<R> {
         {
             object.insert(
                 "run_assets".to_string(),
-                serde_json::to_value(manifest).unwrap_or(Value::Null),
+                self.run_asset_store
+                    .manifest_json(manifest)
+                    .unwrap_or(Value::Null),
             );
         }
         context
@@ -309,6 +338,7 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .deliver_artifact(run_id, activation_id, artifact_key, payload)
             .map_err(ToolError::from_runtime)?;
+        self.record_new_runtime_events(run_id)?;
         let record = self
             .state
             .runtime()
@@ -348,6 +378,8 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .fanout_from_artifact(run_id, &node, artifact_key)
             .map_err(ToolError::from_runtime)?;
+        self.record_explicit_fanout_decision(run_id, node_id, artifact_key, &activation_ids)?;
+        self.record_new_runtime_events(run_id)?;
         let tmux_allocations = match self.allocate_missing_tmux_panes(run_id) {
             Ok(allocations) => allocations,
             Err(err) if self.run_has_asset_preservation_failure(run_id) => {
@@ -427,6 +459,7 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .record_effect(run_id, activation_id, effect_key, payload)
             .map_err(ToolError::from_runtime)?;
+        self.record_new_runtime_events(run_id)?;
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
@@ -457,6 +490,7 @@ impl<R: CommandRunner> McpServer<R> {
                 .runtime_mut()
                 .patch_board(run_id, activation_id, board_patch)
                 .map_err(ToolError::from_runtime)?;
+            self.record_new_runtime_events(run_id)?;
         }
 
         Ok(ToolCallResult::ok(json!({
@@ -488,6 +522,7 @@ impl<R: CommandRunner> McpServer<R> {
             .runtime_mut()
             .activate_node(run_id, &node, None)
             .map_err(ToolError::from_runtime)?;
+        self.record_new_runtime_events(run_id)?;
         let tmux_allocations = match self.allocate_missing_tmux_panes(run_id) {
             Ok(allocations) => allocations,
             Err(err) if self.run_has_asset_preservation_failure(run_id) => {
@@ -662,6 +697,7 @@ impl<R: CommandRunner> McpServer<R> {
             self.mark_prepared_flow_revision_failed(run_id, &prepared_revision, &err.message);
             return Err(err);
         }
+        self.record_new_runtime_events(run_id)?;
         if let Err(err) = self.commit_run_flow_revision(run_id, &prepared_revision) {
             let message = err.message;
             self.record_asset_preservation_error(run_id, None, None, "flow_package", &message);
@@ -768,7 +804,7 @@ impl<R: CommandRunner> McpServer<R> {
         self.state
             .run_assets
             .get(run_id)
-            .and_then(|manifest| serde_json::to_value(manifest).ok())
+            .and_then(|manifest| self.run_asset_store.manifest_json(manifest).ok())
     }
 
     fn run_asset_blocked_result(&self, run_id: &str, control: &str) -> Option<ToolCallResult> {
@@ -807,7 +843,9 @@ struct McpServerState {
     run_agent_actuation: BTreeMap<String, AgentActuationConfig>,
     machine_inputs: BTreeMap<String, Vec<Value>>,
     actuation_warnings: BTreeMap<String, Vec<Value>>,
+    waiting_human: BTreeMap<String, Vec<Value>>,
     run_assets: BTreeMap<String, RunAssetManifest>,
+    recorded_runtime_sequences: BTreeMap<String, u64>,
     shutdown_requested: bool,
     shutdown_assets_finalized: bool,
     shutdown_assets_error: Option<String>,
@@ -826,7 +864,7 @@ struct AgentActuationConfig {
 impl Default for AgentActuationConfig {
     fn default() -> Self {
         Self {
-            prompt_submit_key_count: 2,
+            prompt_submit_key_count: 1,
             ready_pattern: None,
             ready_timeout: Duration::from_secs(30),
         }
@@ -1005,7 +1043,7 @@ fn run_not_found_guidance(run_id: &str) -> Value {
     })
 }
 
-const SERVER_INSTRUCTIONS: &str = "When a user asks to use Humanize or workflow, start with flow_suggest from the terse natural-language request, then call flow_check, flow_lock, prepare_flow_review, approve_flow_review with an approved or bypassed decision, and run_flow; do not substitute ordinary repo exploration for this workflow. Validate that the flow package includes a README before locking or running.";
+const SERVER_INSTRUCTIONS: &str = "When a user asks to use Humanize or workflow, start with flow_suggest from the terse natural-language request, then call flow_check, flow_lock, prepare_flow_review, approve_flow_review with an approved or bypassed decision, and run_flow; do not substitute ordinary repo exploration for this workflow. Validate that the flow package includes a README before locking or running. Agent and review nodes require an autonomous tmux context from HUMANIZE_TMUX_SESSION and HUMANIZE_AGENT_COMMAND, or run_flow fails before starting.";
 
 fn initialize_result() -> Value {
     json!({
@@ -1094,6 +1132,44 @@ fn optional_string<'a>(arguments: &'a Value, names: &[&str]) -> Result<Option<&'
         }
     }
     Ok(None)
+}
+
+pub(in crate::mcp) fn runtime_qos_arg(
+    arguments: &Value,
+) -> Result<Option<flow::FlowQosIntent>, ToolError> {
+    let Some(value) = arguments.get("qos") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("qos must be an object"))?;
+    let completion_target =
+        optional_string_field(object, &["completion_target", "completionTarget"])?
+            .map(|target| {
+                if target.trim().is_empty() {
+                    return Err(ToolError::invalid(
+                        "qos.completion_target must be non-empty",
+                    ));
+                }
+                Ok(target.to_string())
+            })
+            .transpose()?;
+    Ok(Some(flow::FlowQosIntent {
+        urgency: optional_string_field(object, &["urgency"])?
+            .map(parse_qos_urgency)
+            .transpose()?
+            .unwrap_or(flow::QosUrgency::Standard),
+        completion_target,
+    }))
+}
+
+fn parse_qos_urgency(value: &str) -> Result<flow::QosUrgency, ToolError> {
+    match value {
+        "interactive" | "Interactive" => Ok(flow::QosUrgency::Interactive),
+        "standard" | "Standard" => Ok(flow::QosUrgency::Standard),
+        "background" | "Background" => Ok(flow::QosUrgency::Background),
+        value => Err(ToolError::invalid(format!("unknown QoS urgency: {value}"))),
+    }
 }
 
 fn require_string_arguments(arguments: &Value, fields: &[&[&str]]) -> Result<(), ToolError> {

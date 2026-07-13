@@ -816,6 +816,11 @@ impl TmuxInputTransactionConfig {
         }
     }
 
+    pub fn with_ledger(mut self, ledger: MachineInputLedger) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
     pub fn with_submit_key_count(mut self, submit_key_count: usize) -> Self {
         self.submit_key_count = submit_key_count.max(1);
         self

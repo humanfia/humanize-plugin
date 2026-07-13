@@ -1,12 +1,13 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub const RUNTIME_TOOL_NAMES: [&str; 21] = [
+pub const RUNTIME_TOOL_NAMES: [&str; 22] = [
     "start_run",
     "get_context",
     "deliver_artifact",
     "fanout_from_artifact",
     "record_effect",
+    "record_hook_fact",
     "patch_board",
     "activate_node",
     "send_message",
@@ -148,6 +149,17 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                         "type": "array",
                         "items": { "type": "string" }
                     },
+                    "qos": {
+                        "type": "object",
+                        "properties": {
+                            "urgency": {
+                                "type": "string",
+                                "enum": ["interactive", "standard", "background"]
+                            },
+                            "completion_target": { "type": "string" },
+                            "completionTarget": { "type": "string" }
+                        }
+                    },
                     "tmux": {
                         "type": "object",
                         "description": "tmux mapping options. When enabled is true, session and window are required.",
@@ -259,6 +271,33 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                     &["activation_id", "activationId"],
                     &["effect_key", "effectKey", "key"],
                 ],
+            ),
+        ),
+        "record_hook_fact" => descriptor(
+            "record_hook_fact",
+            "Record a native hook fact for a run session without changing runtime state.",
+            object_schema_with_required_aliases(
+                json!({
+                    "run_id": { "type": "string" },
+                    "runId": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "sessionId": { "type": "string" },
+                    "activation_id": { "type": "string" },
+                    "activationId": { "type": "string" },
+                    "hook": {
+                        "type": "string",
+                        "description": "Native hook name such as compaction_pending or compaction_finished."
+                    },
+                    "source_native_id": { "type": "string" },
+                    "sourceNativeId": { "type": "string" },
+                    "causal_id": { "type": "string" },
+                    "causalId": { "type": "string" },
+                    "correlation_id": { "type": "string" },
+                    "correlationId": { "type": "string" },
+                    "payload": {}
+                }),
+                &["hook"],
+                &[&["run_id", "runId"], &["session_id", "sessionId"]],
             ),
         ),
         "patch_board" => descriptor(
@@ -419,6 +458,17 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                     "contentHash": { "type": "string" },
                     "review_required": { "type": "boolean" },
                     "reviewRequired": { "type": "boolean" },
+                    "qos": {
+                        "type": "object",
+                        "properties": {
+                            "urgency": {
+                                "type": "string",
+                                "enum": ["interactive", "standard", "background"]
+                            },
+                            "completion_target": { "type": "string" },
+                            "completionTarget": { "type": "string" }
+                        }
+                    },
                     "tmux": {
                         "type": "object",
                         "properties": {

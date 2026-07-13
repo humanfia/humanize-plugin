@@ -2,15 +2,45 @@ use crate::flow;
 use serde_json::{Map, Value, json};
 
 pub(crate) fn flow_draft_json(draft: &flow::FlowDraft) -> Value {
-    json!({
-        "nodes": draft.nodes.iter().map(flow_node_json).collect::<Vec<_>>(),
-        "contracts": draft.contracts.iter().map(|contract| flow_contract_json(draft, contract)).collect::<Vec<_>>(),
-        "routes": draft.routes.iter().map(flow_route_json).collect::<Vec<_>>(),
-        "resources": draft.resources.iter().map(flow_resource_json).collect::<Vec<_>>(),
-        "imports": draft.imports.iter().map(flow_import_json).collect::<Vec<_>>(),
-        "policies": flow_policies_json(&draft.policies),
-        "extensions": draft.extensions,
-    })
+    let mut object = Map::new();
+    object.insert(
+        "nodes".into(),
+        Value::Array(draft.nodes.iter().map(flow_node_json).collect()),
+    );
+    object.insert(
+        "contracts".into(),
+        Value::Array(
+            draft
+                .contracts
+                .iter()
+                .map(|contract| flow_contract_json(draft, contract))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "routes".into(),
+        Value::Array(draft.routes.iter().map(flow_route_json).collect()),
+    );
+    object.insert(
+        "resources".into(),
+        Value::Array(draft.resources.iter().map(flow_resource_json).collect()),
+    );
+    object.insert(
+        "imports".into(),
+        Value::Array(draft.imports.iter().map(flow_import_json).collect()),
+    );
+    object.insert("policies".into(), flow_policies_json(&draft.policies));
+    let qos = flow::flow_draft_qos(draft);
+    if !qos.is_default() {
+        object.insert("qos".into(), flow_qos_json(&qos));
+    }
+    let extensions = draft
+        .extensions
+        .iter()
+        .filter(|extension| !flow::extension_is_flow_qos(extension))
+        .collect::<Vec<_>>();
+    object.insert("extensions".into(), json!(extensions));
+    Value::Object(object)
 }
 
 fn flow_node_json(node: &flow::FlowNode) -> Value {
@@ -20,11 +50,40 @@ fn flow_node_json(node: &flow::FlowNode) -> Value {
     if let Some(action) = &node.action {
         object.insert("action".into(), node_action_json(action));
     }
+    let work_profile = flow::flow_node_work_profile(node);
+    if !work_profile.is_default() {
+        object.insert("work_profile".into(), work_profile_json(&work_profile));
+    }
     object.insert(
         "write_scopes".into(),
         Value::Array(write_scopes_json(&node.write_scopes)),
     );
-    object.insert("extensions".into(), json!(node.extensions));
+    let extensions = node
+        .extensions
+        .iter()
+        .filter(|extension| !flow::extension_is_node_work_profile(extension))
+        .collect::<Vec<_>>();
+    object.insert("extensions".into(), json!(extensions));
+    Value::Object(object)
+}
+
+fn work_profile_json(profile: &flow::WorkProfile) -> Value {
+    json!({
+        "intent": work_intent_name(profile.intent),
+        "workspace_access": workspace_access_name(profile.workspace_access),
+        "tool_execution": tool_execution_name(profile.tool_execution),
+        "network_access": network_access_name(profile.network_access),
+    })
+}
+
+fn flow_qos_json(qos: &flow::FlowQosIntent) -> Value {
+    let mut object = Map::new();
+    object.insert("urgency".into(), json!(qos_urgency_name(qos.urgency)));
+    insert_optional_string(
+        &mut object,
+        "completion_target",
+        qos.completion_target.as_deref(),
+    );
     Value::Object(object)
 }
 
@@ -144,6 +203,47 @@ fn node_driver_name(driver: flow::NodeDriver) -> &'static str {
         flow::NodeDriver::Script => "script",
         flow::NodeDriver::Review => "review",
         flow::NodeDriver::Human => "human",
+    }
+}
+
+fn work_intent_name(intent: flow::WorkIntent) -> &'static str {
+    match intent {
+        flow::WorkIntent::Produce => "produce",
+        flow::WorkIntent::Evaluate => "evaluate",
+        flow::WorkIntent::Explore => "explore",
+        flow::WorkIntent::Synthesize => "synthesize",
+        flow::WorkIntent::Coordinate => "coordinate",
+    }
+}
+
+fn workspace_access_name(access: flow::WorkspaceAccess) -> &'static str {
+    match access {
+        flow::WorkspaceAccess::None => "none",
+        flow::WorkspaceAccess::ReadOnly => "read_only",
+        flow::WorkspaceAccess::ReadWrite => "read_write",
+    }
+}
+
+fn tool_execution_name(execution: flow::ToolExecution) -> &'static str {
+    match execution {
+        flow::ToolExecution::None => "none",
+        flow::ToolExecution::Allowed => "allowed",
+    }
+}
+
+fn network_access_name(access: flow::NetworkAccess) -> &'static str {
+    match access {
+        flow::NetworkAccess::None => "none",
+        flow::NetworkAccess::Restricted => "restricted",
+        flow::NetworkAccess::Open => "open",
+    }
+}
+
+fn qos_urgency_name(urgency: flow::QosUrgency) -> &'static str {
+    match urgency {
+        flow::QosUrgency::Interactive => "interactive",
+        flow::QosUrgency::Standard => "standard",
+        flow::QosUrgency::Background => "background",
     }
 }
 
