@@ -431,6 +431,25 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Ok(())
     }
 
+    fn paste_keys_literal(
+        &self,
+        pane: &TmuxPane,
+        text: &str,
+        buffer_name: &str,
+    ) -> Result<(), TmuxError> {
+        validate_owned_session_id("pane", pane.session_id())?;
+        let target = pane_target(pane);
+        self.run_checked(argv(
+            ["tmux", "set-buffer", "-b", buffer_name, "--"],
+            [text],
+        ))?;
+        self.run_checked(argv(
+            ["tmux", "paste-buffer", "-p", "-d", "-b", buffer_name, "-t"],
+            [target.as_str()],
+        ))?;
+        Ok(())
+    }
+
     pub fn send_key(&self, pane: &TmuxPane, key: &str) -> Result<(), TmuxError> {
         validate_owned_session_id("pane", pane.session_id())?;
         let target = pane_target(pane);
@@ -493,7 +512,13 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 message: err.to_string(),
             })?;
 
-        if let Err(err) = self.send_keys_literal(&pane, text) {
+        let input_result = if requires_bracketed_paste(text) {
+            let buffer_name = transaction_id.replace(':', "-");
+            self.paste_keys_literal(&pane, text, &buffer_name)
+        } else {
+            self.send_keys_literal(&pane, text)
+        };
+        if let Err(err) = input_result {
             self.record_failed_input(
                 metadata,
                 text,
@@ -503,7 +528,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             );
             return Err(err);
         }
-        sleep_if_needed(self.input_config.prompt_to_submit_delay(text));
+        sleep_if_needed(self.input_config.prompt_to_submit_delay);
         for index in 0..submit_key_count {
             if let Err(err) = self.send_key(&pane, "Enter") {
                 self.record_failed_input(
@@ -792,8 +817,6 @@ pub struct TmuxInputTransactionConfig {
     clock: MachineInputClock,
     submit_key_count: usize,
     prompt_to_submit_delay: Duration,
-    prompt_byte_delay: Duration,
-    max_prompt_to_submit_delay: Duration,
     submit_key_delay: Duration,
 }
 
@@ -804,8 +827,6 @@ impl TmuxInputTransactionConfig {
             clock: MachineInputClock::realtime(),
             submit_key_count: 1,
             prompt_to_submit_delay: Duration::from_millis(250),
-            prompt_byte_delay: Duration::from_millis(3),
-            max_prompt_to_submit_delay: Duration::from_secs(30),
             submit_key_delay: Duration::from_millis(250),
         }
     }
@@ -816,8 +837,6 @@ impl TmuxInputTransactionConfig {
             clock: MachineInputClock::fixed(timestamp_ms),
             submit_key_count: 1,
             prompt_to_submit_delay: Duration::ZERO,
-            prompt_byte_delay: Duration::ZERO,
-            max_prompt_to_submit_delay: Duration::ZERO,
             submit_key_delay: Duration::ZERO,
         }
     }
@@ -840,15 +859,6 @@ impl TmuxInputTransactionConfig {
     pub fn with_submit_key_delay(mut self, delay: Duration) -> Self {
         self.submit_key_delay = delay;
         self
-    }
-
-    fn prompt_to_submit_delay(&self, text: &str) -> Duration {
-        let byte_count = u32::try_from(text.len()).unwrap_or(u32::MAX);
-        let scaled_delay = self
-            .prompt_byte_delay
-            .saturating_mul(byte_count)
-            .min(self.max_prompt_to_submit_delay);
-        self.prompt_to_submit_delay.max(scaled_delay)
     }
 }
 
@@ -1789,30 +1799,6 @@ fn tmux_record_fields(value: &str) -> Vec<&str> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_prompt_delay_scales_with_input_and_caps_at_thirty_seconds() {
-        let runtime = TmuxInputTransactionConfig::runtime();
-
-        assert_eq!(
-            runtime.prompt_to_submit_delay("short"),
-            Duration::from_millis(250)
-        );
-        assert_eq!(
-            runtime.prompt_to_submit_delay(&"x".repeat(1_000)),
-            Duration::from_secs(3)
-        );
-        assert_eq!(
-            runtime.prompt_to_submit_delay(&"x".repeat(20_000)),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            TmuxInputTransactionConfig::deterministic(MachineInputLedger::in_memory(), 0)
-                .prompt_to_submit_delay(&"x".repeat(20_000)),
-            Duration::ZERO
-        );
-    }
+fn requires_bracketed_paste(text: &str) -> bool {
+    text.len() >= 512 || text.contains(['\r', '\n'])
 }

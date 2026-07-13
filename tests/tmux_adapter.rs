@@ -423,6 +423,7 @@ fn tmux_send_transaction_validates_exact_pane_sends_literal_text_and_records_led
     assert_eq!(records[1].transaction_id, transaction.transaction_id());
     assert_eq!(records[1].status, MachineInputStatus::Submitted);
     assert!(records[0].transaction_id.starts_with("machine-input:"));
+    let buffer_name = transaction.transaction_id().replace(':', "-");
     assert_eq!(
         runner.calls(),
         argv(vec![
@@ -436,11 +437,21 @@ fn tmux_send_transaction_validates_exact_pane_sends_literal_text_and_records_led
             ],
             vec![
                 "tmux",
-                "send-keys",
+                "set-buffer",
+                "-b",
+                buffer_name.as_str(),
+                "--",
+                "inspect\r\nthe repo",
+            ],
+            vec![
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-d",
+                "-b",
+                buffer_name.as_str(),
                 "-t",
                 "host-a:%7.%8",
-                "-l",
-                "inspect\r\nthe repo",
             ],
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
