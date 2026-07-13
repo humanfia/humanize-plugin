@@ -26,6 +26,7 @@ use crate::pipe_sink::{
 pub struct TmuxAdapter<R: CommandRunner = SystemCommandRunner> {
     runner: R,
     input_config: TmuxInputTransactionConfig,
+    agent_startup_delay: Duration,
     pipe_sink_executable: Option<PathBuf>,
     pipe_ready_timeout: Duration,
     pipe_completion_timeout: Duration,
@@ -72,6 +73,7 @@ impl Default for TmuxAdapter<SystemCommandRunner> {
         Self {
             runner: SystemCommandRunner,
             input_config: TmuxInputTransactionConfig::runtime(),
+            agent_startup_delay: Duration::from_secs(5),
             pipe_sink_executable: None,
             pipe_ready_timeout: Duration::from_secs(2),
             pipe_completion_timeout: Duration::from_secs(2),
@@ -84,6 +86,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         Self {
             runner,
             input_config: TmuxInputTransactionConfig::runtime(),
+            agent_startup_delay: Duration::ZERO,
             pipe_sink_executable: None,
             pipe_ready_timeout: Duration::from_secs(2),
             pipe_completion_timeout: Duration::from_secs(2),
@@ -115,6 +118,40 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         self
     }
 
+    pub fn wait_for_agent_startup(&self) {
+        sleep_if_needed(self.agent_startup_delay);
+    }
+
+    pub fn wait_for_pane_text(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        pattern: &str,
+        timeout: Duration,
+    ) -> Result<(), TmuxError> {
+        self.validate_exact_pane(metadata)?;
+        let pane = TmuxPane::new_in_session(
+            metadata.session_id(),
+            metadata.window_id(),
+            metadata.activation_id(),
+            metadata.pane_id(),
+        );
+        let started = Instant::now();
+
+        loop {
+            if self.capture_pane(&pane)?.contains(pattern) {
+                return Ok(());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(TmuxError::AgentReadinessTimeout {
+                    pattern: pattern.to_string(),
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            sleep_if_needed(Duration::from_millis(100).min(timeout - elapsed));
+        }
+    }
+
     pub fn create_session_with_window_pane(
         &self,
         session_id: impl Into<String>,
@@ -134,7 +171,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 "-d",
                 "-P",
                 "-F",
-                "#{window_id}\t#{pane_id}",
+                "#{window_id}|#{pane_id}",
                 "-s",
                 session.id(),
                 "-n",
@@ -258,7 +295,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         let window_name = window_name.into();
         let output = self.run_checked(argv(
             ["tmux", "list-windows", "-t", session.id(), "-F"],
-            ["#{window_name}\t#{window_id}"],
+            ["#{window_name}|#{window_id}"],
         ))?;
 
         if let Some(window_id) = listed_window_id(&output, &window_name)? {
@@ -312,7 +349,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 "new-window",
                 "-P",
                 "-F",
-                "#{window_id}\t#{pane_id}",
+                "#{window_id}|#{pane_id}",
                 "-t",
                 session.id(),
                 "-n",
@@ -406,7 +443,21 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         metadata: &TmuxActivationMetadata,
         text: &str,
     ) -> Result<TmuxInputTransaction, TmuxError> {
+        self.send_input_transaction_with_submit_key_count(
+            metadata,
+            text,
+            self.input_config.submit_key_count,
+        )
+    }
+
+    pub fn send_input_transaction_with_submit_key_count(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        text: &str,
+        submit_key_count: usize,
+    ) -> Result<TmuxInputTransaction, TmuxError> {
         self.validate_exact_pane(metadata)?;
+        let submit_key_count = submit_key_count.max(1);
         let started_at_ms = self.input_config.clock.now_ms();
         let normalized_text = normalize_machine_input_text(text);
         let payload_hash = machine_input_payload_hash(&normalized_text);
@@ -435,7 +486,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 started_at_ms,
                 submitted_at_ms: started_at_ms,
                 text,
-                submit_key_count: self.input_config.submit_key_count,
+                submit_key_count,
                 transaction_id: transaction_id.clone(),
             }))
             .map_err(|err| TmuxError::InputLedger {
@@ -443,16 +494,28 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             })?;
 
         if let Err(err) = self.send_keys_literal(&pane, text) {
-            self.record_failed_input(metadata, text, started_at_ms, &transaction_id);
+            self.record_failed_input(
+                metadata,
+                text,
+                started_at_ms,
+                &transaction_id,
+                submit_key_count,
+            );
             return Err(err);
         }
         sleep_if_needed(self.input_config.prompt_to_submit_delay);
-        for index in 0..self.input_config.submit_key_count {
+        for index in 0..submit_key_count {
             if let Err(err) = self.send_key(&pane, "Enter") {
-                self.record_failed_input(metadata, text, started_at_ms, &transaction_id);
+                self.record_failed_input(
+                    metadata,
+                    text,
+                    started_at_ms,
+                    &transaction_id,
+                    submit_key_count,
+                );
                 return Err(err);
             }
-            if index + 1 < self.input_config.submit_key_count {
+            if index + 1 < submit_key_count {
                 sleep_if_needed(self.input_config.submit_key_delay);
             }
         }
@@ -465,7 +528,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             started_at_ms,
             submitted_at_ms,
             text,
-            submit_key_count: self.input_config.submit_key_count,
+            submit_key_count,
             transaction_id: transaction_id.clone(),
         });
         self.input_config
@@ -483,6 +546,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         text: &str,
         started_at_ms: u64,
         transaction_id: &str,
+        submit_key_count: usize,
     ) {
         let failed_at_ms = self.input_config.clock.now_ms();
         let _ =
@@ -495,7 +559,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                     started_at_ms,
                     submitted_at_ms: failed_at_ms,
                     text,
-                    submit_key_count: self.input_config.submit_key_count,
+                    submit_key_count,
                     transaction_id: transaction_id.to_string(),
                 }));
     }
@@ -677,7 +741,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         let target = metadata_pane_target(metadata);
         let output = self.run_checked(argv(
             ["tmux", "display-message", "-p", "-t", target.as_str()],
-            ["#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}"],
+            ["#{session_name}|#{window_id}|#{window_name}|#{pane_id}"],
         ))?;
         let (actual_session_id, actual_window_id, actual_window_name, actual_pane_id) =
             pane_identity_stdout(&output)?;
@@ -812,12 +876,12 @@ impl<R: CommandRunner> AgentLifecycleAdapter for TmuxAdapter<R> {
         activation: &Self::Activation,
         command: &str,
     ) -> Result<Self::Handle, Self::Error> {
-        self.send_input_transaction(activation.metadata(), command)?;
+        self.send_input_transaction_with_submit_key_count(activation.metadata(), command, 1)?;
         Ok(activation.clone().into_handle())
     }
 
     fn send_prompt(&self, handle: &Self::Handle, prompt: &str) -> Result<(), Self::Error> {
-        self.send_input_transaction(handle.metadata(), prompt)?;
+        self.send_input_transaction_with_submit_key_count(handle.metadata(), prompt, 2)?;
         Ok(())
     }
 
@@ -1328,6 +1392,10 @@ pub enum TmuxError {
     InputLedger {
         message: String,
     },
+    AgentReadinessTimeout {
+        pattern: String,
+        timeout_ms: u64,
+    },
     PaneMetadataMismatch(Box<TmuxPaneMetadataMismatch>),
     CommandFailed {
         argv: Vec<String>,
@@ -1350,6 +1418,13 @@ impl fmt::Display for TmuxError {
             Self::EmptyOutput { field } => write!(formatter, "tmux did not return {field}"),
             Self::Io { argv, message } => write!(formatter, "{}: {message}", argv.join(" ")),
             Self::InputLedger { message } => write!(formatter, "{message}"),
+            Self::AgentReadinessTimeout {
+                pattern,
+                timeout_ms,
+            } => write!(
+                formatter,
+                "tmux pane did not contain agent readiness pattern {pattern:?} within {timeout_ms} ms"
+            ),
             Self::PaneMetadataMismatch(mismatch) => write!(
                 formatter,
                 "tmux pane metadata mismatch: expected {}:{}({}).{}, got {}:{}({}).{}",
@@ -1611,10 +1686,11 @@ fn listed_window_id(
     window_name: &str,
 ) -> Result<Option<String>, TmuxError> {
     for line in output.stdout.lines() {
-        let Some((name, window_id)) = line.split_once('\t') else {
+        let fields = tmux_record_fields(line);
+        let [name, window_id] = fields.as_slice() else {
             continue;
         };
-        if name == window_name {
+        if *name == window_name {
             let window_id = window_id.trim();
             if window_id.is_empty() {
                 return Err(TmuxError::EmptyOutput { field: "window id" });
@@ -1634,7 +1710,8 @@ fn window_pane_stdout(output: &CommandOutput) -> Result<(String, String), TmuxEr
         });
     }
 
-    let mut fields = value.split_whitespace();
+    let fields = tmux_record_fields(value);
+    let mut fields = fields.into_iter();
     let Some(window_id) = fields.next() else {
         return Err(TmuxError::EmptyOutput { field: "window id" });
     };
@@ -1655,7 +1732,8 @@ fn pane_identity_stdout(
         });
     }
 
-    let mut fields = value.split('\t');
+    let fields = tmux_record_fields(value);
+    let mut fields = fields.into_iter();
     let Some(session_id) = fields.next() else {
         return Err(TmuxError::EmptyOutput {
             field: "session name",
@@ -1679,4 +1757,14 @@ fn pane_identity_stdout(
         window_name.to_string(),
         pane_id.to_string(),
     ))
+}
+
+fn tmux_record_fields(value: &str) -> Vec<&str> {
+    if value.contains('|') {
+        value.split('|').collect()
+    } else if value.contains('\t') {
+        value.split('\t').collect()
+    } else {
+        value.split_whitespace().collect()
+    }
 }

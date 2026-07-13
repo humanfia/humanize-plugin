@@ -63,17 +63,23 @@ unique workflow window for the run, and launch an interactive coding agent:
     "enabled": true,
     "session": "current-session-name",
     "window": "task-run",
-    "agent_command": "codex --dangerously-bypass-approvals-and-sandbox"
+    "agent_command": "codex --dangerously-bypass-approvals-and-sandbox",
+    "agent_ready_pattern": "Use /skills to list available skills",
+    "agent_ready_timeout_ms": 60000,
+    "prompt_submit_key_count": 2
   }
 }
 ```
 
 Use `tmux display-message -p '#S'` to discover the current session. The coding
 agent inherits the container environment and its installed Humanize MCP
-configuration. Current autonomous tmux actuation directly launches agent nodes;
-script and review nodes require explicit orchestration by the main agent or an
-agent node that performs and records the deterministic or review action. Treat
-an actuation warning as an execution gap, not as successful node completion.
+configuration. Configure `agent_ready_pattern` for interactive agents so the
+node prompt is submitted only after the TUI is ready. Set
+`prompt_submit_key_count` to the number of Enter keys that agent requires.
+Current autonomous tmux actuation directly launches agent nodes; script and review nodes require explicit orchestration
+by the main agent or an agent node that performs and records the deterministic
+or review action. Treat an actuation warning as an execution gap, not as
+successful node completion.
 
 ## Flow Architecture
 

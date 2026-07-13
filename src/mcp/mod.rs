@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::time::Duration;
 
 use crate::adapters::tmux::{
     CommandRunner, SystemCommandRunner, TmuxAdapter, TmuxPane, TmuxPipeCapture, TmuxWindow,
@@ -44,7 +45,12 @@ pub struct McpServer<R: CommandRunner = SystemCommandRunner> {
 
 impl McpServer<SystemCommandRunner> {
     pub fn new() -> Self {
-        Self::with_tmux_runner(SystemCommandRunner)
+        Self {
+            surface: McpSurface,
+            state: McpServerState::default(),
+            tmux_adapter: TmuxAdapter::new(),
+            run_asset_store: RunAssetStore::runtime_default(),
+        }
     }
 }
 
@@ -798,6 +804,7 @@ struct McpServerState {
     released_tmux_panes: BTreeSet<(String, String)>,
     run_archives: BTreeMap<String, RunArchive>,
     run_agent_commands: BTreeMap<String, String>,
+    run_agent_actuation: BTreeMap<String, AgentActuationConfig>,
     machine_inputs: BTreeMap<String, Vec<Value>>,
     actuation_warnings: BTreeMap<String, Vec<Value>>,
     run_assets: BTreeMap<String, RunAssetManifest>,
@@ -807,6 +814,23 @@ struct McpServerState {
     shutdown_assets_summary: Option<Value>,
     launched_activations: BTreeSet<(String, String)>,
     actuated_activations: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentActuationConfig {
+    prompt_submit_key_count: usize,
+    ready_pattern: Option<String>,
+    ready_timeout: Duration,
+}
+
+impl Default for AgentActuationConfig {
+    fn default() -> Self {
+        Self {
+            prompt_submit_key_count: 2,
+            ready_pattern: None,
+            ready_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 impl McpServerState {

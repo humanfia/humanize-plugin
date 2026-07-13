@@ -353,6 +353,40 @@ fn tmux_adapter_builds_argv_for_session_window_and_pane_mapping() {
 }
 
 #[test]
+fn tmux_wait_for_pane_text_validates_identity_and_observes_readiness() {
+    let runner = RecordingRunner::with_outputs(vec![
+        CommandOutput::success("host-a|%7|window-a|%8\n"),
+        CommandOutput::success("Use /skills to list available skills\n"),
+    ]);
+    let adapter = TmuxAdapter::with_runner(runner.clone());
+    let metadata =
+        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
+
+    adapter
+        .wait_for_pane_text(
+            &metadata,
+            "Use /skills to list available skills",
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+    assert_eq!(
+        runner.calls(),
+        argv(vec![
+            vec![
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "host-a:%7.%8",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
+            ],
+            vec!["tmux", "capture-pane", "-p", "-t", "host-a:%7.%8"],
+        ])
+    );
+}
+
+#[test]
 fn tmux_send_transaction_validates_exact_pane_sends_literal_text_and_records_ledger() {
     let runner = RecordingRunner::with_outputs(vec![
         CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
@@ -398,7 +432,7 @@ fn tmux_send_transaction_validates_exact_pane_sends_literal_text_and_records_led
                 "-p",
                 "-t",
                 "host-a:%7.%8",
-                "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
             ],
             vec![
                 "tmux",
@@ -466,7 +500,7 @@ fn tmux_send_transaction_does_not_send_when_initial_ledger_record_fails() {
             "-p",
             "-t",
             "host-a:%7.%8",
-            "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
         ]])
     );
     fs::remove_dir_all(&ledger_path).unwrap();
@@ -503,7 +537,7 @@ fn tmux_send_transaction_rejects_pane_metadata_mismatch_before_send() {
             "-p",
             "-t",
             "host-a:%7.%8",
-            "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
         ]])
     );
 }
@@ -540,7 +574,7 @@ fn tmux_send_transaction_rejects_window_name_mismatch_before_send() {
             "-p",
             "-t",
             "host-a:%7.%8",
-            "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
         ]])
     );
 }
@@ -586,7 +620,7 @@ fn tmux_adapter_creates_session_with_initial_window_and_pane() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "host-a",
             "-n",
@@ -620,7 +654,7 @@ fn tmux_adapter_creates_window_with_initial_pane() {
             "new-window",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-t",
             "host-a",
             "-n",
@@ -1107,6 +1141,7 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
         CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success(""),
+        CommandOutput::success(""),
         CommandOutput::success("ready\n"),
         CommandOutput::success(""),
     ]);
@@ -1140,11 +1175,13 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
     assert_eq!(records[0].run_id, "run-a");
     assert_eq!(records[0].activation_id, "activation-a");
     assert_eq!(records[0].normalized_text, "humanize-plugin-mcp --stdio");
+    assert_eq!(records[0].submit_key_count, 1);
     assert_eq!(records[0].status, MachineInputStatus::Started);
     assert_eq!(records[1].status, MachineInputStatus::Submitted);
     assert_eq!(records[2].run_id, "run-a");
     assert_eq!(records[2].activation_id, "activation-a");
     assert_eq!(records[2].normalized_text, "inspect the repo");
+    assert_eq!(records[2].submit_key_count, 2);
     assert_eq!(records[2].status, MachineInputStatus::Started);
     assert_eq!(records[3].status, MachineInputStatus::Submitted);
     assert_eq!(
@@ -1179,7 +1216,7 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
                 "-p",
                 "-t",
                 "host-a:%7.%8",
-                "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
             ],
             vec![
                 "tmux",
@@ -1196,7 +1233,7 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
                 "-p",
                 "-t",
                 "host-a:%7.%8",
-                "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
             ],
             vec![
                 "tmux",
@@ -1206,6 +1243,7 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
                 "-l",
                 "inspect the repo",
             ],
+            vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
             vec!["tmux", "capture-pane", "-p", "-t", "host-a:%7.%8"],
             vec!["tmux", "kill-pane", "-t", "host-a:%7.%8"],
@@ -1302,7 +1340,7 @@ fn tmux_lifecycle_reuses_workflow_window_for_repeated_activations() {
                 "-t",
                 "host-a",
                 "-F",
-                "#{window_name}\t#{window_id}",
+                "#{window_name}|#{window_id}",
             ],
             vec![
                 "tmux",

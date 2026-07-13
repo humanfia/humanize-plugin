@@ -432,6 +432,34 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                             "agentCommand": {
                                 "type": "string",
                                 "description": "Alias for agent_command."
+                            },
+                            "prompt_submit_key_count": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4
+                            },
+                            "promptSubmitKeyCount": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4
+                            },
+                            "agent_ready_pattern": {
+                                "type": "string",
+                                "minLength": 1
+                            },
+                            "agentReadyPattern": {
+                                "type": "string",
+                                "minLength": 1
+                            },
+                            "agent_ready_timeout_ms": {
+                                "type": "integer",
+                                "minimum": 100,
+                                "maximum": 300000
+                            },
+                            "agentReadyTimeoutMs": {
+                                "type": "integer",
+                                "minimum": 100,
+                                "maximum": 300000
                             }
                         }
                     }

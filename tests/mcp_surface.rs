@@ -247,6 +247,18 @@ fn new_tool_schemas_cover_core_arguments() {
         run_flow.input_schema()["properties"]["tmux"]["properties"]["agentCommand"]["type"],
         "string"
     );
+    assert_eq!(
+        run_flow.input_schema()["properties"]["tmux"]["properties"]["prompt_submit_key_count"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        run_flow.input_schema()["properties"]["tmux"]["properties"]["agent_ready_pattern"]["type"],
+        "string"
+    );
+    assert_eq!(
+        run_flow.input_schema()["properties"]["tmux"]["properties"]["agent_ready_timeout_ms"]["type"],
+        "integer"
+    );
 
     for name in [
         "run_status",

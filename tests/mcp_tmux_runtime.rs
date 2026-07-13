@@ -115,7 +115,7 @@ fn start_run_creates_explicit_tmux_window_with_activation_panes() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "host-a",
             "-n",
@@ -225,7 +225,7 @@ fn start_run_allows_dedicated_real_test_tmux_session() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "humanize-plugin-real-test",
             "-n",
@@ -284,7 +284,7 @@ fn start_run_returns_error_when_tmux_creation_fails_without_starting_runtime() {
                 "-d",
                 "-P",
                 "-F",
-                "#{window_id}\t#{pane_id}",
+                "#{window_id}|#{pane_id}",
                 "-s",
                 "host-a",
                 "-n",
@@ -455,7 +455,7 @@ fn observe_stop_releases_satisfied_tmux_activation_pane() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "host-a",
             "-n",
@@ -535,7 +535,7 @@ fn run_flow_locked_agent_node_warns_without_agent_command() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "host-a",
             "-n",
@@ -560,6 +560,8 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
         CommandOutput::success(""),
         CommandOutput::success(""),
         CommandOutput::success("host-a\t%7\tflow-a\t%8\n"),
+        CommandOutput::success("Use /skills to list available skills\n"),
+        CommandOutput::success("host-a\t%7\tflow-a\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success(""),
     ]);
@@ -579,7 +581,10 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
                 "enabled": true,
                 "session": "host-a",
                 "window": "flow-a",
-                "agent_command": "humanize-test-agent"
+                "agent_command": "humanize-test-agent",
+                "agent_ready_pattern": "Use /skills to list available skills",
+                "agent_ready_timeout_ms": 60000,
+                "prompt_submit_key_count": 1
             }
         }),
     );
@@ -591,6 +596,11 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
     assert_eq!(sent["node_id"], "root");
     assert_eq!(sent["driver"], "agent");
     assert_eq!(sent["agent_command"], "humanize-test-agent");
+    assert_eq!(
+        sent["agent_ready_pattern"],
+        "Use /skills to list available skills"
+    );
+    assert_eq!(sent["prompt_submit_key_count"], 1);
     assert_eq!(sent["pane_id"], "%8");
     assert_eq!(sent["session_id"], "host-a");
     assert_eq!(sent["window_id"], "%7");
@@ -624,11 +634,13 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
     assert_eq!(machine_inputs[0]["role"], "agent_launch");
     assert_eq!(machine_inputs[0]["normalized_text"], "humanize-test-agent");
     assert_eq!(machine_inputs[0]["status"], "submitted");
+    assert_eq!(machine_inputs[0]["submit_key_count"], 1);
     assert_eq!(machine_inputs[1]["role"], "node_prompt");
     assert_eq!(machine_inputs[1]["normalized_text"], expected_prompt);
     assert_eq!(machine_inputs[1]["status"], "submitted");
+    assert_eq!(machine_inputs[1]["submit_key_count"], 1);
     let calls = runner.calls();
-    assert_eq!(calls.len(), 9);
+    assert_eq!(calls.len(), 11);
     assert_eq!(
         calls[0],
         argv(vec![vec!["tmux", "has-session", "-t", "host-a"]]).remove(0)
@@ -641,7 +653,7 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "host-a",
             "-n",
@@ -658,7 +670,7 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
             "-p",
             "-t",
             "host-a:%7.%8",
-            "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
         ]])
         .remove(0)
     );
@@ -693,12 +705,35 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
             "-p",
             "-t",
             "host-a:%7.%8",
-            "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
         ]])
         .remove(0)
     );
     assert_eq!(
         calls[7],
+        argv(vec![vec![
+            "tmux",
+            "capture-pane",
+            "-p",
+            "-t",
+            "host-a:%7.%8"
+        ]])
+        .remove(0)
+    );
+    assert_eq!(
+        calls[8],
+        argv(vec![vec![
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            "host-a:%7.%8",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
+        ]])
+        .remove(0)
+    );
+    assert_eq!(
+        calls[9],
         argv(vec![vec![
             "tmux",
             "send-keys",
@@ -710,7 +745,7 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
         .remove(0)
     );
     assert_eq!(
-        calls[8],
+        calls[10],
         argv(vec![vec![
             "tmux",
             "send-keys",
@@ -955,7 +990,7 @@ fn run_flow_does_not_send_agent_prompt_before_tmux_metadata_validation() {
             "-d",
             "-P",
             "-F",
-            "#{window_id}\t#{pane_id}",
+            "#{window_id}|#{pane_id}",
             "-s",
             "host-a",
             "-n",
@@ -976,7 +1011,7 @@ fn run_flow_does_not_send_agent_prompt_before_tmux_metadata_validation() {
             "-p",
             "-t",
             "host-a:%7.%8",
-            "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_id}",
+            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
         ]])
         .remove(0)
     );

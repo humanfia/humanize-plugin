@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    FlowReviewStatus, McpServer, RunArchive, ToolCallResult, ToolError, content_hash,
-    diagnostic_codes_text, flow_check_mode_arg, flow_draft_arg, node_specs, optional_bool,
-    optional_string, require_string, run_not_found_guidance, validate_start_run_preconditions,
+    AgentActuationConfig, FlowReviewStatus, McpServer, RunArchive, ToolCallResult, ToolError,
+    content_hash, diagnostic_codes_text, flow_check_mode_arg, flow_draft_arg, node_specs,
+    optional_bool, optional_string, require_string, run_not_found_guidance,
+    validate_start_run_preconditions,
 };
 
 impl<R: CommandRunner> McpServer<R> {
@@ -29,6 +30,7 @@ impl<R: CommandRunner> McpServer<R> {
             });
         let mut flow_binding = self.flow_lock_binding_from_arguments(arguments)?;
         let agent_command = agent_command_from_arguments(arguments)?;
+        let agent_actuation = agent_actuation_config_from_arguments(arguments)?;
         let nodes = match flow_binding.as_ref() {
             Some((lock_id, _)) => self.locked_flow_node_specs(lock_id)?,
             None => node_specs(arguments)?,
@@ -232,6 +234,9 @@ impl<R: CommandRunner> McpServer<R> {
                 .run_agent_commands
                 .insert(run_id.to_string(), command);
         }
+        self.state
+            .run_agent_actuation
+            .insert(run_id.to_string(), agent_actuation);
         if let Some((lock_id, content_hash)) = flow_binding.as_ref() {
             let review_status = self.run_review_status_name(lock_id, review_required);
             self.remember_run_archive(run_id, lock_id, content_hash, review_status);
@@ -840,6 +845,12 @@ impl<R: CommandRunner> McpServer<R> {
                 );
                 continue;
             };
+            let agent_actuation = self
+                .state
+                .run_agent_actuation
+                .get(run_id)
+                .cloned()
+                .unwrap_or_default();
 
             let Some(window) = self.state.tmux_windows.get(run_id).cloned() else {
                 self.push_actuation_warning(
@@ -883,15 +894,17 @@ impl<R: CommandRunner> McpServer<R> {
                 pane.id(),
             );
             let mut launch_transaction_id = None;
+            let mut launched_now = false;
             if !self.state.launched_activations.contains(&key) {
                 match self
                     .tmux_adapter
-                    .send_input_transaction(&metadata, &agent_command)
+                    .send_input_transaction_with_submit_key_count(&metadata, &agent_command, 1)
                 {
                     Ok(transaction) => {
                         launch_transaction_id = Some(transaction.transaction_id().to_string());
                         self.record_machine_input(run_id, "agent_launch", transaction.record());
                         self.state.launched_activations.insert(key.clone());
+                        launched_now = true;
                     }
                     Err(err) => {
                         self.push_actuation_warning(
@@ -909,7 +922,36 @@ impl<R: CommandRunner> McpServer<R> {
                     }
                 }
             }
-            match self.tmux_adapter.send_input_transaction(&metadata, &prompt) {
+            if let Some(pattern) = agent_actuation.ready_pattern.as_deref() {
+                if let Err(err) = self.tmux_adapter.wait_for_pane_text(
+                    &metadata,
+                    pattern,
+                    agent_actuation.ready_timeout,
+                ) {
+                    self.push_actuation_warning(
+                        run_id,
+                        json!({
+                            "activation_id": activation.activation_id,
+                            "node_id": activation.node_id,
+                            "driver": "agent",
+                            "message": "tmux agent readiness check failed before prompt submission",
+                            "agent_ready_pattern": pattern,
+                            "error": err.to_string()
+                        }),
+                        &mut actuation,
+                    );
+                    continue;
+                }
+            } else if launched_now {
+                self.tmux_adapter.wait_for_agent_startup();
+            }
+            match self
+                .tmux_adapter
+                .send_input_transaction_with_submit_key_count(
+                    &metadata,
+                    &prompt,
+                    agent_actuation.prompt_submit_key_count,
+                ) {
                 Ok(transaction) => {
                     let prompt_transaction_id = transaction.transaction_id().to_string();
                     self.record_machine_input(run_id, "node_prompt", transaction.record());
@@ -919,7 +961,9 @@ impl<R: CommandRunner> McpServer<R> {
                         "node_id": activation.node_id,
                         "driver": "agent",
                         "agent_command": agent_command,
+                        "agent_ready_pattern": agent_actuation.ready_pattern,
                         "agent_launch_transaction_id": launch_transaction_id,
+                        "prompt_submit_key_count": agent_actuation.prompt_submit_key_count,
                         "prompt_transaction_id": prompt_transaction_id,
                         "pane_id": pane.id(),
                         "session_id": pane.session_id(),
@@ -1009,6 +1053,69 @@ fn agent_command_from_arguments(arguments: &Value) -> Result<Option<String>, Too
         return non_empty_agent_command(command, "tmux.agent_command");
     }
     Ok(None)
+}
+
+fn agent_actuation_config_from_arguments(
+    arguments: &Value,
+) -> Result<AgentActuationConfig, ToolError> {
+    let Some(tmux) = arguments.get("tmux") else {
+        return Ok(AgentActuationConfig::default());
+    };
+    let object = tmux
+        .as_object()
+        .ok_or_else(|| ToolError::invalid("tmux must be an object"))?;
+    let mut config = AgentActuationConfig::default();
+
+    for key in ["prompt_submit_key_count", "promptSubmitKeyCount"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let count = value.as_u64().ok_or_else(|| {
+            ToolError::invalid("tmux.prompt_submit_key_count must be an unsigned integer")
+        })?;
+        if !(1..=4).contains(&count) {
+            return Err(ToolError::invalid(
+                "tmux.prompt_submit_key_count must be between 1 and 4",
+            ));
+        }
+        config.prompt_submit_key_count = count as usize;
+        break;
+    }
+
+    for key in ["agent_ready_pattern", "agentReadyPattern"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let pattern = value
+            .as_str()
+            .ok_or_else(|| ToolError::invalid("tmux.agent_ready_pattern must be a string"))?
+            .trim();
+        if pattern.is_empty() {
+            return Err(ToolError::invalid(
+                "tmux.agent_ready_pattern must be non-empty",
+            ));
+        }
+        config.ready_pattern = Some(pattern.to_string());
+        break;
+    }
+
+    for key in ["agent_ready_timeout_ms", "agentReadyTimeoutMs"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let timeout_ms = value.as_u64().ok_or_else(|| {
+            ToolError::invalid("tmux.agent_ready_timeout_ms must be an unsigned integer")
+        })?;
+        if !(100..=300_000).contains(&timeout_ms) {
+            return Err(ToolError::invalid(
+                "tmux.agent_ready_timeout_ms must be between 100 and 300000",
+            ));
+        }
+        config.ready_timeout = std::time::Duration::from_millis(timeout_ms);
+        break;
+    }
+
+    Ok(config)
 }
 
 fn non_empty_agent_command(command: &str, field: &str) -> Result<Option<String>, ToolError> {

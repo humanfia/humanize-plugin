@@ -1,0 +1,10 @@
+# gpu-kernelws + the humanize-plugin-mcp MCP server binary (baked on PATH).
+# Used ONLY by setting-② (humanize) cells; setting-① uses plain gpu-kernelws.
+FROM rust:1.96 AS builder
+WORKDIR /src
+COPY . /src
+RUN cargo install --path /src --bin humanize-plugin-mcp --root /out --locked
+
+FROM flowbench-runtime:gpu-kernelws
+COPY --from=builder /out/bin/humanize-plugin-mcp /usr/local/bin/humanize-plugin-mcp
+RUN humanize-plugin-mcp --version && humanize-plugin-mcp --list-tools >/dev/null && echo "humanize-plugin-mcp OK"
