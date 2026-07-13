@@ -690,6 +690,7 @@ fn run_flow_locked_agent_node_uses_configured_default_tmux_context() {
         CommandOutput::success("host-a\t%7\trun-agent-defaults\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success(""),
+        CommandOutput::success(""),
     ]);
     let defaults = TmuxExecutionDefaults {
         session: Some("host-a".into()),
@@ -722,7 +723,7 @@ fn run_flow_locked_agent_node_uses_configured_default_tmux_context() {
     assert_eq!(sent["driver"], "agent");
     assert_eq!(sent["agent_command"], "humanize-test-agent");
     let calls = runner.calls();
-    assert_eq!(calls.len(), 9);
+    assert_eq!(calls.len(), 10);
     assert_eq!(
         calls[0],
         argv(vec![vec!["tmux", "has-session", "-t", "host-a"]]).remove(0)
@@ -757,12 +758,14 @@ fn run_flow_suggested_flow_uses_bare_artifact_key_for_stop_and_routes() {
         CommandOutput::success("host-a\t%7\trun-suggested-route\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success(""),
+        CommandOutput::success(""),
         CommandOutput::success("%9\n"),
         CommandOutput::success(""),
         CommandOutput::success("host-a\t%7\trun-suggested-route\t%9\n"),
         CommandOutput::success(""),
         CommandOutput::success(""),
         CommandOutput::success("host-a\t%7\trun-suggested-route\t%9\n"),
+        CommandOutput::success(""),
         CommandOutput::success(""),
         CommandOutput::success(""),
     ]);
@@ -868,6 +871,7 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
         CommandOutput::success("host-a\t%7\tflow-a\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success(""),
+        CommandOutput::success(""),
     ]);
     let mut server = isolated_server(runner.clone());
     let (lock_id, content_hash) = lock_flow(&mut server, 1, locked_agent_flow());
@@ -944,7 +948,11 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
     assert_eq!(machine_inputs[1]["status"], "submitted");
     assert_eq!(machine_inputs[1]["submit_key_count"], 1);
     let calls = runner.calls();
-    assert_eq!(calls.len(), 11);
+    let prompt_buffer_name = sent["prompt_transaction_id"]
+        .as_str()
+        .unwrap()
+        .replace(':', "-");
+    assert_eq!(calls.len(), 12);
     assert_eq!(
         calls[0],
         argv(vec![vec!["tmux", "has-session", "-t", "host-a"]]).remove(0)
@@ -1040,16 +1048,30 @@ fn run_flow_locked_agent_node_launches_agent_then_sends_initial_prompt() {
         calls[9],
         argv(vec![vec![
             "tmux",
-            "send-keys",
-            "-t",
-            "host-a:%7.%8",
-            "-l",
+            "set-buffer",
+            "-b",
+            prompt_buffer_name.as_str(),
+            "--",
             expected_prompt,
         ]])
         .remove(0)
     );
     assert_eq!(
         calls[10],
+        argv(vec![vec![
+            "tmux",
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            prompt_buffer_name.as_str(),
+            "-t",
+            "host-a:%7.%8",
+        ]])
+        .remove(0)
+    );
+    assert_eq!(
+        calls[11],
         argv(vec![vec![
             "tmux",
             "send-keys",
@@ -1071,6 +1093,7 @@ fn run_flow_locked_review_node_launches_agent_with_review_prompt() {
         CommandOutput::success(""),
         CommandOutput::success(""),
         CommandOutput::success("host-a\t%7\trun-review-defaults\t%8\n"),
+        CommandOutput::success(""),
         CommandOutput::success(""),
         CommandOutput::success(""),
     ]);
@@ -1117,7 +1140,7 @@ fn run_flow_locked_review_node_launches_agent_with_review_prompt() {
     assert_eq!(machine_inputs[0]["role"], "agent_launch");
     assert_eq!(machine_inputs[1]["role"], "node_prompt");
     assert_eq!(machine_inputs[1]["normalized_text"], expected_prompt);
-    assert_eq!(runner.calls().len(), 9);
+    assert_eq!(runner.calls().len(), 10);
 
     let exported = call_tool(
         &mut server,
