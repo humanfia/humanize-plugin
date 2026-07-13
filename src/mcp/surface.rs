@@ -449,7 +449,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
                             ]
                         }
                     },
-                    "flow": {},
+                    "flow": { "type": "object" },
                     "flow_lock_id": { "type": "string" },
                     "flowLockId": { "type": "string" },
                     "lock_id": { "type": "string" },
@@ -616,7 +616,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             "Run flow authoring repair analysis and return mechanical patches, candidates, and guidance.",
             object_schema(
                 json!({
-                    "flow": {},
+                    "flow": { "type": "object" },
                     "mode": { "type": "string" },
                     "route_authoring": {
                         "type": "array",
@@ -631,7 +631,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             "Record that a supplied or locked flow was selected for application.",
             object_schema(
                 json!({
-                    "flow": {},
+                    "flow": { "type": "object" },
                     "flow_lock_id": { "type": "string" },
                     "flowLockId": { "type": "string" },
                     "lock_id": { "type": "string" },
@@ -659,7 +659,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             "flow_check",
             "Validate a Humanize flow draft before locking, review, export, or runtime execution.",
             object_schema(
-                json!({ "flow": {}, "mode": { "type": "string" } }),
+                json!({ "flow": { "type": "object" }, "mode": { "type": "string" } }),
                 &["flow"],
             ),
         ),
@@ -667,7 +667,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             "flow_lock",
             "Freeze a validated Humanize flow draft into a deterministic lock for review, export, and runtime execution.",
             object_schema(
-                json!({ "flow": {}, "mode": { "type": "string" } }),
+                json!({ "flow": { "type": "object" }, "mode": { "type": "string" } }),
                 &["flow"],
             ),
         ),
@@ -692,7 +692,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             object_schema(
                 json!({
                     "run_id": { "type": "string" },
-                    "flow": {},
+                    "flow": { "type": "object" },
                     "apply_mode": {
                         "type": "string",
                         "enum": ["future_activations", "checkpoint_restart"]
@@ -743,7 +743,7 @@ fn descriptor_for(name: &str) -> McpToolDescriptor {
             "Create a human-readable review document for a Humanize flow lock or draft before long-running execution.",
             object_schema(
                 json!({
-                    "flow": {},
+                    "flow": { "type": "object" },
                     "flow_lock_id": { "type": "string" },
                     "flowLockId": { "type": "string" },
                     "lock_id": { "type": "string" },

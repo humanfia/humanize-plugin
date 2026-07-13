@@ -208,6 +208,23 @@ fn new_tool_schemas_cover_core_arguments() {
         "array"
     );
 
+    for name in [
+        "run_flow",
+        "flow_repair",
+        "flow_apply",
+        "flow_check",
+        "flow_lock",
+        "propose_flow_update",
+        "prepare_flow_review",
+    ] {
+        let descriptor = surface.lookup(name).expect("descriptor should be present");
+        assert_eq!(
+            descriptor.input_schema()["properties"]["flow"]["type"],
+            "object",
+            "{name} must expose flow as an object"
+        );
+    }
+
     let run_flow = surface
         .lookup("run_flow")
         .expect("run_flow descriptor should be present");
