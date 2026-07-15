@@ -1,13 +1,14 @@
 use crate::adapters::tmux::CommandRunner;
 use crate::flow;
 use serde_json::{Value, json};
+use std::path::Path;
 
 use super::flow_json::flow_draft_json;
 use super::{
-    McpServer, ToolCallResult, ToolError, content_hash, diagnostics_json, flow_check_mode_arg,
+    McpServer, ToolCallResult, ToolError, diagnostics_json, flow_check_mode_arg,
     flow_check_mode_name, flow_draft_arg, flow_draft_is_empty, flow_export_format_arg,
     flow_export_format_name, flow_repair_input_arg, flow_suggest_input_arg, input_severity_name,
-    repair_candidates_json, repair_guidance_json, repair_patches_json, require_string,
+    optional_string, repair_candidates_json, repair_guidance_json, require_string,
 };
 
 impl<R: CommandRunner> McpServer<R> {
@@ -17,18 +18,18 @@ impl<R: CommandRunner> McpServer<R> {
         let fatal = report
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.severity_level == flow::DiagnosticSeverity::Fatal);
-        let repairable = !fatal && (!report.patches.is_empty() || !report.candidates.is_empty());
-
-        Ok(ToolCallResult::ok(json!({
+            .any(|diagnostic| diagnostic.severity == flow::Severity::Fatal);
+        let repairable = !fatal && !report.candidates.is_empty();
+        let structured = json!({
             "ok": true,
             "repairable": repairable,
             "input_severity": input_severity_name(&report.diagnostics),
-            "patches": repair_patches_json(&report.patches),
             "candidates": repair_candidates_json(&report.candidates),
             "guidance": repair_guidance_json(&report.diagnostics),
             "diagnostics": diagnostics_json(&report.diagnostics)
-        })))
+        });
+
+        Ok(ToolCallResult::ok(structured))
     }
 
     pub(super) fn flow_apply(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
@@ -43,7 +44,7 @@ impl<R: CommandRunner> McpServer<R> {
             return match flow::flow_lock(&draft, mode) {
                 Ok(lock) => {
                     let lock_id = lock.id().to_string();
-                    let content_hash = content_hash(lock.normalized_content());
+                    let content_hash = lock.content_hash().to_string();
                     let diagnostics = diagnostics_json(lock.diagnostics());
                     self.state.flow_locks.insert(lock_id.clone(), lock);
                     Ok(ToolCallResult::ok(json!({
@@ -63,6 +64,30 @@ impl<R: CommandRunner> McpServer<R> {
             };
         }
 
+        if arguments.get("flow_lock").is_some()
+            || arguments.get("package_path").is_some()
+            || arguments.get("packagePath").is_some()
+            || arguments.get("flow_lock_path").is_some()
+            || arguments.get("flowLockPath").is_some()
+        {
+            let (lock_id, content_hash) =
+                self.require_flow_lock_binding_from_arguments(arguments)?;
+            let lock = self
+                .state
+                .flow_locks
+                .get(&lock_id)
+                .expect("resolved flow lock should be cached");
+            return Ok(ToolCallResult::ok(json!({
+                "ok": true,
+                "mode": flow_check_mode_name(lock.mode()),
+                "flow_lock_id": lock_id,
+                "lock_id": lock_id,
+                "content_hash": content_hash,
+                "flow_lock": lock,
+                "diagnostics": diagnostics_json(lock.diagnostics())
+            })));
+        }
+
         let flow_lock_id = require_string(
             arguments,
             &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
@@ -74,7 +99,7 @@ impl<R: CommandRunner> McpServer<R> {
                 "error": "flow lock not found"
             })));
         };
-        let content_hash = content_hash(lock.normalized_content());
+        let content_hash = lock.content_hash().to_string();
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
@@ -131,14 +156,35 @@ impl<R: CommandRunner> McpServer<R> {
         match flow::flow_lock(&draft, mode) {
             Ok(lock) => {
                 let lock_id = lock.id().to_string();
-                let content_hash = content_hash(lock.normalized_content());
+                let content_hash = lock.content_hash().to_string();
+                if let Some(package_path) = optional_string(
+                    arguments,
+                    &[
+                        "package_path",
+                        "packagePath",
+                        "flow_lock_path",
+                        "flowLockPath",
+                    ],
+                )? {
+                    lock.write_directory(Path::new(package_path))
+                        .map_err(|error| {
+                            ToolError::invalid(format!("flow lock package write failed: {error}"))
+                        })?;
+                }
+                let flow_lock = serde_json::to_value(&lock)
+                    .map_err(|_| ToolError::invalid("flow lock serialization failed"))?;
                 self.state.flow_locks.insert(lock_id.clone(), lock);
                 Ok(ToolCallResult::ok(json!({
                     "ok": true,
                     "mode": flow_check_mode_name(mode),
                     "flow_lock_id": lock_id,
                     "lock_id": lock_id,
-                    "content_hash": content_hash
+                    "content_hash": content_hash,
+                    "flow_lock": flow_lock,
+                    "package_path": optional_string(
+                        arguments,
+                        &["package_path", "packagePath", "flow_lock_path", "flowLockPath"],
+                    )?
                 })))
             }
             Err(err) => Ok(ToolCallResult::error(json!({
@@ -150,12 +196,9 @@ impl<R: CommandRunner> McpServer<R> {
     }
 
     pub(super) fn flow_export(&mut self, arguments: &Value) -> Result<ToolCallResult, ToolError> {
-        let flow_lock_id = require_string(
-            arguments,
-            &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
-        )?;
+        let (flow_lock_id, _) = self.require_flow_lock_binding_from_arguments(arguments)?;
         let format = flow_export_format_arg(arguments)?;
-        let Some(lock) = self.state.flow_locks.get(flow_lock_id) else {
+        let Some(lock) = self.state.flow_locks.get(&flow_lock_id) else {
             return Ok(ToolCallResult::error(json!({
                 "ok": false,
                 "flow_lock_id": flow_lock_id,

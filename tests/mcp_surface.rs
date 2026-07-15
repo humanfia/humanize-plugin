@@ -5,18 +5,17 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use humanize_plugin::mcp::{AUTHORING_TOOL_NAMES, McpServer, McpSurface, REVIEW_TOOL_NAMES};
+use humanize_plugin::mcp::{McpServer, McpSurface};
+use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::{Value, json};
 
-use support::mcp::{call_tool, readme_resource};
+use support::mcp::{RecordingRunner, call_tool, readme_resource};
 
 static NEXT_STDIO_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
 
 fn child_asset_root(name: &str) -> PathBuf {
     let index = NEXT_STDIO_ASSET_ROOT.fetch_add(1, Ordering::SeqCst);
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("temp")
-        .join(format!("{name}-{index}"));
+    let root = std::env::temp_dir().join(format!("humanize-{name}-{}-{index}", std::process::id()));
     if root.exists() {
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -43,17 +42,14 @@ fn assert_required_alias_group(schema: &Value, aliases: &[&str]) {
 
 fn expected_tool_names() -> Vec<&'static str> {
     vec![
-        "start_run",
         "get_context",
         "deliver_artifact",
         "fanout_from_artifact",
         "record_effect",
-        "record_hook_fact",
         "patch_board",
         "activate_node",
         "send_message",
         "validate_stop",
-        "observe_stop",
         "apply_flow_lock",
         "preview_flow_routes",
         "run_flow",
@@ -61,10 +57,10 @@ fn expected_tool_names() -> Vec<&'static str> {
         "run_why",
         "pause_run",
         "resume_run",
+        "complete_run",
         "stop_run",
         "view_terminal",
         "view_snapshot",
-        "view_browser",
         "flow_repair",
         "flow_apply",
         "flow_suggest",
@@ -74,7 +70,7 @@ fn expected_tool_names() -> Vec<&'static str> {
         "propose_flow_update",
         "apply_flow_update",
         "prepare_flow_review",
-        "approve_flow_review",
+        "decide_flow_review",
     ]
 }
 
@@ -89,6 +85,122 @@ fn mcp_surface_exposes_exact_tool_names_and_lookup() {
         assert_eq!(descriptor.name(), name);
     }
     assert!(surface.lookup("unknown_tool").is_none());
+}
+
+#[test]
+fn unsupported_runtime_tools_are_hidden_from_list_and_lookup() {
+    let surface = McpSurface;
+    let names = surface
+        .tools()
+        .into_iter()
+        .map(|tool| tool.name())
+        .collect::<Vec<_>>();
+
+    for hidden in [
+        "start_run",
+        "view_browser",
+        "record_hook_fact",
+        "observe_stop",
+    ] {
+        assert!(!names.contains(&hidden));
+        assert!(surface.lookup(hidden).is_none());
+    }
+}
+
+#[test]
+fn hidden_tools_are_rejected_for_every_runner_without_creating_state() {
+    let root = child_asset_root("mcp-hidden-tools");
+    let store = RunAssetStore::new(RunAssetSink::Root(root.clone()));
+    let mut server =
+        McpServer::with_tmux_runner_and_run_asset_store(RecordingRunner::default(), store.clone());
+
+    for (id, name, arguments) in [
+        (
+            1,
+            "start_run",
+            json!({ "run_id": "run-hidden", "nodes": [{ "id": "root" }] }),
+        ),
+        (
+            2,
+            "view_browser",
+            json!({ "run_id": "run-hidden", "host": "127.0.0.1" }),
+        ),
+    ] {
+        let response = call_tool(&mut server, id, name, arguments);
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert_eq!(response["error"]["message"], "unknown tool", "{response}");
+    }
+
+    assert!(!store.run_root("run-hidden").unwrap().exists());
+}
+
+#[test]
+fn every_advertised_run_read_requires_run_id() {
+    let surface = McpSurface;
+
+    for name in [
+        "get_context",
+        "run_status",
+        "run_why",
+        "validate_stop",
+        "preview_flow_routes",
+        "view_terminal",
+        "view_snapshot",
+    ] {
+        let descriptor = surface.lookup(name).expect("tool should be advertised");
+        assert_required_alias_group(descriptor.input_schema(), &["run_id", "runId"]);
+    }
+}
+
+#[test]
+fn participant_message_schema_requires_target_identity_and_text() {
+    let descriptor = McpSurface
+        .lookup("send_message")
+        .expect("send_message should be advertised");
+    let schema = descriptor.input_schema();
+
+    assert_required_alias_group(schema, &["run_id", "runId"]);
+    assert_required_alias_group(schema, &["activation_id", "activationId"]);
+    assert_required_alias_group(schema, &["message_id", "messageId"]);
+    assert_required_alias_group(schema, &["text", "message"]);
+}
+
+#[test]
+fn every_advertised_run_tool_rejects_missing_run_id_before_dispatch() {
+    let mut server = McpServer::new();
+    let run_tools = [
+        "get_context",
+        "deliver_artifact",
+        "fanout_from_artifact",
+        "record_effect",
+        "patch_board",
+        "activate_node",
+        "send_message",
+        "validate_stop",
+        "apply_flow_lock",
+        "preview_flow_routes",
+        "run_flow",
+        "run_status",
+        "run_why",
+        "pause_run",
+        "resume_run",
+        "complete_run",
+        "stop_run",
+        "view_terminal",
+        "view_snapshot",
+        "apply_flow_update",
+    ];
+
+    for (index, name) in run_tools.into_iter().enumerate() {
+        let response = call_tool(&mut server, index as u64 + 100, name, json!({}));
+        assert_eq!(response["error"]["code"], -32602, "{name}: {response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("run_id")),
+            "{name}: {response}"
+        );
+    }
 }
 #[test]
 fn fanout_from_artifact_schema_requires_runtime_arguments() {
@@ -158,20 +270,46 @@ fn new_runtime_authoring_and_review_tool_groups_are_explicit() {
         "run_why",
         "pause_run",
         "resume_run",
+        "complete_run",
         "stop_run",
-        "observe_stop",
-        "record_hook_fact",
     ] {
         assert!(runtime_names.contains(&name));
     }
-    for name in ["flow_repair", "propose_flow_update", "apply_flow_update"] {
+    for name in ["flow_repair", "propose_flow_update"] {
         assert!(authoring_names.contains(&name));
-        assert!(AUTHORING_TOOL_NAMES.contains(&name));
     }
-    for name in ["prepare_flow_review", "approve_flow_review"] {
+    assert!(runtime_names.contains(&"apply_flow_update"));
+    for name in ["prepare_flow_review", "decide_flow_review"] {
         assert!(review_names.contains(&name));
-        assert!(REVIEW_TOOL_NAMES.contains(&name));
     }
+}
+
+#[test]
+fn generation_aware_run_controls_are_advertised_with_bounded_schemas() {
+    let surface = McpSurface;
+    let run_flow_descriptor = surface
+        .lookup("run_flow")
+        .expect("run_flow should be advertised");
+    let run_flow = run_flow_descriptor.input_schema();
+    assert_eq!(
+        run_flow["properties"]["run_mode"]["enum"],
+        json!(["finite", "continuous", "manual"])
+    );
+    assert_eq!(run_flow["properties"]["activation_limit"]["minimum"], 0);
+    assert_eq!(run_flow["properties"]["stop_attempt_limit"]["minimum"], 1);
+    assert_eq!(run_flow["properties"]["stop_attempt_limit"]["maximum"], 8);
+
+    let resume_descriptor = surface
+        .lookup("resume_run")
+        .expect("resume_run should be advertised");
+    let resume = resume_descriptor.input_schema();
+    assert_eq!(resume["properties"]["activation_limit"]["minimum"], 0);
+
+    let complete_descriptor = surface
+        .lookup("complete_run")
+        .expect("complete_run should be advertised");
+    let complete = complete_descriptor.input_schema();
+    assert_required_alias_group(complete, &["run_id", "runId"]);
 }
 
 #[test]
@@ -204,8 +342,21 @@ fn new_tool_schemas_cover_core_arguments() {
         .expect("flow_repair descriptor should be present");
     assert_eq!(flow_repair.input_schema()["required"], json!(["flow"]));
     assert_eq!(
-        flow_repair.input_schema()["properties"]["route_authoring"]["type"],
-        "array"
+        flow_repair.input_schema()["properties"]["include_warnings"]["type"],
+        "boolean"
+    );
+    assert!(flow_repair.description().contains("does not modify"));
+    assert!(flow_repair.description().contains("unranked"));
+    assert!(flow_repair.description().contains("authored order"));
+    assert!(
+        flow_repair
+            .description()
+            .contains("guidance and diagnostics")
+    );
+    assert!(
+        flow_repair.input_schema()["properties"]
+            .get("route_authoring")
+            .is_none()
     );
 
     for name in [
@@ -247,12 +398,18 @@ fn new_tool_schemas_cover_core_arguments() {
         "string"
     );
     assert_eq!(
-        run_flow.input_schema()["properties"]["review_required"]["type"],
-        "boolean"
+        run_flow.input_schema()["properties"]["review_id"]["type"],
+        "string"
     );
     assert_eq!(
-        run_flow.input_schema()["properties"]["reviewRequired"]["type"],
-        "boolean"
+        run_flow.input_schema()["properties"]["reviewId"]["type"],
+        "string"
+    );
+    assert_required_alias_group(run_flow.input_schema(), &["review_id", "reviewId"]);
+    assert!(
+        run_flow.input_schema()["properties"]
+            .get("review_required")
+            .is_none()
     );
     assert_eq!(
         run_flow.input_schema()["properties"]["tmux"]["properties"]["enabled"]["type"],
@@ -295,28 +452,6 @@ fn new_tool_schemas_cover_core_arguments() {
         );
     }
 
-    let observe_stop = surface
-        .lookup("observe_stop")
-        .expect("observe_stop descriptor should be present");
-    assert_eq!(observe_stop.input_schema()["required"], json!(["reason"]));
-    assert_required_alias_group(observe_stop.input_schema(), &["run_id", "runId"]);
-    assert_required_alias_group(
-        observe_stop.input_schema(),
-        &["activation_id", "activationId"],
-    );
-    assert_eq!(
-        observe_stop.input_schema()["properties"]["activation_id"]["type"],
-        "string"
-    );
-    assert_eq!(
-        observe_stop.input_schema()["properties"]["activationId"]["type"],
-        "string"
-    );
-    assert_eq!(
-        observe_stop.input_schema()["properties"]["reason"]["type"],
-        "string"
-    );
-
     let prepare = surface
         .lookup("prepare_flow_review")
         .expect("prepare_flow_review descriptor should be present");
@@ -325,11 +460,11 @@ fn new_tool_schemas_cover_core_arguments() {
         "string"
     );
 
-    let approve = surface
-        .lookup("approve_flow_review")
-        .expect("approve_flow_review descriptor should be present");
+    let decide = surface
+        .lookup("decide_flow_review")
+        .expect("decide_flow_review descriptor should be present");
     assert_eq!(
-        approve.input_schema()["required"],
+        decide.input_schema()["required"],
         json!(["review_id", "decision"])
     );
 
@@ -337,13 +472,15 @@ fn new_tool_schemas_cover_core_arguments() {
         .lookup("propose_flow_update")
         .expect("propose_flow_update descriptor should be present");
     assert_eq!(propose.input_schema()["required"], json!(["flow"]));
+    assert!(propose.input_schema()["properties"].get("run_id").is_none());
     assert_eq!(
         propose.input_schema()["properties"]["applyMode"]["type"],
         "string"
     );
-    assert_eq!(
-        propose.input_schema()["properties"]["reviewRequired"]["type"],
-        "boolean"
+    assert!(
+        propose.input_schema()["properties"]
+            .get("reviewRequired")
+            .is_none()
     );
 
     let apply = surface
@@ -356,6 +493,7 @@ fn new_tool_schemas_cover_core_arguments() {
         &["flow_lock_id", "flowLockId", "lock_id", "lockId"],
     );
     assert_required_alias_group(apply.input_schema(), &["content_hash", "contentHash"]);
+    assert_required_alias_group(apply.input_schema(), &["review_id", "reviewId"]);
     assert_eq!(
         apply.input_schema()["properties"]["applyMode"]["type"],
         "string"
@@ -371,12 +509,14 @@ fn new_tool_schemas_cover_core_arguments() {
         &["lock_id", "lockId", "flow_lock_id", "flowLockId"],
     );
     assert_required_alias_group(apply_lock.input_schema(), &["content_hash", "contentHash"]);
+    assert_required_alias_group(apply_lock.input_schema(), &["review_id", "reviewId"]);
     for name in [
         "runId",
         "lockId",
         "flow_lock_id",
         "flowLockId",
         "contentHash",
+        "reviewId",
     ] {
         assert_eq!(
             apply_lock.input_schema()["properties"][name]["type"],
@@ -386,14 +526,45 @@ fn new_tool_schemas_cover_core_arguments() {
 }
 
 #[test]
-fn runtime_flow_descriptions_surface_start_run_recovery() {
+fn resume_run_schema_exposes_ambiguous_delivery_resolution_contract() {
+    let descriptor = McpSurface
+        .lookup("resume_run")
+        .expect("resume_run descriptor should be present");
+    assert!(descriptor.description().contains("ambiguous_delivery"));
+    assert!(descriptor.description().contains("started_event_sequence"));
+    let resolution = &descriptor.input_schema()["properties"]["delivery_resolution"];
+    assert_eq!(resolution["type"], "object");
+    assert_eq!(
+        resolution["required"],
+        json!(["started_event_sequence", "outcome", "evidence"])
+    );
+    assert_eq!(
+        resolution["properties"]["started_event_sequence"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        resolution["properties"]["started_event_sequence"]["minimum"],
+        1
+    );
+    assert_eq!(
+        resolution["properties"]["outcome"]["enum"],
+        json!(["submitted", "not_submitted"])
+    );
+    assert_eq!(resolution["properties"]["evidence"]["minLength"], 1);
+    assert_eq!(resolution["properties"]["evidence"]["pattern"], r".*\S.*");
+    assert!(resolution["properties"].get("activation_id").is_none());
+    assert!(resolution["properties"].get("role").is_none());
+}
+
+#[test]
+fn runtime_flow_descriptions_surface_run_flow_recovery() {
     let surface = McpSurface;
 
-    for name in ["start_run", "apply_flow_lock", "preview_flow_routes"] {
+    for name in ["apply_flow_lock", "preview_flow_routes"] {
         let descriptor = surface.lookup(name).expect("tool should be present");
         assert!(
-            descriptor.description().contains("start_run"),
-            "{name} description should mention start_run"
+            descriptor.description().contains("run_flow"),
+            "{name} description should mention run_flow"
         );
     }
 }
@@ -431,23 +602,6 @@ fn tools_list_includes_preview_flow_routes_descriptor() {
     );
 }
 #[test]
-fn start_run_schema_requires_tmux_session_and_window_when_enabled() {
-    let surface = McpSurface;
-    let descriptor = surface
-        .lookup("start_run")
-        .expect("start_run descriptor should be present");
-    let schema = descriptor.input_schema();
-    let tmux_schema = &schema["properties"]["tmux"];
-    let enabled_case = &tmux_schema["allOf"][0];
-
-    assert_eq!(enabled_case["if"]["required"], json!(["enabled"]));
-    assert_eq!(enabled_case["if"]["properties"]["enabled"]["const"], true);
-    assert_eq!(
-        enabled_case["then"]["required"],
-        json!(["session", "window"])
-    );
-}
-#[test]
 fn tools_call_rejects_non_object_arguments() {
     let mut server = McpServer::new();
 
@@ -472,7 +626,7 @@ fn deliver_artifact_rejects_missing_required_arguments() {
         response["error"]["message"]
             .as_str()
             .expect("error should include a message")
-            .contains("artifact_key")
+            .contains("run_id")
     );
 }
 #[test]
@@ -509,10 +663,10 @@ fn initialize_result_includes_server_wide_workflow_instructions() {
         "flow_check",
         "flow_lock",
         "prepare_flow_review",
-        "approve_flow_review",
+        "decide_flow_review",
         "run_flow",
         "do not substitute ordinary repo exploration",
-        "README before locking or running",
+        "root README.md before locking or running",
     ] {
         assert!(
             prefix.contains(expected),
@@ -538,6 +692,38 @@ fn cli_list_tools_emits_json_tool_descriptors() {
 
     assert_eq!(names, expected_tool_names());
 }
+
+#[test]
+fn stdio_project_local_home_exits_with_configuration_error_without_panic() {
+    let project = child_asset_root("mcp-project-local-home");
+    std::fs::create_dir_all(&project).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_humanize-plugin-mcp"))
+        .current_dir(&project)
+        .env("HOME", &project)
+        .env("RUST_BACKTRACE", "1")
+        .env_remove("HUMANIZE_STATE_ROOT")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("binary should run");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {:?}",
+        output.stdout
+    );
+    assert!(stderr.contains("MCP configuration error"), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    assert!(!stderr.contains("stack backtrace"), "{stderr}");
+    assert!(
+        !stderr.contains(project.to_string_lossy().as_ref()),
+        "{stderr}"
+    );
+
+    std::fs::remove_dir_all(project).unwrap();
+}
+
 #[test]
 fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
     let asset_root = child_asset_root("mcp-surface-stdio-assets");
@@ -554,8 +740,8 @@ fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
             json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flow_check","arguments":{"flow":{"nodes":["root"],"resources":[readme_resource()]},"mode":"core"}}}),
-            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"flow_repair","arguments":{"flow":{"nodes":["root"],"resources":[readme_resource()]},"route_authoring":[{"when":"exists(artifact.ready)","to":"root"}]}}}),
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_flow","arguments":{"run_id":"run-a","nodes":["root"]}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"flow_repair","arguments":{"flow":{"nodes":["root"],"resources":[readme_resource()]}}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_flow","arguments":{"run_id":"run-a","nodes":["root"],"review_id":"review-missing"}}}),
             json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_status","arguments":{"run_id":"run-a"}}}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run_why","arguments":{"run_id":"run-a"}}}),
         ] {
@@ -589,12 +775,19 @@ fn stdio_json_rpc_smoke_handles_initialize_list_and_calls() {
         responses[4]["result"]["structuredContent"]["run_id"],
         "run-a"
     );
+    assert_eq!(responses[4]["result"]["structuredContent"]["ok"], false);
     assert_eq!(
-        responses[5]["result"]["structuredContent"]["run_status"],
-        "running"
+        responses[4]["result"]["structuredContent"]["error"],
+        "flow_lock_id is required for driver run_flow"
     );
+    assert_eq!(responses[5]["result"]["isError"], true);
     assert_eq!(
-        responses[6]["result"]["structuredContent"]["cause"],
-        "run is running"
+        responses[5]["result"]["structuredContent"]["error"]["code"],
+        "driver_authority_required"
+    );
+    assert_eq!(responses[6]["result"]["isError"], true);
+    assert_eq!(
+        responses[6]["result"]["structuredContent"]["error"]["code"],
+        "driver_authority_required"
     );
 }

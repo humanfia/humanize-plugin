@@ -30,6 +30,7 @@ fn record_with_status(
         run_id: "run-a".to_string(),
         activation_id: "activation-a".to_string(),
         pane_id: "%8".to_string(),
+        allocation_generation: 0,
         started_at_ms: submitted_at_ms.saturating_sub(10),
         submitted_at_ms,
         payload_hash: machine_input_payload_hash(&normalized_text),

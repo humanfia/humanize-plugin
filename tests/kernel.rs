@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
+use humanize_plugin::flow::FlowPredicate;
 use humanize_plugin::kernel::{
     Artifact, Board, BoardPatch, BoardPatchError, BoardValue, CompletionRule, Contract,
-    ContractPermit, ContractProduction, ContractRequirement, Event, Node, Route,
-    kernel_primitive_names,
+    ContractPermit, ContractProduction, ContractRequirement, Event, Node, kernel_primitive_names,
 };
+use serde_json::json;
 
 #[test]
 fn kernel_primitive_names_are_exactly_the_authoring_kernel() {
@@ -122,19 +123,31 @@ fn contract_describes_local_inputs_outputs_permissions_and_completion() {
 }
 
 #[test]
-fn route_keeps_predicate_text_and_optional_for_each_expression_only() {
-    let single = Route::new("route:single", "node:test", "node:review")
-        .when("artifact.schema == 'test.result.v1' && artifact.status == 'passed'");
-    let fanout = Route::new("route:fanout", "node:test", "node:review")
-        .when("artifact.schema == 'test.result.v1'")
-        .for_each_artifact("artifact.test_results");
+fn completion_rules_use_structured_typed_serde() {
+    let rule = CompletionRule::Predicate(FlowPredicate::truthy_board("open").unwrap());
+    let value = serde_json::to_value(&rule).unwrap();
 
     assert_eq!(
-        single.predicate(),
-        "artifact.schema == 'test.result.v1' && artifact.status == 'passed'"
+        value,
+        json!({
+            "kind": "predicate",
+            "predicate": {
+                "op": "truthy",
+                "fact": { "kind": "board", "key": "open" }
+            }
+        })
     );
-    assert_eq!(single.for_each(), None);
-    assert_eq!(fanout.for_each(), Some("artifact.test_results"));
+    assert_eq!(
+        serde_json::from_value::<CompletionRule>(value).unwrap(),
+        rule
+    );
+    assert!(
+        serde_json::from_value::<CompletionRule>(json!({
+            "kind": "predicate",
+            "predicate": "truthy(board.open)"
+        }))
+        .is_err()
+    );
 }
 
 #[test]

@@ -8,18 +8,17 @@ use super::{
 
 pub(super) fn flow_draft_arg(arguments: &Value) -> Result<flow::FlowDraft, ToolError> {
     let flow = require_object_arg(arguments, &["flow"])?;
-    parse_flow_draft_object(flow, false)
+    parse_flow_draft_object(flow)
 }
 
 pub(super) fn flow_draft_for_repair(
     flow: &serde_json::Map<String, Value>,
 ) -> Result<flow::FlowDraft, ToolError> {
-    parse_flow_draft_object(flow, true)
+    parse_flow_draft_object(flow)
 }
 
 fn parse_flow_draft_object(
     flow: &serde_json::Map<String, Value>,
-    lenient_routes: bool,
 ) -> Result<flow::FlowDraft, ToolError> {
     let parsed_contracts = optional_array_field(flow, "contracts")?
         .iter()
@@ -39,17 +38,10 @@ fn parse_flow_draft_object(
             .iter()
             .map(|parsed| parsed.contract.clone())
             .collect(),
-        routes: if lenient_routes {
-            optional_array_field(flow, "routes")?
-                .iter()
-                .filter_map(|route| parse_flow_route(route).ok())
-                .collect::<Vec<_>>()
-        } else {
-            optional_array_field(flow, "routes")?
-                .iter()
-                .map(parse_flow_route)
-                .collect::<Result<Vec<_>, _>>()?
-        },
+        routes: optional_array_field(flow, "routes")?
+            .iter()
+            .map(parse_flow_route)
+            .collect::<Result<Vec<_>, _>>()?,
         resources: optional_array_field(flow, "resources")?
             .iter()
             .map(parse_flow_resource)
@@ -294,9 +286,20 @@ fn parse_flow_route(value: &Value) -> Result<flow::FlowRoute, ToolError> {
     let object = value
         .as_object()
         .ok_or_else(|| ToolError::invalid("routes items must be objects"))?;
+    let predicate = object
+        .get("predicate")
+        .ok_or_else(|| ToolError::invalid("route predicate is required"))?;
     Ok(flow::FlowRoute {
-        predicate: string_field(object, &["predicate"])?.to_string(),
-        for_each: optional_string_field(object, &["for_each", "forEach"])?.map(str::to_string),
+        predicate: serde_json::from_value(predicate.clone())
+            .map_err(|error| ToolError::invalid(format!("invalid route predicate: {error}")))?,
+        for_each: object
+            .get("for_each")
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    ToolError::invalid(format!("invalid route for_each artifact: {error}"))
+                })
+            })
+            .transpose()?,
         activate: string_field(object, &["activate"])?.to_string(),
     })
 }
@@ -306,9 +309,9 @@ fn parse_flow_resource(value: &Value) -> Result<flow::FlowResource, ToolError> {
         .as_object()
         .ok_or_else(|| ToolError::invalid("resources items must be objects"))?;
     Ok(flow::FlowResource {
-        id: string_field(object, &["id"])?.to_string(),
+        id: string_field(object, &["path"])?.to_string(),
         kind: parse_resource_kind(string_field(object, &["kind"])?)?,
-        source: string_field(object, &["source"])?.to_string(),
+        source: string_field(object, &["content"])?.to_string(),
     })
 }
 
@@ -322,6 +325,7 @@ fn parse_resource_kind(value: &str) -> Result<flow::ResourceKind, ToolError> {
         "script" | "Script" => Ok(flow::ResourceKind::Script),
         "flow" | "Flow" => Ok(flow::ResourceKind::Flow),
         "readme" | "README" | "Readme" => Ok(flow::ResourceKind::Readme),
+        "skill" | "Skill" => Ok(flow::ResourceKind::Skill),
         value => Err(ToolError::invalid(format!(
             "unknown resource kind: {value}"
         ))),

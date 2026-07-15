@@ -1,9 +1,5 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{self, Read, Write as _};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
-use std::thread;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -15,7 +11,7 @@ mod review;
 pub use review::{
     AdapterCapabilityReview, DiffEntry, FlowGraph, FlowGraphEdge, FlowGraphNode,
     FlowReviewContract, FlowReviewNode, FlowReviewRoute, FlowReviewSnapshot, FlowValueFlow,
-    FlowVisualDiff, ReviewRisk, render_flow_review_document,
+    FlowVisualDiff, ReviewRisk, derive_flow_graph, render_flow_review_document,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -525,45 +521,6 @@ pub fn render_browser_document(snapshot: &VisualizationSnapshot) -> serde_json::
     ))
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct BrowserViewServer {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) url: String,
-}
-
-pub(crate) fn serve_browser_snapshot(
-    host: &str,
-    port: u16,
-    snapshot: &VisualizationSnapshot,
-) -> io::Result<BrowserViewServer> {
-    let html = render_browser_document(snapshot).map_err(io_other)?;
-    let snapshot_json = snapshot_json(snapshot).map_err(io_other)?;
-    let listener = TcpListener::bind((host, port))?;
-    let local_addr = listener.local_addr()?;
-    let local_host = local_addr.ip().to_string();
-    let url_host = if local_addr.ip().is_ipv6() {
-        format!("[{}]", local_addr.ip())
-    } else {
-        local_host.clone()
-    };
-    let port = local_addr.port();
-    let html = Arc::new(html);
-    let snapshot_json = Arc::new(snapshot_json);
-
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let _ = serve_browser_stream(stream, html.as_str(), snapshot_json.as_str());
-        }
-    });
-
-    Ok(BrowserViewServer {
-        host: local_host,
-        port,
-        url: format!("http://{url_host}:{port}/"),
-    })
-}
-
 fn render_browser_body(snapshot: &VisualizationSnapshot) -> String {
     let mut body = String::new();
     writeln!(body, "<p>Runs: {}</p>", snapshot.runs.len())
@@ -680,61 +637,4 @@ pub(crate) fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
-}
-
-fn serve_browser_stream(mut stream: TcpStream, html: &str, snapshot_json: &str) -> io::Result<()> {
-    let mut request_bytes = Vec::new();
-    let mut buffer = [0; 512];
-    loop {
-        let bytes = stream.read(&mut buffer)?;
-        if bytes == 0 {
-            break;
-        }
-        request_bytes.extend_from_slice(&buffer[..bytes]);
-        if http_headers_complete(&request_bytes) || request_bytes.len() >= 8192 {
-            break;
-        }
-    }
-    let request = String::from_utf8_lossy(&request_bytes);
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-
-    match path {
-        "/" => write_http_response(&mut stream, "200 OK", "text/html; charset=utf-8", html),
-        "/snapshot.json" => {
-            write_http_response(&mut stream, "200 OK", "application/json", snapshot_json)
-        }
-        _ => write_http_response(
-            &mut stream,
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            "not found\n",
-        ),
-    }
-}
-
-fn write_http_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &str,
-) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )?;
-    stream.flush()
-}
-
-fn http_headers_complete(bytes: &[u8]) -> bool {
-    bytes.windows(4).any(|window| window == b"\r\n\r\n")
-        || bytes.windows(2).any(|window| window == b"\n\n")
-}
-
-fn io_other(err: serde_json::Error) -> io::Error {
-    io::Error::other(err)
 }

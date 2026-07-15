@@ -94,8 +94,8 @@ fn readme_starts_with_production_install_flow_and_terse_prompt() {
         .find("## Install\n")
         .expect("README beginning should include the production Install heading");
     let runtime_install = beginning
-        .find("cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin humanize-plugin-mcp")
-        .expect("README beginning should include the production runtime install command");
+        .find("cargo install --git https://github.com/humanfia/humanize-plugin --locked --bins")
+        .expect("README beginning should install every production binary");
     let codex_marketplace = beginning
         .find("codex plugin marketplace add humanfia/humanize-plugin")
         .expect("README beginning should include the Codex marketplace command");
@@ -109,7 +109,7 @@ fn readme_starts_with_production_install_flow_and_terse_prompt() {
         .find("claude plugin install humanize-plugin@humanfia")
         .expect("README beginning should include the Claude Code install command");
     let prompt_heading = beginning
-        .find("## Start with natural language")
+        .find("## First Use")
         .expect("README beginning should include terse prompt examples before details");
     let prompt = beginning
         .find("Use Humanize")
@@ -127,10 +127,16 @@ fn readme_starts_with_production_install_flow_and_terse_prompt() {
         "README beginning should not push client install behind prerequisites"
     );
 
-    assert!(readme.contains(
-        "cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin humanize-plugin-mcp --force"
+    assert!(!readme.contains(
+        "cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin "
     ));
-    assert!(readme.contains("cargo uninstall humanize-plugin"));
+    assert_eq!(
+        readme
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .collect::<Vec<_>>(),
+        ["## Install", "## First Use"]
+    );
 }
 
 #[test]
@@ -149,6 +155,54 @@ fn workflow_skill_explains_executable_tmux_agent_runs() {
 }
 
 #[test]
+fn architecture_and_skill_explain_ambiguous_delivery_recovery() {
+    for relative in ["docs/architecture.md", "skills/humanize-workflows/SKILL.md"] {
+        let text = read_text(relative);
+        for required in [
+            "ambiguous_delivery",
+            "started_event_sequence",
+            "submitted",
+            "not_submitted",
+            "evidence",
+            "resume_run",
+        ] {
+            assert!(
+                text.contains(required),
+                "{relative} should document {required}"
+            );
+        }
+    }
+}
+
+#[test]
+fn docs_define_operator_console_and_cooperative_tmux_guard_boundary() {
+    for relative in ["docs/architecture.md", "skills/humanize-workflows/SKILL.md"] {
+        let text = read_text(relative);
+        assert!(
+            text.contains("operator-only"),
+            "{relative} should define console ownership"
+        );
+        assert!(
+            text.contains("same-UID OS security boundary"),
+            "{relative} should state the guard boundary"
+        );
+        assert!(
+            text.contains("model control") && text.contains("MCP"),
+            "{relative} should route model control through MCP"
+        );
+    }
+}
+
+#[test]
+fn architecture_describes_durable_driver_runtime_authority() {
+    let architecture = read_text("docs/architecture.md");
+
+    assert!(architecture.contains("durable driver"));
+    assert!(architecture.contains("append-only runtime events"));
+    assert!(!architecture.contains("Runtime state is local and in-memory."));
+}
+
+#[test]
 fn workflow_skill_minimal_example_keeps_valid_adaptive_review_loop() {
     let skill = read_text("skills/humanize-workflows/SKILL.md");
     let example = fenced_block_after(&skill, "## Minimal Draft Example", "json");
@@ -160,35 +214,39 @@ fn workflow_skill_minimal_example_keeps_valid_adaptive_review_loop() {
             .as_array()
             .expect("minimal draft example should include routes")
             .iter()
-            .any(
-                |route| route["predicate"] == "exists(artifact.review_continue)"
+            .any(|route| {
+                route["predicate"]
+                    == json!({
+                        "op": "exists",
+                        "fact": {"kind": "artifact", "key": "review_continue"}
+                    })
                     && route["activate"] == "try_candidates"
-            )
+            })
     );
     assert!(!example.contains("artifact.review_verdict =="));
-    let resource_sources = flow["resources"]
+    let resource_contents = flow["resources"]
         .as_array()
         .expect("minimal draft example should include resources")
         .iter()
-        .filter_map(|resource| resource["source"].as_str())
+        .filter_map(|resource| resource["content"].as_str())
         .collect::<Vec<_>>();
     assert!(
-        resource_sources
+        resource_contents
             .iter()
             .any(|source| source.contains("artifact_key \"baseline\""))
     );
     assert!(
-        resource_sources
+        resource_contents
             .iter()
             .any(|source| source.contains("artifact_key \"candidates\""))
     );
     assert!(
-        resource_sources
+        resource_contents
             .iter()
             .any(|source| source.contains("artifact_key \"review_verdict\""))
     );
     assert!(
-        resource_sources
+        resource_contents
             .iter()
             .any(|source| source.contains("artifact_key \"review_continue\""))
     );

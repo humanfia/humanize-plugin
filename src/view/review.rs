@@ -1,6 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::Serialize;
+
+use crate::flow;
 
 use super::{RuntimeBudgetSnapshot, escape_html, escape_script_json};
 
@@ -55,6 +58,7 @@ pub struct FlowReviewRoute {
     pub from: String,
     pub to: String,
     pub predicate: String,
+    pub for_each: Option<String>,
     pub outcome: String,
 }
 
@@ -118,6 +122,128 @@ impl DiffEntry {
             detail: detail.into(),
         }
     }
+}
+
+pub fn derive_flow_graph(draft: &flow::FlowDraft) -> FlowGraph {
+    let producers = artifact_producers(draft);
+    let mut facts = BTreeSet::new();
+    for route in &draft.routes {
+        facts.insert(route.predicate.fact_ref().clone());
+        if let Some(for_each) = &route.for_each {
+            facts.insert(for_each.fact_ref());
+        }
+    }
+
+    let mut nodes = draft
+        .nodes
+        .iter()
+        .map(|node| FlowGraphNode {
+            id: node.id.clone(),
+            label: node.id.replace(['_', '-'], " "),
+            kind: "work".to_string(),
+        })
+        .collect::<Vec<_>>();
+    nodes.extend(facts.iter().map(|fact_ref| FlowGraphNode {
+        id: fact_node_id(fact_ref),
+        label: fact_ref.to_string(),
+        kind: "fact".to_string(),
+    }));
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut edges = Vec::new();
+    for fact_ref in &facts {
+        let flow::FactRef::Artifact { .. } = fact_ref else {
+            continue;
+        };
+        if let Some(producers) = producers.get(fact_ref)
+            && producers.len() == 1
+        {
+            edges.push(FlowGraphEdge {
+                from: producers.iter().next().expect("one producer").clone(),
+                to: fact_node_id(fact_ref),
+                label: "produces".to_string(),
+            });
+        }
+    }
+    for route in &draft.routes {
+        let predicate_fact = route.predicate.fact_ref();
+        let for_each_fact = route.for_each.as_ref().map(flow::ArtifactRef::fact_ref);
+        let label = if for_each_fact.as_ref() == Some(predicate_fact) {
+            format!(
+                "{} | for each {}",
+                route.predicate,
+                route.for_each.as_ref().expect("matching fanout fact")
+            )
+        } else {
+            route.predicate.to_string()
+        };
+        edges.push(FlowGraphEdge {
+            from: fact_node_id(predicate_fact),
+            to: route.activate.clone(),
+            label,
+        });
+        if let Some(for_each_fact) = for_each_fact
+            && &for_each_fact != predicate_fact
+        {
+            edges.push(FlowGraphEdge {
+                from: fact_node_id(&for_each_fact),
+                to: route.activate.clone(),
+                label: format!("for each {}", route.for_each.as_ref().expect("fanout fact")),
+            });
+        }
+    }
+    edges.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then(left.to.cmp(&right.to))
+            .then(left.label.cmp(&right.label))
+    });
+
+    FlowGraph { nodes, edges }
+}
+
+fn artifact_producers(draft: &flow::FlowDraft) -> BTreeMap<flow::FactRef, BTreeSet<String>> {
+    let contracts = draft
+        .contracts
+        .iter()
+        .map(|contract| (contract.id.as_str(), contract))
+        .collect::<BTreeMap<_, _>>();
+    let mut producers = BTreeMap::<flow::FactRef, BTreeSet<String>>::new();
+    for node in &draft.nodes {
+        if let Some(action) = &node.action {
+            for fact_path in action.writes.iter().chain(action.verdict_artifact.iter()) {
+                if let Some(fact_ref) = artifact_fact_from_action_ref(fact_path) {
+                    producers
+                        .entry(fact_ref)
+                        .or_default()
+                        .insert(node.id.clone());
+                }
+            }
+        }
+        if let Some(contract) = node
+            .contract_id
+            .as_deref()
+            .and_then(|contract_id| contracts.get(contract_id).copied())
+        {
+            for artifact in &contract.artifacts {
+                if let Ok(fact_ref) = flow::FactRef::artifact(&artifact.id) {
+                    producers
+                        .entry(fact_ref)
+                        .or_default()
+                        .insert(node.id.clone());
+                }
+            }
+        }
+    }
+    producers
+}
+
+fn artifact_fact_from_action_ref(value: &str) -> Option<flow::FactRef> {
+    flow::FactRef::artifact(value.strip_prefix("artifact.")?).ok()
+}
+
+fn fact_node_id(fact_ref: &flow::FactRef) -> String {
+    format!("fact:{fact_ref}")
 }
 
 pub fn render_flow_review_document(snapshot: &FlowReviewSnapshot) -> serde_json::Result<String> {
@@ -236,15 +362,16 @@ fn render_nodes(body: &mut String, nodes: &[FlowReviewNode]) {
 
 fn render_routes(body: &mut String, routes: &[FlowReviewRoute]) {
     body.push_str("<section><h2>Route Predicates</h2>");
-    body.push_str("<table><thead><tr><th>Route</th><th>Path</th><th>Predicate</th><th>Outcome</th></tr></thead><tbody>");
+    body.push_str("<table><thead><tr><th>Route</th><th>Path</th><th>Predicate</th><th>Fanout</th><th>Outcome</th></tr></thead><tbody>");
     for route in routes {
         write!(
             body,
-            "<tr><td><code>{}</code></td><td><code>{} -> {}</code></td><td><code>{}</code></td><td>{}</td></tr>",
+            "<tr><td><code>{}</code></td><td><code>{} -> {}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>",
             text(&route.id),
             text(&route.from),
             text(&route.to),
             text(&route.predicate),
+            text(route.for_each.as_deref().unwrap_or("none")),
             text(&route.outcome)
         )
         .expect("writing to a string should not fail");

@@ -5,10 +5,10 @@ runnable MCP flow packages.
 
 ## Install
 
-Install the MCP runtime binary from GitHub:
+Install the MCP runtime and its dedicated per-run driver from GitHub:
 
 ```bash
-cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin humanize-plugin-mcp
+cargo install --git https://github.com/humanfia/humanize-plugin --locked --bins
 ```
 
 Add the marketplace and plugin to Codex:
@@ -25,7 +25,7 @@ claude plugin marketplace add humanfia/humanize-plugin
 claude plugin install humanize-plugin@humanfia
 ```
 
-## Start with natural language
+## First Use
 
 Use terse prompts that name Humanize or workflow:
 
@@ -36,45 +36,26 @@ Use workflow to package this task with a README, check it, lock it, review it, t
 ```
 
 Humanize authoring normally starts with `flow_suggest`, then uses `flow_check`,
-`flow_lock`, `prepare_flow_review`, `approve_flow_review`, and `run_flow`.
+`flow_lock`, `prepare_flow_review`, `decide_flow_review`, and `run_flow`.
+Supply the package's root `README.md` content explicitly; Humanize preserves it
+verbatim and does not generate or repair it from the goal.
 
-## Details
+For agent-backed runs, set the tmux execution context:
 
-- Requires Rust and Cargo for the runtime install.
-- Requires Codex or Claude Code with plugin support enabled.
-- Includes `.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json`,
-  `.claude-plugin/`, `.mcp.json`, and `skills/` metadata.
-- Keeps architecture and repository layout docs in `docs/architecture.md`.
-
-## Update Or Remove
-
-```bash
-cargo install --git https://github.com/humanfia/humanize-plugin --locked --bin humanize-plugin-mcp --force
-codex plugin marketplace upgrade humanfia
-codex plugin add humanize-plugin@humanfia
-claude plugin marketplace update humanfia
-claude plugin update humanize-plugin
+```sh
+export HUMANIZE_TMUX_SESSION="$(tmux display-message -p '#S')"
+export HUMANIZE_AGENT_COMMAND="agent-command"
+export HUMANIZE_TMUX_BIN="/usr/bin/tmux"
 ```
 
-```bash
-codex plugin remove humanize-plugin@humanfia
-codex plugin marketplace remove humanfia
-claude plugin uninstall humanize-plugin
-claude plugin marketplace remove humanfia
-cargo uninstall humanize-plugin
-```
-
-## Development Build
+Generate the hook config for the client you use:
 
 ```bash
-git clone https://github.com/humanfia/humanize-plugin
-cd humanize-plugin
-cargo build
-cargo test
-cargo run --bin humanize-plugin-mcp -- --list-tools
+humanize-plugin-mcp --print-client-config codex-hooks-json --command "$(command -v humanize-plugin-mcp)"
+humanize-plugin-mcp --print-client-config claude-hooks-json --command "$(command -v humanize-plugin-mcp)"
 ```
 
-For local plugin packaging tests from a checkout, use the same commands with
-`"$PWD"` instead of `humanfia/humanize-plugin`.
+Install the generated block in the client's hook config, then invoke Humanize
+with one of the prompts above. Rust 1.88 or newer is required.
 
-See `docs/architecture.md` for design boundaries and repository layout.
+See `docs/architecture.md` for package, review, runtime, and repository design.

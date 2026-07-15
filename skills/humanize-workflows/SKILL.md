@@ -21,7 +21,7 @@ exploration.
 5. Export the locked flow with `flow_export` when a run artifact directory is available.
 6. Prepare the review gate with `prepare_flow_review`.
 7. Ask for human approval unless the user explicitly permits bypass.
-8. Record the decision with `approve_flow_review` using `approved` or `bypassed`.
+8. Record the decision with `decide_flow_review` using `approved` or `bypassed`.
 9. Run with `run_flow` only after the review gate is recorded.
 
 ## MCP Interaction Pattern
@@ -33,13 +33,12 @@ Use MCP tools as the compiler and runtime interface:
    work profiles, resources, QoS intent, and routes that fit the task.
 3. `flow_check`: validate the full draft. Use `strict` when the flow will be
    shared or run for a long time.
-4. `flow_repair`: ask for mechanical patches or candidate repairs when
-   diagnostics are local. Choose among candidates yourself; do not blindly
-   apply a ranking.
+4. `flow_repair`: ask for unranked local candidates plus guidance and
+   diagnostics. Choose among candidates yourself; do not infer a ranking.
 5. `flow_lock`: freeze the checked draft.
 6. `flow_export`: save the locked flow when artifacts should be collected.
 7. `prepare_flow_review`: create the human review view before execution.
-8. `approve_flow_review`: record either explicit approval or an explicit
+8. `decide_flow_review`: record either explicit approval or an explicit
    bypass.
 9. `run_flow`: start the runtime driver.
 10. During a run, use `preview_flow_routes`, `propose_flow_update`, and
@@ -57,6 +56,7 @@ the MCP server with an execution context before starting a long-running flow:
 ```sh
 export HUMANIZE_TMUX_SESSION="$(tmux display-message -p '#S')"
 export HUMANIZE_AGENT_COMMAND="agent-command"
+export HUMANIZE_TMUX_BIN="/usr/bin/tmux"
 ```
 
 `HUMANIZE_TMUX_WINDOW` is optional; when it is absent, `run_flow` uses the
@@ -86,14 +86,69 @@ submission on an interactive agent's readiness marker:
 Use `tmux display-message -p '#S'` to discover the current session. The coding
 agent inherits the container environment and its installed Humanize MCP
 configuration. Configure `agent_ready_pattern` for interactive agents so the
-node prompt is submitted only after the TUI is ready. Set
-`prompt_submit_key_count` to the number of Enter keys that agent requires.
+node prompt is submitted only after both the native `SessionStart` binding and
+the TUI marker are ready. The native binding remains the lifecycle authority;
+pane text never creates session facts. Set `prompt_submit_key_count` to the
+number of Enter keys that agent requires.
+
+Install the production client hooks before autonomous runs:
+
+```sh
+humanize-plugin-mcp --print-client-config codex-hooks-json --command "$(command -v humanize-plugin-mcp)"
+humanize-plugin-mcp --print-client-config claude-hooks-json --command "$(command -v humanize-plugin-mcp)"
+```
+
+Use the generated `SessionStart` hook to bind the native coding session to the
+exact driver-owned allocation, the generated `Stop` hook to obtain the durable
+completion decision, and the generated `PreToolUse` hook to deny direct
+`tmux send-keys` into owned panes. If shell hooks can be bypassed, put a wrapper
+named `tmux` earlier on
+the agent `PATH` that runs:
+
+```sh
+exec humanize-plugin-mcp --guarded-tmux -- "$@"
+```
+
+Keep `HUMANIZE_TMUX_BIN` pointed at the real tmux binary so Humanize MCP
+transport bypasses the wrapper. Do not pass run or activation identifiers to
+node prompts; ownership is discovered from durable pane state.
+
+The driver pane is an operator-only interactive console. Do not put its pane
+identity or mutable console commands in participant or master prompts;
+model control goes through MCP. Hooks and wrappers enforce cooperative policy for
+the supported harness and literal shell command boundary, not a
+same-UID OS security boundary.
+
+Existing-run tools attach to the authenticated driver automatically. If it has
+exited, MCP serializes replacement startup and replays durable state. Use
+`resume_run` for public recovery and reconciliation; do not invent a manual
+driver restart operation.
+
+Choose `run_mode` deliberately. `finite` completes when no activation or fact
+trigger remains. `continuous` becomes quiescent and wakes on a new fact
+version. `manual` remains quiescent until `resume_run`; call `complete_run`
+only when that run is quiescent. Treat `activation_limit` as an absolute total,
+not a per-resume allowance, and only raise it when resuming a budget pause.
+
+Activation ids are opaque across repeated fact generations. Pane replacement
+does not create a new activation; it creates a new allocation generation, so
+old readiness, capture, and input receipts must not be reused for the new pane.
 Agent and review action drivers are agent-backed and are actuated through tmux.
 Script action drivers are rejected before lock until they have an explicit
 runtime execution contract. For deterministic shell work, use an agent-backed
 node that runs the command, records the artifact, and stops under its contract.
 Treat any actuation warning as an execution gap, not as successful node
 completion.
+
+### Ambiguous delivery recovery
+
+When status contains `ambiguous_delivery`, read its
+`started_event_sequence`. Resolve only that barrier through `resume_run` with
+`delivery_resolution` containing the sequence, `outcome` set to `submitted`
+or `not_submitted`, and non-empty `evidence`. Use `submitted` only with
+receiver-side confirmation; it closes the barrier without replay. Use
+`not_submitted` only with evidence that retry is safe. Never resend directly,
+and refresh status after a stale-sequence conflict.
 
 ## Flow Architecture
 
@@ -104,7 +159,7 @@ primitives directly:
 | --- | --- |
 | `nodes` | Work units: agent, script, review, or human. Add `work_profile` when intent or execution traits matter. |
 | `contracts` | Required delivery for a node. Use `all_artifacts` when stopping must depend on artifacts. |
-| `routes` | Runtime activation rules. Use predicates over artifacts, verdicts, or state. |
+| `routes` | Runtime activation rules. Use typed `exists` or `truthy` predicates over artifact or board facts. |
 | `resources` | README, prompts, schemas, scripts, views, and packaged subflows. |
 | `imports` | Reusable flow resources or schema aliases. |
 | `policies` | Write boundaries for artifacts, resources, workspace, and system state. |
@@ -138,9 +193,9 @@ a review or guard that decides whether to continue, branch, or finish.
   repair target, a validation signal, and an archive path for terminal state.
 - Put long instructions in prompt resources, not in the user-facing request.
   Keep the top-level flow draft readable.
-- Include a README resource in every package. It should explain intent,
-  prerequisites, expected artifacts, review gates, and how to rerun or inspect
-  the flow.
+- Include exactly one root `README.md` resource in every package. The main
+  agent must author and supply it; preserve that content verbatim and never
+  generate or repair it from the goal.
 - Use Work Profile intents `produce`, `evaluate`, `explore`, `synthesize`, and
   `coordinate` to describe node work. Set workspace, tool, and network access
   traits only when the default would be misleading.
@@ -170,7 +225,7 @@ For a measured optimization task, use a shape like this:
       "contract_id": "contract.baseline",
       "action": {
         "driver": "agent",
-        "prompt_ref": "prompt.baseline",
+        "prompt_ref": "prompts/baseline.md",
         "writes": ["artifact.baseline"]
       }
     },
@@ -179,7 +234,7 @@ For a measured optimization task, use a shape like this:
       "contract_id": "contract.candidates",
       "action": {
         "driver": "agent",
-        "prompt_ref": "prompt.optimize",
+        "prompt_ref": "prompts/optimize.md",
         "reads": ["artifact.baseline"],
         "writes": ["artifact.candidates"]
       }
@@ -189,7 +244,7 @@ For a measured optimization task, use a shape like this:
       "contract_id": "contract.review",
       "action": {
         "driver": "review",
-        "prompt_ref": "prompt.review",
+        "prompt_ref": "prompts/review.md",
         "reads": ["artifact.baseline", "artifact.candidates"],
         "writes": ["artifact.review_verdict", "artifact.review_continue"],
         "verdict_artifact": "artifact.review_verdict"
@@ -203,7 +258,7 @@ For a measured optimization task, use a shape like this:
       "artifacts": [
         {
           "id": "baseline",
-          "schema_resource_id": "schema.baseline"
+          "schema_resource_id": "schemas/baseline.txt"
         }
       ]
     },
@@ -213,7 +268,7 @@ For a measured optimization task, use a shape like this:
       "artifacts": [
         {
           "id": "candidates",
-          "schema_resource_id": "schema.candidates"
+          "schema_resource_id": "schemas/candidates.txt"
         }
       ]
     },
@@ -223,65 +278,74 @@ For a measured optimization task, use a shape like this:
       "artifacts": [
         {
           "id": "review_verdict",
-          "schema_resource_id": "schema.review_verdict"
+          "schema_resource_id": "schemas/review-verdict.txt"
         }
       ]
     }
   ],
   "routes": [
     {
-      "predicate": "exists(artifact.baseline)",
+      "predicate": {
+        "op": "exists",
+        "fact": {"kind": "artifact", "key": "baseline"}
+      },
       "activate": "try_candidates"
     },
     {
-      "predicate": "exists(artifact.candidates)",
+      "predicate": {
+        "op": "exists",
+        "fact": {"kind": "artifact", "key": "candidates"}
+      },
       "activate": "review_selection"
     },
     {
-      "predicate": "exists(artifact.review_continue)",
+      "predicate": {
+        "op": "exists",
+        "fact": {"kind": "artifact", "key": "review_continue"}
+      },
       "activate": "try_candidates"
     }
   ],
   "resources": [
     {
-      "id": "readme.main",
+      "path": "README.md",
       "kind": "readme",
-      "source": "inline:Measured optimization flow with baseline, candidate search, review, and loop."
+      "content": "Measured optimization flow with baseline, candidate search, review, and loop."
     },
     {
-      "id": "prompt.baseline",
+      "path": "prompts/baseline.md",
       "kind": "prompt",
-      "source": "inline:Run the benchmark command and deliver the result with artifact_key \"baseline\"."
+      "content": "Run the benchmark command and deliver the result with artifact_key \"baseline\"."
     },
     {
-      "id": "prompt.optimize",
+      "path": "prompts/optimize.md",
       "kind": "prompt",
-      "source": "inline:Generate and test one bounded candidate improvement, then deliver it with artifact_key \"candidates\"."
+      "content": "Generate and test one bounded candidate improvement, then deliver it with artifact_key \"candidates\"."
     },
     {
-      "id": "prompt.review",
+      "path": "prompts/review.md",
       "kind": "prompt",
-      "source": "inline:Deliver artifact_key \"review_verdict\" with finish or continue. Also deliver artifact_key \"review_continue\" only when another candidate is needed."
+      "content": "Deliver artifact_key \"review_verdict\" with finish or continue. Also deliver artifact_key \"review_continue\" only when another candidate is needed."
     },
     {
-      "id": "schema.baseline",
+      "path": "schemas/baseline.txt",
       "kind": "schema",
-      "source": "inline:baseline metrics and command evidence"
+      "content": "baseline metrics and command evidence"
     },
     {
-      "id": "schema.candidates",
+      "path": "schemas/candidates.txt",
       "kind": "schema",
-      "source": "inline:candidate changes with benchmark evidence"
+      "content": "candidate changes with benchmark evidence"
     },
     {
-      "id": "schema.review_verdict",
+      "path": "schemas/review-verdict.txt",
       "kind": "schema",
-      "source": "inline:verdict string finish or continue with reason"
+      "content": "verdict string finish or continue with reason"
     },
     {
-      "id": "schema.review_continue",
+      "path": "schemas/review-continue.txt",
       "kind": "schema",
-      "source": "inline:optional continue marker with reason"
+      "content": "optional continue marker with reason"
     }
   ]
 }
@@ -297,8 +361,8 @@ example, the review node finishes by delivering only artifact key
 
 - Every node that must deliver something should have a contract. If the main
   output is side-effect work, use `manual` completion and still record evidence.
-- A README must be authored for the package. Do not rely on a placeholder that
-  only repeats the terse user goal.
+- The main agent must author the package's root `README.md`. Do not synthesize,
+  repair, or replace it from the terse user goal.
 - Flow fact paths should be semantic and stable, such as `artifact.baseline`,
   `artifact.hypotheses`, `artifact.validation`, `artifact.review_verdict`, and
   `artifact.archive`. When calling `deliver_artifact`, use the bare artifact id,
@@ -318,7 +382,7 @@ example, the review node finishes by delivering only artifact key
 | Draft flow exists | Run `flow_check` before locking. |
 | Flow package lacks README | Repair before `flow_lock`. |
 | Long-running or effectful execution | Use `prepare_flow_review` first. |
-| User approved or allowed bypass | Record with `approve_flow_review`, then `run_flow`. |
+| User approved or allowed bypass | Record with `decide_flow_review`, then `run_flow`. |
 
 ## Common Mistakes
 

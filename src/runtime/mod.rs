@@ -2,16 +2,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
+use crate::flow::{ArtifactRef, FactError, FactKey};
+
 mod driver;
+mod identity;
 mod route_preview;
+mod stop;
+
+use identity::{
+    activation_id_for, activation_key, artifact_id, content_hash, effect_index_key,
+    flow_lock_application_id, next_activation_identity, slot_index_key, stop_fact_id,
+};
 
 pub use driver::{
     ControlCommand, DriverRender, DriverState, DriverTickInput, DriverTickReport, LoopBudget,
     RouteDecision, RouteSourceArtifact, RunCompletionMode, TickBudget,
 };
 pub use route_preview::{PlannedActivationPreview, RoutePreview, preview_flow_routes};
+pub use stop::{StopDecision, StopDecisionKind, StopObservation};
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub sequence: u64,
     pub source: EventSource,
@@ -22,14 +34,15 @@ pub struct Event {
     pub payload: EventPayload,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventSource {
     pub run_id: Option<String>,
     pub activation_id: Option<String>,
     pub source_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventKind {
     ActivationStatusChanged,
     ArtifactDelivered,
@@ -38,13 +51,16 @@ pub enum EventKind {
     FlowApplied,
     FlowUpdate,
     NodeActivated,
+    ParticipantExited,
+    RunActivationLimitChanged,
     RunStarted,
     RunStatusChanged,
     StopDecision,
     StopObserved,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventStrength {
     Applied,
     Checked,
@@ -53,20 +69,37 @@ pub enum EventStrength {
     Proposed,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventPayload {
     RunStarted {
         run_id: String,
+        #[serde(default)]
+        mode: RunMode,
+        #[serde(default = "unbounded_activation_limit")]
+        activation_limit: u64,
+        #[serde(default = "default_stop_attempt_limit")]
+        stop_attempt_limit: u32,
+    },
+    RunActivationLimitChanged {
+        run_id: String,
+        activation_limit: u64,
     },
     RunStatusChanged {
         run_id: String,
         status: RunStatus,
+        #[serde(default)]
+        reason: Option<String>,
     },
     NodeActivated {
         run_id: String,
         activation_id: String,
         node_id: String,
         stable_key: Option<String>,
+        #[serde(default)]
+        activation_generation: u64,
+        #[serde(default)]
+        trigger: Option<RouteTrigger>,
         context: BTreeMap<String, String>,
         stop_contract: StopContract,
         flow_lock_mode: Option<FlowLockMode>,
@@ -77,6 +110,12 @@ pub enum EventPayload {
         run_id: String,
         activation_id: String,
         status: ActivationStatus,
+    },
+    ParticipantExited {
+        run_id: String,
+        activation_id: String,
+        allocation_generation: u64,
+        exit_status: i32,
     },
     ArtifactDelivered {
         run_id: String,
@@ -127,7 +166,8 @@ pub enum EventPayload {
 impl EventPayload {
     fn source(&self) -> EventSource {
         match self {
-            EventPayload::RunStarted { run_id }
+            EventPayload::RunStarted { run_id, .. }
+            | EventPayload::RunActivationLimitChanged { run_id, .. }
             | EventPayload::RunStatusChanged { run_id, .. }
             | EventPayload::FlowApplied { run_id, .. }
             | EventPayload::FlowUpdate { run_id, .. } => EventSource {
@@ -141,6 +181,11 @@ impl EventPayload {
                 ..
             }
             | EventPayload::ActivationStatusChanged {
+                run_id,
+                activation_id,
+                ..
+            }
+            | EventPayload::ParticipantExited {
                 run_id,
                 activation_id,
                 ..
@@ -180,9 +225,11 @@ impl EventPayload {
     fn kind(&self) -> EventKind {
         match self {
             EventPayload::RunStarted { .. } => EventKind::RunStarted,
+            EventPayload::RunActivationLimitChanged { .. } => EventKind::RunActivationLimitChanged,
             EventPayload::RunStatusChanged { .. } => EventKind::RunStatusChanged,
             EventPayload::NodeActivated { .. } => EventKind::NodeActivated,
             EventPayload::ActivationStatusChanged { .. } => EventKind::ActivationStatusChanged,
+            EventPayload::ParticipantExited { .. } => EventKind::ParticipantExited,
             EventPayload::ArtifactDelivered { .. } => EventKind::ArtifactDelivered,
             EventPayload::BoardPatched { .. } => EventKind::BoardPatched,
             EventPayload::StopObserved { .. } => EventKind::StopObserved,
@@ -207,100 +254,47 @@ impl EventPayload {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Finite,
+    Continuous,
+    Manual,
+}
+
+const fn unbounded_activation_limit() -> u64 {
+    u64::MAX
+}
+
+const fn default_stop_attempt_limit() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct RouteTrigger {
+    pub flow_lock_id: String,
+    pub route_id: String,
+    pub fact_ref: String,
+    pub fact_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FlowLockMode {
     FutureActivations,
     CheckpointRestart,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FlowUpdateStatus {
     Proposed,
     Checked,
     Applied,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct StopObservation {
-    pub reason: String,
-}
-
-impl StopObservation {
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum StopDecisionKind {
-    Allow,
-    Deny,
-    Block,
-    Yield,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct StopDecision {
-    pub kind: StopDecisionKind,
-    pub attempt: u32,
-    pub missing_artifacts: Vec<String>,
-    pub missing_effects: Vec<String>,
-    pub reason: Option<String>,
-}
-
-impl StopDecision {
-    pub fn allow(attempt: u32) -> Self {
-        Self {
-            kind: StopDecisionKind::Allow,
-            attempt,
-            missing_artifacts: Vec::new(),
-            missing_effects: Vec::new(),
-            reason: None,
-        }
-    }
-
-    pub fn deny_until_limit(
-        attempt: u32,
-        missing_artifacts: Vec<String>,
-        missing_effects: Vec<String>,
-    ) -> Self {
-        Self {
-            kind: StopDecisionKind::Deny,
-            attempt,
-            missing_artifacts,
-            missing_effects,
-            reason: Some("missing stop requirements".into()),
-        }
-    }
-
-    pub fn block(
-        attempt: u32,
-        missing_artifacts: Vec<String>,
-        missing_effects: Vec<String>,
-    ) -> Self {
-        Self {
-            kind: StopDecisionKind::Block,
-            attempt,
-            missing_artifacts,
-            missing_effects,
-            reason: Some("stop validation limit reached".into()),
-        }
-    }
-
-    pub fn yield_now(attempt: u32, reason: impl Into<String>) -> Self {
-        Self {
-            kind: StopDecisionKind::Yield,
-            attempt,
-            missing_artifacts: Vec::new(),
-            missing_effects: Vec::new(),
-            reason: Some(reason.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocalEventStore {
     events: Vec<Event>,
 }
@@ -335,11 +329,11 @@ impl EventStore for LocalEventStore {
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeSpec {
     id: String,
     stop_contract: StopContract,
-    for_each: Option<String>,
+    for_each: Option<ArtifactRef>,
 }
 
 impl NodeSpec {
@@ -356,8 +350,8 @@ impl NodeSpec {
         self
     }
 
-    pub fn with_for_each(mut self, artifact_key: impl Into<String>) -> Self {
-        self.for_each = Some(artifact_key.into());
+    pub fn with_for_each(mut self, artifact: ArtifactRef) -> Self {
+        self.for_each = Some(artifact);
         self
     }
 
@@ -370,11 +364,14 @@ impl NodeSpec {
     }
 
     pub fn for_each_key(&self) -> Option<&str> {
-        self.for_each.as_deref()
+        self.for_each
+            .as_ref()
+            .map(ArtifactRef::key)
+            .map(FactKey::as_str)
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StopContract {
     required_artifacts: Vec<String>,
     required_effects: Vec<String>,
@@ -406,7 +403,8 @@ impl StopContract {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     #[default]
     PendingReview,
@@ -421,7 +419,28 @@ pub enum RunStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SchedulingIntent {
+    Explicit,
+    FactTriggeredRoute,
+}
+
+pub(crate) fn scheduling_enabled(
+    state: &RuntimeState,
+    run_id: &str,
+    intent: SchedulingIntent,
+) -> bool {
+    match state.run_status(run_id) {
+        Some(RunStatus::Running) => true,
+        Some(RunStatus::Quiescent) if intent == SchedulingIntent::FactTriggeredRoute => {
+            state.run_mode(run_id) == Some(RunMode::Continuous)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActivationStatus {
     #[default]
     Pending,
@@ -441,6 +460,8 @@ pub struct Activation {
     pub run_id: String,
     pub node_id: String,
     pub stable_key: Option<String>,
+    pub activation_generation: u64,
+    pub trigger: Option<RouteTrigger>,
     pub status: ActivationStatus,
     pub context: BTreeMap<String, String>,
     pub stop_contract: StopContract,
@@ -456,6 +477,8 @@ impl Default for Activation {
             run_id: String::new(),
             node_id: String::new(),
             stable_key: None,
+            activation_generation: 0,
+            trigger: None,
             status: ActivationStatus::Pending,
             context: BTreeMap::new(),
             stop_contract: StopContract::default(),
@@ -497,7 +520,13 @@ pub struct RuntimeState {
     pub boards: BTreeMap<String, BTreeMap<String, String>>,
     pub board_version: u64,
     pub board_versions: BTreeMap<String, u64>,
+    pub board_fact_versions: BTreeMap<(String, String), u64>,
     pub run_statuses: BTreeMap<String, RunStatus>,
+    pub run_status_reasons: BTreeMap<String, String>,
+    pub run_modes: BTreeMap<String, RunMode>,
+    pub initial_activation_limits: BTreeMap<String, u64>,
+    pub activation_limits: BTreeMap<String, u64>,
+    pub stop_attempt_limits: BTreeMap<String, u32>,
     pub activations: BTreeMap<(String, String), Activation>,
     pub effects: BTreeMap<(String, String, String), String>,
     pub stop_observations: BTreeMap<String, StopObservation>,
@@ -523,24 +552,55 @@ impl RuntimeState {
 
     fn apply(&mut self, event: &Event) {
         match &event.payload {
-            EventPayload::RunStarted { run_id } => {
+            EventPayload::RunStarted {
+                run_id,
+                mode,
+                activation_limit,
+                stop_attempt_limit,
+            } => {
                 self.run_id = Some(run_id.clone());
                 self.runs.insert(run_id.clone());
                 self.boards.entry(run_id.clone()).or_default();
                 self.board_versions.entry(run_id.clone()).or_insert(0);
+                self.run_modes.insert(run_id.clone(), *mode);
+                self.initial_activation_limits
+                    .insert(run_id.clone(), *activation_limit);
+                self.activation_limits
+                    .insert(run_id.clone(), *activation_limit);
+                self.stop_attempt_limits
+                    .insert(run_id.clone(), *stop_attempt_limit);
                 self.run_statuses
                     .entry(run_id.clone())
                     .or_insert(RunStatus::Ready);
             }
-            EventPayload::RunStatusChanged { run_id, status } => {
+            EventPayload::RunActivationLimitChanged {
+                run_id,
+                activation_limit,
+            } => {
+                self.activation_limits
+                    .insert(run_id.clone(), *activation_limit);
+            }
+            EventPayload::RunStatusChanged {
+                run_id,
+                status,
+                reason,
+            } => {
                 self.runs.insert(run_id.clone());
                 self.run_statuses.insert(run_id.clone(), *status);
+                if let Some(reason) = reason {
+                    self.run_status_reasons
+                        .insert(run_id.clone(), reason.clone());
+                } else {
+                    self.run_status_reasons.remove(run_id);
+                }
             }
             EventPayload::NodeActivated {
                 run_id,
                 activation_id,
                 node_id,
                 stable_key,
+                activation_generation,
+                trigger,
                 context,
                 stop_contract,
                 flow_lock_mode,
@@ -554,6 +614,8 @@ impl RuntimeState {
                         run_id: run_id.clone(),
                         node_id: node_id.clone(),
                         stable_key: stable_key.clone(),
+                        activation_generation: *activation_generation,
+                        trigger: trigger.clone(),
                         status: ActivationStatus::Pending,
                         context: context.clone(),
                         stop_contract: stop_contract.clone(),
@@ -573,6 +635,25 @@ impl RuntimeState {
                     .get_mut(&activation_key(run_id, activation_id))
                 {
                     activation.status = *status;
+                }
+            }
+            EventPayload::ParticipantExited {
+                run_id,
+                activation_id,
+                ..
+            } => {
+                if let Some(activation) = self
+                    .activations
+                    .get_mut(&activation_key(run_id, activation_id))
+                    && !matches!(
+                        activation.status,
+                        ActivationStatus::Blocked
+                            | ActivationStatus::Completed
+                            | ActivationStatus::Failed
+                            | ActivationStatus::Cancelled
+                    )
+                {
+                    activation.status = ActivationStatus::Failed;
                 }
             }
             EventPayload::ArtifactDelivered {
@@ -610,14 +691,16 @@ impl RuntimeState {
                 run_id,
                 key,
                 value,
-                version,
+                version: _,
                 ..
             } => {
                 let board = self.boards.entry(run_id.clone()).or_default();
                 board.insert(key.clone(), value.clone());
                 self.board = board.clone();
-                self.board_version = *version;
-                self.board_versions.insert(run_id.clone(), *version);
+                self.board_version = event.sequence;
+                self.board_versions.insert(run_id.clone(), event.sequence);
+                self.board_fact_versions
+                    .insert(slot_index_key(run_id, key), event.sequence);
             }
             EventPayload::EffectRecorded {
                 run_id,
@@ -679,6 +762,72 @@ impl RuntimeState {
         self.run_statuses.get(run_id).copied()
     }
 
+    pub fn run_status_reason(&self, run_id: &str) -> Option<&str> {
+        self.run_status_reasons.get(run_id).map(String::as_str)
+    }
+
+    pub fn run_mode(&self, run_id: &str) -> Option<RunMode> {
+        self.run_modes.get(run_id).copied()
+    }
+
+    pub fn initial_activation_limit(&self, run_id: &str) -> Option<u64> {
+        self.initial_activation_limits.get(run_id).copied()
+    }
+
+    pub fn activation_limit(&self, run_id: &str) -> Option<u64> {
+        self.activation_limits.get(run_id).copied()
+    }
+
+    pub fn stop_attempt_limit(&self, run_id: &str) -> Option<u32> {
+        self.stop_attempt_limits.get(run_id).copied()
+    }
+
+    pub fn activations_used(&self, run_id: &str) -> u64 {
+        self.activations
+            .values()
+            .filter(|activation| activation.run_id == run_id)
+            .count() as u64
+    }
+
+    pub fn artifact_fact_version(&self, run_id: &str, artifact_key: &str) -> Option<u64> {
+        let artifact_id = self
+            .latest_artifact_by_slot_index
+            .get(&slot_index_key(run_id, artifact_key))?;
+        self.artifact_records
+            .get(artifact_id)
+            .map(|artifact| artifact.event_sequence)
+    }
+
+    pub fn board_fact_version(&self, run_id: &str, key: &str) -> Option<u64> {
+        self.board_fact_versions
+            .get(&slot_index_key(run_id, key))
+            .copied()
+    }
+
+    pub fn has_applied_trigger(&self, run_id: &str, trigger: &RouteTrigger) -> bool {
+        self.activations.values().any(|activation| {
+            activation.run_id == run_id && activation.trigger.as_ref() == Some(trigger)
+        })
+    }
+
+    pub fn next_activation_generation(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        stable_key: Option<&str>,
+    ) -> u64 {
+        self.activations
+            .values()
+            .filter(|activation| {
+                activation.run_id == run_id
+                    && activation.node_id == node_id
+                    && activation.stable_key.as_deref() == stable_key
+            })
+            .map(|activation| activation.activation_generation)
+            .max()
+            .map_or(0, |generation| generation.saturating_add(1))
+    }
+
     fn apply_flow_update(
         &mut self,
         event_sequence: u64,
@@ -718,20 +867,62 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub fn from_events(events: Vec<Event>) -> Self {
+        Self {
+            state: RuntimeState::from_events(&events),
+            store: LocalEventStore { events },
+        }
+    }
+
     pub fn start_run(
         &mut self,
         run_id: impl Into<String>,
         nodes: Vec<NodeSpec>,
+    ) -> Result<Vec<String>, RuntimeError> {
+        self.start_run_with_options(run_id, nodes, RunMode::Finite, unbounded_activation_limit())
+    }
+
+    pub fn start_run_with_options(
+        &mut self,
+        run_id: impl Into<String>,
+        nodes: Vec<NodeSpec>,
+        mode: RunMode,
+        activation_limit: u64,
+    ) -> Result<Vec<String>, RuntimeError> {
+        self.start_run_with_limits(
+            run_id,
+            nodes,
+            mode,
+            activation_limit,
+            default_stop_attempt_limit(),
+        )
+    }
+
+    pub fn start_run_with_limits(
+        &mut self,
+        run_id: impl Into<String>,
+        nodes: Vec<NodeSpec>,
+        mode: RunMode,
+        activation_limit: u64,
+        stop_attempt_limit: u32,
     ) -> Result<Vec<String>, RuntimeError> {
         let run_id = run_id.into();
         if self.state.runs.contains(&run_id) {
             return Err(RuntimeError::DuplicateRun { run_id });
         }
 
+        if nodes.len() as u64 > activation_limit {
+            return Err(RuntimeError::ActivationLimitExceeded {
+                run_id,
+                activation_limit,
+                requested: nodes.len() as u64,
+            });
+        }
+
         let mut activation_ids = Vec::with_capacity(nodes.len());
         let mut seen_activation_ids = BTreeSet::new();
         for node in &nodes {
-            let activation_id = activation_id_for(node, None);
+            let activation_id = activation_id_for(node, None, 0);
             if !seen_activation_ids.insert(activation_id.clone()) {
                 return Err(RuntimeError::DuplicateActivation { activation_id });
             }
@@ -740,10 +931,26 @@ impl Runtime {
 
         self.append(EventPayload::RunStarted {
             run_id: run_id.clone(),
+            mode,
+            activation_limit,
+            stop_attempt_limit,
         });
 
         for node in nodes {
-            self.activate_node(run_id.as_str(), &node, None)?;
+            let activation_id = activation_id_for(&node, None, 0);
+            self.append(EventPayload::NodeActivated {
+                run_id: run_id.clone(),
+                activation_id,
+                node_id: node.id().to_owned(),
+                stable_key: None,
+                activation_generation: 0,
+                trigger: None,
+                context: BTreeMap::new(),
+                stop_contract: node.stop_contract().clone(),
+                flow_lock_mode: None,
+                flow_lock_id: None,
+                contract_hash: None,
+            });
         }
         Ok(activation_ids)
     }
@@ -758,6 +965,13 @@ impl Runtime {
         let run_id = run_id.into();
         let activation_id = activation_id.into();
         let artifact_key = artifact_key.into();
+        let artifact_key = ArtifactRef::new(artifact_key.clone())
+            .map_err(|_| RuntimeError::InvalidFactKey {
+                kind: "artifact",
+                key: artifact_key,
+            })?
+            .key()
+            .to_string();
         let payload = payload.into();
         self.require_activation_in_run(&run_id, &activation_id)?;
         let artifact_id = artifact_id(self.next_event_sequence());
@@ -782,21 +996,21 @@ impl Runtime {
         let run_id = run_id.into();
         let activation_id = activation_id.into();
         self.require_activation_in_run(&run_id, &activation_id)?;
-        let board_version = self.board_version_for_run(&run_id)?;
-        if let Some(expected) = patch.expected_version {
-            if expected != board_version {
-                return Err(RuntimeError::BoardVersionConflict {
-                    expected,
-                    actual: board_version,
-                });
-            }
+        let board_version = self.board_fact_version_for_key(&run_id, patch.key.as_str())?;
+        if let Some(expected) = patch.expected_version
+            && expected != board_version
+        {
+            return Err(RuntimeError::BoardVersionConflict {
+                expected,
+                actual: board_version,
+            });
         }
 
-        let version = board_version + 1;
+        let version = self.next_event_sequence();
         self.append(EventPayload::BoardPatched {
             run_id,
             activation_id,
-            key: patch.key,
+            key: patch.key.to_string(),
             value: patch.value,
             version,
         });
@@ -839,14 +1053,22 @@ impl Runtime {
     ) -> Result<Vec<String>, RuntimeError> {
         let run_id = run_id.into();
         self.require_run(&run_id)?;
+        self.require_scheduling_enabled(&run_id, SchedulingIntent::Explicit)?;
         let artifact_key = artifact_key.into();
-        if let Some(for_each_key) = node.for_each_key() {
-            if for_each_key != artifact_key {
-                return Err(RuntimeError::ForEachMismatch {
-                    expected: for_each_key.to_owned(),
-                    actual: artifact_key,
-                });
-            }
+        let artifact_key = ArtifactRef::new(artifact_key.clone())
+            .map_err(|_| RuntimeError::InvalidFactKey {
+                kind: "artifact",
+                key: artifact_key,
+            })?
+            .key()
+            .to_string();
+        if let Some(for_each_key) = node.for_each_key()
+            && for_each_key != artifact_key
+        {
+            return Err(RuntimeError::ForEachMismatch {
+                expected: for_each_key.to_owned(),
+                actual: artifact_key,
+            });
         }
 
         let artifact_id = self
@@ -869,7 +1091,8 @@ impl Runtime {
         let mut planned_activations = Vec::new();
         for (index, item) in artifact_payload.lines().enumerate() {
             let stable_key = format!("{artifact_key}/{index}");
-            let activation_id = activation_id_for(node, Some(&stable_key));
+            let (_, activation_id) =
+                next_activation_identity(&self.state, &run_id, node.id(), Some(&stable_key));
             if self
                 .state
                 .activations
@@ -884,10 +1107,83 @@ impl Runtime {
             planned_activations.push((activation_id, stable_key, context));
         }
 
+        self.require_activation_capacity(&run_id, planned_activations.len() as u64)?;
+
         let mut activation_ids = Vec::with_capacity(planned_activations.len());
-        for (activation_id, stable_key, context) in planned_activations {
-            self.activate_node_with_context(run_id.clone(), node, Some(&stable_key), context)?;
-            activation_ids.push(activation_id);
+        for (_, stable_key, context) in planned_activations {
+            activation_ids.push(self.activate_node_with_context(
+                run_id.clone(),
+                node,
+                Some(&stable_key),
+                context,
+            )?);
+        }
+        Ok(activation_ids)
+    }
+
+    fn apply_route_plan(
+        &mut self,
+        run_id: &str,
+        node: &NodeSpec,
+        trigger: &RouteTrigger,
+        planned: &[PlannedActivationPreview],
+    ) -> Result<Vec<String>, RuntimeError> {
+        self.require_run(run_id)?;
+        self.require_scheduling_enabled(run_id, SchedulingIntent::FactTriggeredRoute)?;
+        if self.state.has_applied_trigger(run_id, trigger) {
+            return Ok(Vec::new());
+        }
+        self.require_activation_capacity(run_id, planned.len() as u64)?;
+
+        let flow_lock_mode = self.state.flow_lock_mode_by_run.get(run_id).copied();
+        let flow_lock_id = self.state.flow_lock_id_by_run.get(run_id).cloned();
+        let contract_hash = self.state.contract_hash_by_run.get(run_id).cloned();
+        let mut payloads = Vec::with_capacity(planned.len());
+        for activation in planned {
+            let (generation, activation_id) = next_activation_identity(
+                &self.state,
+                run_id,
+                node.id(),
+                activation.stable_key.as_deref(),
+            );
+            if activation_id != activation.activation_id {
+                return Err(RuntimeError::StaleRoutePlan {
+                    activation_id: activation.activation_id.clone(),
+                });
+            }
+            let mut context = BTreeMap::new();
+            if let Some(index) = activation.index {
+                context.insert("index".to_owned(), index.to_string());
+            }
+            if let Some(item) = &activation.item {
+                context.insert("item".to_owned(), item.clone());
+            }
+            if let Some(stable_key) = &activation.stable_key {
+                let for_each = stable_key.split('/').next().unwrap_or(stable_key);
+                context.insert("for_each".to_owned(), for_each.to_owned());
+            }
+            payloads.push(EventPayload::NodeActivated {
+                run_id: run_id.to_owned(),
+                activation_id,
+                node_id: node.id().to_owned(),
+                stable_key: activation.stable_key.clone(),
+                activation_generation: generation,
+                trigger: Some(trigger.clone()),
+                context,
+                stop_contract: node.stop_contract().clone(),
+                flow_lock_mode,
+                flow_lock_id: flow_lock_id.clone(),
+                contract_hash: contract_hash.clone(),
+            });
+        }
+
+        let mut activation_ids = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let EventPayload::NodeActivated { activation_id, .. } = &payload else {
+                unreachable!("route plan payload must activate a node");
+            };
+            activation_ids.push(activation_id.clone());
+            self.append(payload);
         }
         Ok(activation_ids)
     }
@@ -988,10 +1284,52 @@ impl Runtime {
         run_id: impl Into<String>,
         status: RunStatus,
     ) -> Result<(), RuntimeError> {
+        self.set_run_status_with_reason(run_id, status, None)
+    }
+
+    pub fn set_run_status_with_reason(
+        &mut self,
+        run_id: impl Into<String>,
+        status: RunStatus,
+        reason: Option<&str>,
+    ) -> Result<(), RuntimeError> {
         let run_id = run_id.into();
         self.require_run(&run_id)?;
-        if self.state.run_status(&run_id) != Some(status) {
-            self.append(EventPayload::RunStatusChanged { run_id, status });
+        if self.state.run_status(&run_id) != Some(status)
+            || self.state.run_status_reason(&run_id) != reason
+        {
+            self.append(EventPayload::RunStatusChanged {
+                run_id,
+                status,
+                reason: reason.map(str::to_owned),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn raise_activation_limit(
+        &mut self,
+        run_id: impl Into<String>,
+        activation_limit: u64,
+    ) -> Result<(), RuntimeError> {
+        let run_id = run_id.into();
+        self.require_run(&run_id)?;
+        let current = self
+            .state
+            .activation_limit(&run_id)
+            .unwrap_or(unbounded_activation_limit());
+        if activation_limit < current {
+            return Err(RuntimeError::ActivationLimitDecrease {
+                run_id,
+                current,
+                requested: activation_limit,
+            });
+        }
+        if activation_limit > current {
+            self.append(EventPayload::RunActivationLimitChanged {
+                run_id,
+                activation_limit,
+            });
         }
         Ok(())
     }
@@ -1026,7 +1364,9 @@ impl Runtime {
         context: BTreeMap<String, String>,
     ) -> Result<String, RuntimeError> {
         self.require_run(&run_id)?;
-        let activation_id = activation_id_for(node, stable_key);
+        self.require_scheduling_enabled(&run_id, SchedulingIntent::Explicit)?;
+        let (activation_generation, activation_id) =
+            next_activation_identity(&self.state, &run_id, node.id(), stable_key);
         if self
             .state
             .activations
@@ -1034,6 +1374,7 @@ impl Runtime {
         {
             return Err(RuntimeError::DuplicateActivation { activation_id });
         }
+        self.require_activation_capacity(&run_id, 1)?;
         let flow_lock_mode = self.state.flow_lock_mode_by_run.get(&run_id).copied();
         let flow_lock_id = self.state.flow_lock_id_by_run.get(&run_id).cloned();
         let contract_hash = self.state.contract_hash_by_run.get(&run_id).cloned();
@@ -1043,6 +1384,8 @@ impl Runtime {
             activation_id: activation_id.clone(),
             node_id: node.id().to_owned(),
             stable_key: stable_key.map(str::to_owned),
+            activation_generation,
+            trigger: None,
             context,
             stop_contract: node.stop_contract().clone(),
             flow_lock_mode,
@@ -1083,26 +1426,76 @@ impl Runtime {
         }
     }
 
-    fn board_version_for_run(&self, run_id: &str) -> Result<u64, RuntimeError> {
+    fn board_fact_version_for_key(&self, run_id: &str, key: &str) -> Result<u64, RuntimeError> {
         self.require_run(run_id)?;
-        Ok(self.state.board_versions.get(run_id).copied().unwrap_or(0))
+        Ok(self.state.board_fact_version(run_id, key).unwrap_or(0))
+    }
+
+    fn require_activation_capacity(
+        &self,
+        run_id: &str,
+        requested: u64,
+    ) -> Result<(), RuntimeError> {
+        let activation_limit = self
+            .state
+            .activation_limit(run_id)
+            .unwrap_or(unbounded_activation_limit());
+        let used = self.state.activations_used(run_id);
+        if requested > activation_limit.saturating_sub(used) {
+            return Err(RuntimeError::ActivationLimitExceeded {
+                run_id: run_id.to_owned(),
+                activation_limit,
+                requested,
+            });
+        }
+        Ok(())
+    }
+
+    fn require_scheduling_enabled(
+        &self,
+        run_id: &str,
+        intent: SchedulingIntent,
+    ) -> Result<(), RuntimeError> {
+        let status = self
+            .state
+            .run_status(run_id)
+            .ok_or_else(|| RuntimeError::RunNotFound {
+                run_id: run_id.to_owned(),
+            })?;
+        if scheduling_enabled(&self.state, run_id, intent) {
+            return Ok(());
+        }
+        if status == RunStatus::Paused {
+            return Err(RuntimeError::RunPaused {
+                run_id: run_id.to_owned(),
+            });
+        }
+        let action = match intent {
+            SchedulingIntent::Explicit => "schedule an explicit activation",
+            SchedulingIntent::FactTriggeredRoute => "apply a fact-triggered route",
+        };
+        Err(RuntimeError::InvalidRunStatusTransition {
+            run_id: run_id.to_owned(),
+            action: action.to_string(),
+            status,
+        })
     }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BoardPatch {
-    key: String,
+    key: FactKey,
     value: String,
     expected_version: Option<u64>,
 }
 
 impl BoardPatch {
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Result<Self, FactError> {
+        Ok(Self {
+            key: FactKey::new(key)?,
             value: value.into(),
             expected_version: None,
-        }
+        })
     }
 
     pub fn expect_version(mut self, version: u64) -> Self {
@@ -1113,6 +1506,20 @@ impl BoardPatch {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RuntimeError {
+    ActivationLimitDecrease {
+        run_id: String,
+        current: u64,
+        requested: u64,
+    },
+    ActivationLimitExceeded {
+        run_id: String,
+        activation_limit: u64,
+        requested: u64,
+    },
+    ActivationLimitIncreaseRequired {
+        run_id: String,
+        current: u64,
+    },
     ActivationNotFound {
         activation_id: String,
     },
@@ -1122,6 +1529,10 @@ pub enum RuntimeError {
     },
     ArtifactNotFound {
         artifact_key: String,
+    },
+    InvalidFactKey {
+        kind: &'static str,
+        key: String,
     },
     BoardVersionConflict {
         expected: u64,
@@ -1133,6 +1544,11 @@ pub enum RuntimeError {
     DuplicateRun {
         run_id: String,
     },
+    ParticipantExitConflict {
+        run_id: String,
+        activation_id: String,
+        allocation_generation: u64,
+    },
     ForEachMismatch {
         expected: String,
         actual: String,
@@ -1140,11 +1556,58 @@ pub enum RuntimeError {
     RunNotFound {
         run_id: String,
     },
+    RunPaused {
+        run_id: String,
+    },
+    RunConfigurationConflict {
+        run_id: String,
+        expected_mode: RunMode,
+        actual_mode: RunMode,
+        expected_activation_limit: u64,
+        actual_activation_limit: u64,
+    },
+    InvalidRunStatusTransition {
+        run_id: String,
+        action: String,
+        status: RunStatus,
+    },
+    RunModeDoesNotAllowControl {
+        run_id: String,
+        action: String,
+        mode: RunMode,
+    },
+    RunNotQuiescent {
+        run_id: String,
+        status: RunStatus,
+    },
+    StaleRoutePlan {
+        activation_id: String,
+    },
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RuntimeError::ActivationLimitDecrease {
+                run_id,
+                current,
+                requested,
+            } => write!(
+                formatter,
+                "activation limit for run {run_id} cannot decrease from {current} to {requested}"
+            ),
+            RuntimeError::ActivationLimitExceeded {
+                run_id,
+                activation_limit,
+                requested,
+            } => write!(
+                formatter,
+                "activation limit exceeded for run {run_id}: limit {activation_limit}, requested {requested}"
+            ),
+            RuntimeError::ActivationLimitIncreaseRequired { run_id, current } => write!(
+                formatter,
+                "run {run_id} requires an activation limit greater than {current} to resume"
+            ),
             RuntimeError::ActivationNotFound { activation_id } => {
                 write!(formatter, "activation not found: {activation_id}")
             }
@@ -1160,6 +1623,9 @@ impl fmt::Display for RuntimeError {
             RuntimeError::ArtifactNotFound { artifact_key } => {
                 write!(formatter, "artifact not found: {artifact_key}")
             }
+            RuntimeError::InvalidFactKey { kind, key } => {
+                write!(formatter, "invalid {kind} fact key: {key}")
+            }
             RuntimeError::BoardVersionConflict { expected, actual } => write!(
                 formatter,
                 "board version conflict: expected {expected}, actual {actual}"
@@ -1168,6 +1634,14 @@ impl fmt::Display for RuntimeError {
                 write!(formatter, "duplicate activation: {activation_id}")
             }
             RuntimeError::DuplicateRun { run_id } => write!(formatter, "duplicate run: {run_id}"),
+            RuntimeError::ParticipantExitConflict {
+                run_id,
+                activation_id,
+                allocation_generation,
+            } => write!(
+                formatter,
+                "participant exit conflicts for run {run_id} activation {activation_id} allocation {allocation_generation}"
+            ),
             RuntimeError::ForEachMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -1175,6 +1649,40 @@ impl fmt::Display for RuntimeError {
                 )
             }
             RuntimeError::RunNotFound { run_id } => write!(formatter, "run not found: {run_id}"),
+            RuntimeError::RunPaused { run_id } => write!(formatter, "run {run_id} is paused"),
+            RuntimeError::RunConfigurationConflict {
+                run_id,
+                expected_mode,
+                actual_mode,
+                expected_activation_limit,
+                actual_activation_limit,
+            } => write!(
+                formatter,
+                "run {run_id} configuration conflict: expected {expected_mode:?}/{expected_activation_limit}, got {actual_mode:?}/{actual_activation_limit}"
+            ),
+            RuntimeError::InvalidRunStatusTransition {
+                run_id,
+                action,
+                status,
+            } => write!(
+                formatter,
+                "run {run_id} cannot {action} from status {status:?}"
+            ),
+            RuntimeError::RunModeDoesNotAllowControl {
+                run_id,
+                action,
+                mode,
+            } => write!(
+                formatter,
+                "run {run_id} in mode {mode:?} does not allow {action}"
+            ),
+            RuntimeError::RunNotQuiescent { run_id, status } => write!(
+                formatter,
+                "run {run_id} must be quiescent before completion, current status {status:?}"
+            ),
+            RuntimeError::StaleRoutePlan { activation_id } => {
+                write!(formatter, "stale route plan for activation {activation_id}")
+            }
         }
     }
 }
@@ -1240,51 +1748,3 @@ impl fmt::Display for StopValidationError {
 }
 
 impl Error for StopValidationError {}
-
-fn activation_id_for(node: &NodeSpec, stable_key: Option<&str>) -> String {
-    match stable_key {
-        Some(stable_key) => format!("{}:{stable_key}", node.id()),
-        None => node.id().to_owned(),
-    }
-}
-
-fn activation_key(run_id: &str, activation_id: &str) -> (String, String) {
-    (run_id.to_owned(), activation_id.to_owned())
-}
-
-fn slot_index_key(run_id: &str, artifact_key: &str) -> (String, String) {
-    (run_id.to_owned(), artifact_key.to_owned())
-}
-
-fn effect_index_key(
-    run_id: &str,
-    activation_id: &str,
-    effect_key: &str,
-) -> (String, String, String) {
-    (
-        run_id.to_owned(),
-        activation_id.to_owned(),
-        effect_key.to_owned(),
-    )
-}
-
-fn stop_fact_id(run_id: &str, activation_id: &str, event_sequence: u64) -> String {
-    format!("{run_id}/{activation_id}/{event_sequence}")
-}
-
-fn artifact_id(event_sequence: u64) -> String {
-    format!("artifact:{event_sequence}")
-}
-
-fn flow_lock_application_id(event_sequence: u64) -> String {
-    format!("flow-lock-application:{event_sequence}")
-}
-
-fn content_hash(payload: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in payload.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("fnv1a64:{hash:016x}")
-}

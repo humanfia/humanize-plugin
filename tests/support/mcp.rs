@@ -86,6 +86,10 @@ impl CommandRunner for SideEffectRunner {
         false
     }
 
+    fn supports_external_driver_launch(&self) -> bool {
+        false
+    }
+
     fn pipe_sink_producer_closed(&self, target: &str) {
         complete_pipe_command(target);
     }
@@ -101,6 +105,10 @@ impl CommandRunner for RecordingRunner {
     }
 
     fn pipe_sink_helper_is_external(&self) -> bool {
+        false
+    }
+
+    fn supports_external_driver_launch(&self) -> bool {
         false
     }
 
@@ -218,6 +226,43 @@ pub fn call_tool<R: CommandRunner>(
     server: &mut McpServer<R>,
     id: u64,
     name: &str,
+    mut arguments: Value,
+) -> Value {
+    if matches!(name, "run_flow" | "apply_flow_lock" | "apply_flow_update")
+        && arguments.get("review_id").is_none()
+        && arguments.get("reviewId").is_none()
+    {
+        let prepared = raw_call_tool(
+            server,
+            id.saturating_add(10_000),
+            "prepare_flow_review",
+            arguments.clone(),
+        );
+        if let Some(review_id) = structured(&prepared)["review_id"].as_str() {
+            let decided = raw_call_tool(
+                server,
+                id.saturating_add(20_000),
+                "decide_flow_review",
+                json!({
+                    "review_id": review_id,
+                    "decision": "approved"
+                }),
+            );
+            if structured(&decided)["ok"] == true {
+                arguments["review_id"] = Value::String(review_id.to_string());
+            }
+        }
+        if arguments.get("review_id").is_none() {
+            arguments["review_id"] = Value::String("review-missing".to_string());
+        }
+    }
+    raw_call_tool(server, id, name, arguments)
+}
+
+fn raw_call_tool<R: CommandRunner>(
+    server: &mut McpServer<R>,
+    id: u64,
+    name: &str,
     arguments: Value,
 ) -> Value {
     server
@@ -273,14 +318,14 @@ pub fn assert_prefixed_hex(value: &str, prefix: &str) {
     let suffix = value
         .strip_prefix(prefix)
         .expect("value should include expected prefix");
-    assert_eq!(suffix.len(), 16);
+    assert_eq!(suffix.len(), 64);
     assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
 }
 pub fn readme_resource() -> Value {
     json!({
-        "id": "readme.main",
+        "path": "README.md",
         "kind": "readme",
-        "source": "inline:Use Humanize to audit this library without editing files."
+        "content": "Use Humanize to audit this library without editing files."
     })
 }
 pub fn missing_readme_flow() -> Value {
@@ -292,9 +337,9 @@ pub fn node_less_missing_readme_flow() -> Value {
     json!({
         "resources": [
             {
-                "id": "schema.handoff",
+                "path": "schemas/handoff.json",
                 "kind": "schema",
-                "source": "inline:handoff"
+                "content": "handoff"
             }
         ]
     })
@@ -304,9 +349,9 @@ pub fn blank_inline_readme_flow() -> Value {
         "nodes": ["root"],
         "resources": [
             {
-                "id": "readme.main",
+                "path": "README.md",
                 "kind": "readme",
-                "source": "inline:   "
+                "content": "   "
             }
         ]
     })
@@ -320,7 +365,10 @@ pub fn valid_flow() -> Value {
         "resources": [readme_resource()],
         "routes": [
             {
-                "predicate": "exists(artifact.ready)",
+                "predicate": {
+                    "op": "exists",
+                    "fact": {"kind": "artifact", "key": "ready"}
+                },
                 "activate": "finish"
             }
         ]

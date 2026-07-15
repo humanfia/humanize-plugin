@@ -1,16 +1,14 @@
 use crate::adapters::tmux::CommandRunner;
 use crate::flow;
+use crate::review::{ReviewDecision, ReviewStatus};
 use crate::view::{
-    AdapterCapabilityReview, DiffEntry, FlowGraph, FlowGraphEdge, FlowGraphNode,
-    FlowReviewContract, FlowReviewNode, FlowReviewRoute, FlowReviewSnapshot, FlowValueFlow,
-    FlowVisualDiff, ReviewRisk, render_flow_review_document,
+    AdapterCapabilityReview, DiffEntry, FlowReviewContract, FlowReviewNode, FlowReviewRoute,
+    FlowReviewSnapshot, FlowValueFlow, FlowVisualDiff, ReviewRisk, derive_flow_graph,
+    render_flow_review_document,
 };
 use serde_json::{Value, json};
 
-use super::{
-    FlowReviewRecord, FlowReviewStatus, McpServer, ToolCallResult, ToolError,
-    diagnostic_severity_name, optional_string, require_string, stable_hash,
-};
+use super::{McpServer, ToolCallResult, ToolError, optional_string, require_string};
 
 impl<R: CommandRunner> McpServer<R> {
     pub(super) fn prepare_flow_review(
@@ -24,55 +22,43 @@ impl<R: CommandRunner> McpServer<R> {
             .get(&lock_id)
             .ok_or_else(|| ToolError::invalid("flow lock not found"))?;
         let title = optional_string(arguments, &["title"])?.unwrap_or("Flow review");
-        let review_id = review_id_for(&lock_id, &content_hash);
-        let status = self
-            .state
-            .reviews
-            .get(&review_id)
-            .map(|record| record.status)
-            .unwrap_or(FlowReviewStatus::Pending);
+        let status = ReviewStatus::Pending;
         let snapshot = build_flow_review_snapshot(title, status, lock);
         let document = render_flow_review_document(&snapshot)
             .map_err(|_| ToolError::invalid("review render failed"))?;
         let snapshot_json = serde_json::to_value(&snapshot)
             .map_err(|_| ToolError::invalid("review serialization failed"))?;
 
-        self.state
-            .flow_review_index
-            .insert(lock_id.clone(), review_id.clone());
-        self.state
-            .reviews
-            .entry(review_id.clone())
-            .or_insert(FlowReviewRecord {
-                review_id: review_id.clone(),
-                lock_id: lock_id.clone(),
-                content_hash: content_hash.clone(),
-                status: FlowReviewStatus::Pending,
-                reason: None,
-            });
+        let record = self
+            .review_store
+            .prepare(lock, &snapshot_json, &document)
+            .map_err(|error| ToolError::invalid(error.to_string()))?;
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
-            "review_id": review_id,
+            "review_id": record.review_id(),
             "flow_lock_id": lock_id,
             "lock_id": lock_id,
             "content_hash": content_hash,
-            "review_status": status.as_str(),
+            "review_status": record.status().as_str(),
+            "review_uri": record.document_uri(),
+            "review_path": record.review_json_path(),
+            "document_path": record.document_path(),
             "document": document,
             "snapshot": snapshot_json
         })))
     }
 
-    pub(super) fn approve_flow_review(
+    pub(super) fn decide_flow_review(
         &mut self,
         arguments: &Value,
     ) -> Result<ToolCallResult, ToolError> {
         let review_id = require_string(arguments, &["review_id", "reviewId"])?;
         let decision = require_string(arguments, &["decision", "status", "action"])?;
         let status = match decision {
-            "approved" | "approve" => FlowReviewStatus::Approved,
-            "bypassed" | "bypass" => FlowReviewStatus::Bypassed,
-            "rejected" | "reject" => FlowReviewStatus::Rejected,
+            "approved" | "approve" => ReviewDecision::Approved,
+            "bypassed" | "bypass" => ReviewDecision::Bypassed,
+            "rejected" | "reject" => ReviewDecision::Rejected,
             value => {
                 return Err(ToolError::invalid(format!(
                     "unknown review decision: {value}"
@@ -80,78 +66,40 @@ impl<R: CommandRunner> McpServer<R> {
             }
         };
         let reason = optional_string(arguments, &["reason"])?.map(str::to_string);
-        if status == FlowReviewStatus::Bypassed
+        if matches!(status, ReviewDecision::Bypassed | ReviewDecision::Rejected)
             && reason
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
         {
             return Err(ToolError::invalid(
-                "reason is required when bypassing review",
+                "reason is required when rejecting or bypassing review",
             ));
         }
-        let Some(record) = self.state.reviews.get_mut(review_id) else {
-            return Ok(ToolCallResult::error(json!({
-                "ok": false,
-                "review_id": review_id,
-                "error": "flow review not found"
-            })));
-        };
-        record.status = status;
-        record.reason = reason.clone();
+        let record = self
+            .review_store
+            .decide(review_id, status, reason.as_deref())
+            .map_err(|error| ToolError::invalid(error.to_string()))?;
 
         Ok(ToolCallResult::ok(json!({
             "ok": true,
             "review_id": review_id,
-            "flow_lock_id": record.lock_id,
-            "lock_id": record.lock_id,
-            "content_hash": record.content_hash,
-            "review_status": status.as_str(),
-            "reason": reason
+            "flow_lock_id": record.flow_lock_id(),
+            "lock_id": record.flow_lock_id(),
+            "content_hash": record.content_hash(),
+            "review_status": record.status().as_str(),
+            "reason": record.reason()
         })))
     }
 }
 
-fn review_id_for(lock_id: &str, content_hash: &str) -> String {
-    format!(
-        "review_{:016x}",
-        stable_hash(&format!("{lock_id}:{content_hash}"))
-    )
-}
-
 fn build_flow_review_snapshot(
     title: &str,
-    status: FlowReviewStatus,
+    status: ReviewStatus,
     lock: &flow::FlowLock,
 ) -> FlowReviewSnapshot {
     let draft = lock.draft();
-    let first_node = draft
-        .nodes
-        .first()
-        .map(|node| node.id.as_str())
-        .unwrap_or("root");
     let diagnostics = lock.diagnostics();
-    let graph_nodes = draft
-        .nodes
-        .iter()
-        .map(|node| FlowGraphNode {
-            id: node.id.clone(),
-            label: review_label(&node.id),
-            kind: node
-                .action
-                .as_ref()
-                .map(|action| node_driver_name(action.driver).to_string())
-                .unwrap_or_else(|| "node".to_string()),
-        })
-        .collect::<Vec<_>>();
-    let graph_edges = draft
-        .routes
-        .iter()
-        .map(|route| FlowGraphEdge {
-            from: first_node.to_string(),
-            to: route.activate.clone(),
-            label: route.predicate.clone(),
-        })
-        .collect::<Vec<_>>();
+    let graph = derive_flow_graph(draft);
     let nodes = draft
         .nodes
         .iter()
@@ -172,9 +120,10 @@ fn build_flow_review_snapshot(
         .enumerate()
         .map(|(index, route)| FlowReviewRoute {
             id: format!("route-{index}"),
-            from: first_node.to_string(),
+            from: format!("fact:{}", route.predicate.fact_ref()),
             to: route.activate.clone(),
-            predicate: route.predicate.clone(),
+            predicate: route.predicate.to_string(),
+            for_each: route.for_each.as_ref().map(ToString::to_string),
             outcome: format!("activates {}", route.activate),
         })
         .collect::<Vec<_>>();
@@ -208,11 +157,19 @@ fn build_flow_review_snapshot(
     let artifact_flows = draft
         .routes
         .iter()
-        .filter_map(|route| {
-            artifact_fact_from_predicate(&route.predicate).map(|artifact| FlowValueFlow {
-                source: first_node.to_string(),
+        .flat_map(|route| route_artifact_facts(route).map(move |fact| (route, fact)))
+        .filter_map(|(route, artifact)| {
+            let fact_node = format!("fact:{artifact}");
+            let source = graph
+                .edges
+                .iter()
+                .find(|edge| edge.to == fact_node && edge.label == "produces")?
+                .from
+                .clone();
+            Some(FlowValueFlow {
+                source,
                 target: route.activate.clone(),
-                value: artifact,
+                value: artifact.to_string(),
             })
         })
         .collect::<Vec<_>>();
@@ -229,7 +186,7 @@ fn build_flow_review_snapshot(
             .iter()
             .map(|diagnostic| ReviewRisk {
                 id: format!("risk.{}", diagnostic.code.to_ascii_lowercase()),
-                severity: diagnostic_severity_name(diagnostic.severity_level).to_string(),
+                severity: diagnostic.severity.as_str().to_string(),
                 summary: diagnostic.message.clone(),
                 mitigation: diagnostic
                     .fix_hint
@@ -242,10 +199,7 @@ fn build_flow_review_snapshot(
     FlowReviewSnapshot {
         title: title.to_string(),
         review_status: status.as_str().to_string(),
-        graph: FlowGraph {
-            nodes: graph_nodes,
-            edges: graph_edges,
-        },
+        graph,
         nodes,
         routes,
         contracts,
@@ -314,19 +268,14 @@ fn node_driver_name(driver: flow::NodeDriver) -> &'static str {
     }
 }
 
-fn artifact_fact_from_predicate(predicate: &str) -> Option<String> {
-    let trimmed = predicate.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix("exists(")
-        .and_then(|value| value.strip_suffix(')'))
-    {
-        if inner.starts_with("artifact.") {
-            return Some(inner.to_string());
-        }
-    }
-    trimmed
-        .starts_with("artifact.")
-        .then(|| trimmed.to_string())
+fn route_artifact_facts(route: &flow::FlowRoute) -> impl Iterator<Item = flow::FactRef> + '_ {
+    let predicate = match route.predicate.fact_ref() {
+        fact @ flow::FactRef::Artifact { .. } => Some(fact.clone()),
+        flow::FactRef::Board { .. } => None,
+    };
+    predicate
+        .into_iter()
+        .chain(route.for_each.as_ref().map(flow::ArtifactRef::fact_ref))
 }
 
 fn review_diff(draft: &flow::FlowDraft) -> FlowVisualDiff {

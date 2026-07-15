@@ -3,13 +3,20 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::Serialize;
+use serde_json::json;
+
+mod hooks;
+
+pub use hooks::{run_participant_exited_hook, run_session_start_hook, run_stop_hook};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ClientConfigTarget {
     CodexSession,
     CodexPersistent,
+    CodexHooksJson,
     ClaudeProject,
     ClaudeSessionJson,
+    ClaudeHooksJson,
 }
 
 impl FromStr for ClientConfigTarget {
@@ -19,8 +26,10 @@ impl FromStr for ClientConfigTarget {
         match value {
             "codex-session" => Ok(Self::CodexSession),
             "codex-persistent" => Ok(Self::CodexPersistent),
+            "codex-hooks-json" => Ok(Self::CodexHooksJson),
             "claude-project" => Ok(Self::ClaudeProject),
             "claude-session-json" => Ok(Self::ClaudeSessionJson),
+            "claude-hooks-json" => Ok(Self::ClaudeHooksJson),
             _ => Err(ClientConfigError::UnknownTarget(value.to_owned())),
         }
     }
@@ -63,11 +72,23 @@ pub fn render_client_config(
             "codex mcp add humanize_plugin -- {}",
             shell_word(command)
         )),
+        ClientConfigTarget::CodexHooksJson => render_hooks_json(
+            command,
+            "codex_session_start",
+            "--codex-pre-tool-use-hook",
+            "--codex-stop-hook",
+        ),
         ClientConfigTarget::ClaudeProject => Ok(format!(
             "claude mcp add --scope project humanize_plugin -- {}",
             shell_word(command)
         )),
         ClientConfigTarget::ClaudeSessionJson => render_claude_session_json(command),
+        ClientConfigTarget::ClaudeHooksJson => render_hooks_json(
+            command,
+            "claude_session_start",
+            "--claude-pre-tool-use-hook",
+            "--claude-stop-hook",
+        ),
     }
 }
 
@@ -96,6 +117,57 @@ fn render_claude_session_json(command: &str) -> Result<String, ClientConfigError
 
     serde_json::to_string_pretty(&config)
         .map_err(|err| ClientConfigError::JsonRender(err.to_string()))
+}
+
+fn render_hooks_json(
+    command: &str,
+    ready_source: &str,
+    pre_tool_flag: &str,
+    stop_flag: &str,
+) -> Result<String, ClientConfigError> {
+    let command_word = shell_word(command);
+    let ready_command = format!("{command_word} --agent-ready-hook --source {ready_source}");
+    let guard_command = format!("{command_word} {pre_tool_flag}");
+    let stop_command = format!("{command_word} {stop_flag}");
+    serde_json::to_string_pretty(&json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": ready_command,
+                            "statusMessage": "Recording Humanize agent readiness"
+                        }
+                    ]
+                }
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": guard_command,
+                            "statusMessage": "Checking Humanize tmux ownership"
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": stop_command,
+                            "statusMessage": "Validating Humanize participant completion"
+                        }
+                    ]
+                }
+            ]
+        }
+    }))
+    .map_err(|err| ClientConfigError::JsonRender(err.to_string()))
 }
 
 fn shell_word(value: &str) -> String {

@@ -1,15 +1,18 @@
 use crate::flow;
 
-use super::{RuntimeError, RuntimeState, activation_key, slot_index_key};
+use super::{RouteTrigger, RuntimeError, RuntimeState, next_activation_identity, slot_index_key};
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
 pub struct RoutePreview {
     pub route_index: usize,
+    pub route_id: String,
     pub activate: String,
     pub predicate: String,
     pub matched: bool,
     pub reason: Option<String>,
     pub for_each: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<RouteTrigger>,
     pub planned_activations: Vec<PlannedActivationPreview>,
 }
 
@@ -17,6 +20,7 @@ pub struct RoutePreview {
 pub struct PlannedActivationPreview {
     pub activation_id: String,
     pub stable_key: Option<String>,
+    pub activation_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,119 +43,136 @@ pub fn preview_flow_routes(
         .routes
         .iter()
         .enumerate()
-        .map(|(route_index, route)| preview_route(state, run_id, route_index, route))
+        .map(|(route_index, route)| preview_route(state, run_id, lock, route_index, route))
         .collect())
 }
 
 fn preview_route(
     state: &RuntimeState,
     run_id: &str,
+    lock: &flow::FlowLock,
     route_index: usize,
     route: &flow::FlowRoute,
 ) -> RoutePreview {
-    let mut matched = false;
-    let mut reason = None;
-    let mut planned_activations = Vec::new();
+    let route_id = flow::canonical_route_identity(route);
+    let mut preview = RoutePreview {
+        route_index,
+        route_id: route_id.clone(),
+        activate: route.activate.clone(),
+        predicate: route.predicate.to_string(),
+        matched: false,
+        reason: None,
+        for_each: route.for_each.as_ref().map(ToString::to_string),
+        trigger: None,
+        planned_activations: Vec::new(),
+    };
 
-    match evaluate_predicate(state, run_id, &route.predicate) {
-        PredicateResult::Matched => match plan_activations(state, run_id, route) {
-            Ok(plan) => {
-                matched = true;
-                planned_activations = plan;
-            }
-            Err(plan_reason) => {
-                reason = Some(plan_reason);
+    let predicate_fact = match evaluate_predicate(state, run_id, &route.predicate) {
+        PredicateResult::Matched(fact) => fact,
+        PredicateResult::Unmatched(reason) => {
+            preview.reason = Some(reason);
+            return preview;
+        }
+    };
+    let trigger_fact = match route.for_each.as_ref() {
+        Some(for_each) => match for_each_artifact_fact(state, run_id, for_each) {
+            Ok(fact) => fact,
+            Err(reason) => {
+                preview.reason = Some(reason);
+                return preview;
             }
         },
-        PredicateResult::Unmatched(predicate_reason) => {
-            reason = Some(predicate_reason);
-        }
+        None => predicate_fact,
+    };
+    let trigger = RouteTrigger {
+        flow_lock_id: lock.id().to_owned(),
+        route_id,
+        fact_ref: trigger_fact.fact_ref,
+        fact_version: trigger_fact.version,
+    };
+    preview.trigger = Some(trigger.clone());
+    if state.has_applied_trigger(run_id, &trigger) {
+        preview.reason = Some("trigger_already_applied".into());
+        return preview;
     }
 
-    RoutePreview {
-        route_index,
-        activate: route.activate.clone(),
-        predicate: route.predicate.clone(),
-        matched,
-        reason,
-        for_each: route.for_each.clone(),
-        planned_activations,
+    match plan_activations(state, run_id, route) {
+        Ok(planned) => {
+            let remaining = state
+                .activation_limit(run_id)
+                .unwrap_or(u64::MAX)
+                .saturating_sub(state.activations_used(run_id));
+            preview.planned_activations = planned;
+            if preview.planned_activations.len() as u64 > remaining {
+                preview.reason = Some("activation_limit_exhausted".into());
+            } else if preview.planned_activations.is_empty() {
+                preview.reason = Some("no_activations".into());
+            } else {
+                preview.matched = true;
+            }
+        }
+        Err(reason) => preview.reason = Some(reason),
     }
+    preview
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct FactVersion {
+    fact_ref: String,
+    version: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum PredicateResult {
-    Matched,
+    Matched(FactVersion),
     Unmatched(String),
 }
 
-fn evaluate_predicate(state: &RuntimeState, run_id: &str, predicate: &str) -> PredicateResult {
-    let predicate = predicate.trim();
-
-    if let Some(path) = exists_argument(predicate) {
-        if let Some(key) = path.strip_prefix("artifact.") {
-            return if latest_artifact_payload(state, run_id, key).is_some() {
-                PredicateResult::Matched
-            } else {
-                PredicateResult::Unmatched("predicate_unmatched".into())
+fn evaluate_predicate(
+    state: &RuntimeState,
+    run_id: &str,
+    predicate: &flow::FlowPredicate,
+) -> PredicateResult {
+    match predicate.fact_ref() {
+        flow::FactRef::Artifact { key } => {
+            let artifact = latest_artifact(state, run_id, key.as_str());
+            if !predicate.matches(artifact.map(|artifact| artifact.payload.as_str())) {
+                return PredicateResult::Unmatched("predicate_unmatched".into());
+            }
+            let artifact = artifact.expect("a matching artifact predicate must have a value");
+            PredicateResult::Matched(FactVersion {
+                fact_ref: predicate.fact_ref().to_string(),
+                version: artifact.event_sequence,
+            })
+        }
+        flow::FactRef::Board { key } => {
+            let value = board_value(state, run_id, key.as_str());
+            if !predicate.matches(value) {
+                return PredicateResult::Unmatched("predicate_unmatched".into());
+            }
+            let Some(version) = state.board_fact_version(run_id, key.as_str()) else {
+                return PredicateResult::Unmatched("predicate_unmatched".into());
             };
-        }
-        if let Some(key) = path.strip_prefix("board.") {
-            return if board_value(state, run_id, key).is_some() {
-                PredicateResult::Matched
-            } else {
-                PredicateResult::Unmatched("predicate_unmatched".into())
-            };
-        }
-        if bare_fact_path(path, "event.").is_some() {
-            return PredicateResult::Unmatched("event fact source unavailable".into());
+            PredicateResult::Matched(FactVersion {
+                fact_ref: predicate.fact_ref().to_string(),
+                version,
+            })
         }
     }
-
-    if let Some(key) = bare_fact_path(predicate, "artifact.") {
-        return if latest_artifact_payload(state, run_id, key).is_some_and(is_truthy_fact) {
-            PredicateResult::Matched
-        } else {
-            PredicateResult::Unmatched("predicate_unmatched".into())
-        };
-    }
-
-    if let Some(key) = bare_fact_path(predicate, "board.") {
-        return if board_value(state, run_id, key).is_some_and(is_truthy_fact) {
-            PredicateResult::Matched
-        } else {
-            PredicateResult::Unmatched("predicate_unmatched".into())
-        };
-    }
-
-    if bare_fact_path(predicate, "event.").is_some() {
-        return PredicateResult::Unmatched("event fact source unavailable".into());
-    }
-
-    PredicateResult::Unmatched("unsupported_predicate".into())
 }
 
-fn exists_argument(predicate: &str) -> Option<&str> {
-    predicate
-        .strip_prefix("exists(")?
-        .strip_suffix(')')
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-}
-
-fn bare_fact_path<'a>(predicate: &'a str, prefix: &str) -> Option<&'a str> {
-    let key = predicate.strip_prefix(prefix)?;
-    if key.is_empty() || key.contains(|character: char| character.is_whitespace()) {
-        return None;
-    }
-    if key
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '.')
-    {
-        Some(key)
-    } else {
-        None
-    }
+fn for_each_artifact_fact(
+    state: &RuntimeState,
+    run_id: &str,
+    for_each: &flow::ArtifactRef,
+) -> Result<FactVersion, String> {
+    let key = for_each.key();
+    let artifact = latest_artifact(state, run_id, key.as_str())
+        .ok_or_else(|| format!("artifact not found: {key}"))?;
+    Ok(FactVersion {
+        fact_ref: for_each.to_string(),
+        version: artifact.event_sequence,
+    })
 }
 
 fn plan_activations(
@@ -159,72 +180,51 @@ fn plan_activations(
     run_id: &str,
     route: &flow::FlowRoute,
 ) -> Result<Vec<PlannedActivationPreview>, String> {
-    let Some(for_each) = route.for_each.as_deref() else {
-        let activation_id = route.activate.clone();
-        if state
-            .activations
-            .contains_key(&activation_key(run_id, &activation_id))
-        {
-            return Err(format!("duplicate activation: {activation_id}"));
-        }
+    let Some(for_each) = route.for_each.as_ref() else {
+        let (generation, activation_id) =
+            next_activation_identity(state, run_id, &route.activate, None);
         return Ok(vec![PlannedActivationPreview {
             activation_id,
             stable_key: None,
+            activation_generation: generation,
             index: None,
             item: None,
         }]);
     };
 
-    let artifact_key = for_each
-        .trim()
-        .strip_prefix("artifact.")
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| "unsupported_for_each".to_string())?;
-    let payload = latest_artifact_payload(state, run_id, artifact_key)
-        .ok_or_else(|| format!("artifact not found: {artifact_key}"))?;
-    let mut planned = Vec::new();
-    for (index, item) in payload.lines().enumerate() {
-        let stable_key = format!("{artifact_key}/{index}");
-        let activation_id = format!("{}:{stable_key}", route.activate);
-        if state
-            .activations
-            .contains_key(&activation_key(run_id, &activation_id))
-        {
-            return Err(format!("duplicate activation: {activation_id}"));
-        }
-        planned.push(PlannedActivationPreview {
-            activation_id,
-            stable_key: Some(stable_key),
-            index: Some(index),
-            item: Some(item.to_owned()),
-        });
-    }
-    Ok(planned)
+    let artifact_key = for_each.key().as_str();
+    let payload = &latest_artifact(state, run_id, artifact_key)
+        .ok_or_else(|| format!("artifact not found: {artifact_key}"))?
+        .payload;
+    Ok(payload
+        .lines()
+        .enumerate()
+        .map(|(index, item)| {
+            let stable_key = format!("{artifact_key}/{index}");
+            let (generation, activation_id) =
+                next_activation_identity(state, run_id, &route.activate, Some(&stable_key));
+            PlannedActivationPreview {
+                activation_id,
+                stable_key: Some(stable_key),
+                activation_generation: generation,
+                index: Some(index),
+                item: Some(item.to_owned()),
+            }
+        })
+        .collect())
 }
 
-fn latest_artifact_payload<'a>(
+fn latest_artifact<'a>(
     state: &'a RuntimeState,
     run_id: &str,
     artifact_key: &str,
-) -> Option<&'a str> {
+) -> Option<&'a super::ArtifactRecord> {
     let artifact_id = state
         .latest_artifact_by_slot_index
         .get(&slot_index_key(run_id, artifact_key))?;
-    state
-        .artifact_records
-        .get(artifact_id)
-        .map(|artifact| artifact.payload.as_str())
+    state.artifact_records.get(artifact_id)
 }
 
 fn board_value<'a>(state: &'a RuntimeState, run_id: &str, key: &str) -> Option<&'a str> {
-    state
-        .boards
-        .get(run_id)?
-        .get(key)
-        .map(|value| value.as_str())
-}
-
-fn is_truthy_fact(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty() && value != "false" && value != "0"
+    state.boards.get(run_id)?.get(key).map(String::as_str)
 }

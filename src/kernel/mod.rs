@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 pub const KERNEL_PRIMITIVES: [&str; 6] =
     ["Node", "Contract", "Artifact", "Board", "Route", "Event"];
 
@@ -251,12 +253,13 @@ pub enum ContractPermit {
     ApplyFlow,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "predicate", rename_all = "snake_case")]
 pub enum CompletionRule {
     #[default]
     Manual,
     AllProducedArtifactsRecorded,
-    Predicate(String),
+    Predicate(crate::flow::FlowPredicate),
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -333,65 +336,6 @@ impl Contract {
 
     pub fn completion(&self) -> &CompletionRule {
         &self.completion
-    }
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct Route {
-    id: String,
-    source_node_id: String,
-    target_node_template_id: String,
-    predicate: String,
-    for_each: Option<String>,
-}
-
-impl Route {
-    pub fn new(
-        id: impl Into<String>,
-        source_node_id: impl Into<String>,
-        target_node_template_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            source_node_id: source_node_id.into(),
-            target_node_template_id: target_node_template_id.into(),
-            predicate: String::new(),
-            for_each: None,
-        }
-    }
-
-    pub fn when(mut self, predicate: impl Into<String>) -> Self {
-        self.predicate = predicate.into();
-        self
-    }
-
-    pub fn for_each_artifact(mut self, expression: impl Into<String>) -> Self {
-        self.for_each = Some(expression.into());
-        self
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn source_node_id(&self) -> &str {
-        &self.source_node_id
-    }
-
-    pub fn target_node_template_id(&self) -> &str {
-        &self.target_node_template_id
-    }
-
-    pub fn predicate(&self) -> &str {
-        &self.predicate
-    }
-
-    pub fn for_each_expression(&self) -> Option<&str> {
-        self.for_each.as_deref()
-    }
-
-    pub fn for_each(&self) -> Option<&str> {
-        self.for_each.as_deref()
     }
 }
 

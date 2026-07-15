@@ -1,7 +1,7 @@
 use humanize_plugin::{
     flow::{
-        ContractArtifact, ContractCompletion, FlowCheckMode, FlowContract, FlowDraft, FlowLock,
-        FlowNode, FlowResource, FlowRoute, ResourceKind, flow_lock,
+        ArtifactRef, ContractArtifact, ContractCompletion, FlowCheckMode, FlowContract, FlowDraft,
+        FlowLock, FlowNode, FlowPredicate, FlowResource, FlowRoute, ResourceKind, flow_lock,
     },
     runtime::{
         ActivationStatus, BoardPatch, ControlCommand, DriverState, DriverTickInput, EventKind,
@@ -56,7 +56,7 @@ fn route_preview_lock(routes: Vec<FlowRoute>) -> FlowLock {
                 })
                 .collect(),
             resources: vec![FlowResource {
-                id: "readme.main".into(),
+                id: "README.md".into(),
                 kind: ResourceKind::Readme,
                 source: "inline:Preview local routes.".into(),
             }],
@@ -92,7 +92,7 @@ fn route_lock_with_finish_contract() -> FlowLock {
             }],
             resources: vec![
                 FlowResource {
-                    id: "readme.main".into(),
+                    id: "README.md".into(),
                     kind: ResourceKind::Readme,
                     source: "inline:Preview local routes.".into(),
                 },
@@ -103,7 +103,7 @@ fn route_lock_with_finish_contract() -> FlowLock {
                 },
             ],
             routes: vec![FlowRoute {
-                predicate: "exists(artifact.ready)".into(),
+                predicate: FlowPredicate::exists_artifact("ready").unwrap(),
                 for_each: None,
                 activate: "finish".into(),
             }],
@@ -120,6 +120,9 @@ fn local_event_store_appends_and_replays_events_in_order() {
 
     let first = store.append(EventPayload::RunStarted {
         run_id: "run-a".into(),
+        mode: RunCompletionMode::Finite,
+        activation_limit: u64::MAX,
+        stop_attempt_limit: 3,
     });
     let second = store.append(EventPayload::EffectRecorded {
         run_id: "run-a".into(),
@@ -140,7 +143,7 @@ fn local_event_store_appends_and_replays_events_in_order() {
     );
     assert!(matches!(
         store.replay()[0].payload,
-        EventPayload::RunStarted { ref run_id } if run_id == "run-a"
+        EventPayload::RunStarted { ref run_id, .. } if run_id == "run-a"
     ));
 }
 
@@ -177,6 +180,9 @@ fn events_have_fact_envelope_and_legacy_payloads_replay() {
 
     let started = store.append(EventPayload::RunStarted {
         run_id: "run-envelope".into(),
+        mode: RunCompletionMode::Finite,
+        activation_limit: u64::MAX,
+        stop_attempt_limit: 3,
     });
     let observed = store.append(EventPayload::StopObserved {
         run_id: "run-envelope".into(),
@@ -287,6 +293,9 @@ fn flow_updates_bind_new_activations_without_rewriting_existing_contracts() {
     let mut runtime = Runtime::default();
     runtime
         .start_run("run-flow", vec![NodeSpec::new("root")])
+        .unwrap();
+    runtime
+        .set_run_status("run-flow", RunStatus::Running)
         .unwrap();
 
     runtime
@@ -417,7 +426,7 @@ fn driver_tick_runs_ordered_pipeline_and_reports_quiescent_for_continuous_runs()
 #[test]
 fn driver_tick_repeats_route_actuate_and_complete_until_quiescent() {
     let lock = route_preview_lock(vec![FlowRoute {
-        predicate: "exists(artifact.ready)".into(),
+        predicate: FlowPredicate::exists_artifact("ready").unwrap(),
         for_each: None,
         activate: "finish".into(),
     }]);
@@ -543,7 +552,7 @@ fn driver_route_activations_keep_locked_target_contracts() {
 #[test]
 fn driver_tick_respects_tick_limit_when_route_work_remains() {
     let lock = route_preview_lock(vec![FlowRoute {
-        predicate: "exists(artifact.ready)".into(),
+        predicate: FlowPredicate::exists_artifact("ready").unwrap(),
         for_each: None,
         activate: "finish".into(),
     }]);
@@ -691,7 +700,7 @@ fn stop_validation_zero_per_tick_defers_without_recording_attempt() {
 #[test]
 fn driver_tick_zero_action_limit_prevents_route_actuate_and_complete_work() {
     let lock = route_preview_lock(vec![FlowRoute {
-        predicate: "exists(artifact.ready)".into(),
+        predicate: FlowPredicate::exists_artifact("ready").unwrap(),
         for_each: None,
         activate: "finish".into(),
     }]);
@@ -781,7 +790,7 @@ fn stop_run_transitions_to_stopped_and_cancels_active_activations() {
             .events()
             .iter()
             .filter_map(|event| match &event.payload {
-                EventPayload::RunStatusChanged { run_id, status }
+                EventPayload::RunStatusChanged { run_id, status, .. }
                     if run_id == "run-stop-control" =>
                 {
                     Some(*status)
@@ -943,7 +952,11 @@ fn runtime_rejects_cross_run_activation_mutation() {
         .deliver_artifact("run-b", "only-a", "brief", "wrong run")
         .unwrap_err();
     let patched = runtime
-        .patch_board("run-b", "only-a", BoardPatch::new("summary", "wrong run"))
+        .patch_board(
+            "run-b",
+            "only-a",
+            BoardPatch::new("summary", "wrong run").unwrap(),
+        )
         .unwrap_err();
     let effect = runtime
         .record_effect("run-b", "only-a", "shell", "wrong run")
@@ -1026,27 +1039,63 @@ fn patch_board_detects_version_conflicts_and_records_next_version() {
         .patch_board(
             "run-a",
             "ingest",
-            BoardPatch::new("summary", "ready").expect_version(0),
+            BoardPatch::new("summary", "ready")
+                .unwrap()
+                .expect_version(0),
         )
         .unwrap();
     let conflict = runtime
         .patch_board(
             "run-a",
             "ingest",
-            BoardPatch::new("summary", "stale").expect_version(0),
+            BoardPatch::new("summary", "stale")
+                .unwrap()
+                .expect_version(0),
         )
         .unwrap_err();
 
-    assert_eq!(version, 1);
+    assert_eq!(version, 3);
     assert_eq!(
         conflict.to_string(),
-        "board version conflict: expected 0, actual 1"
+        "board version conflict: expected 0, actual 3"
     );
-    assert_eq!(runtime.state().board_version, 1);
+    assert_eq!(runtime.state().board_version, 3);
     assert_eq!(
         runtime.state().board.get("summary").map(String::as_str),
         Some("ready")
     );
+}
+
+#[test]
+fn runtime_write_boundaries_reject_invalid_fact_keys() {
+    for key in [
+        "",
+        ".missing",
+        "missing.",
+        "bad-key",
+        "bad..key",
+        "non_ascii_\u{e9}",
+    ] {
+        let mut runtime = Runtime::default();
+        runtime
+            .start_run("run-invalid-artifact", vec![NodeSpec::new("root")])
+            .unwrap();
+        assert!(
+            runtime
+                .deliver_artifact("run-invalid-artifact", "root", key, "value")
+                .is_err(),
+            "artifact key {key:?} should be rejected"
+        );
+
+        let mut runtime = Runtime::default();
+        runtime
+            .start_run("run-invalid-board", vec![NodeSpec::new("root")])
+            .unwrap();
+        assert!(
+            BoardPatch::new(key, "value").is_err(),
+            "board key {key:?} should be rejected"
+        );
+    }
 }
 
 #[test]
@@ -1062,7 +1111,9 @@ fn runtime_state_can_be_replayed_from_the_event_log() {
         .patch_board(
             "run-a",
             "ingest",
-            BoardPatch::new("summary", "ready").expect_version(0),
+            BoardPatch::new("summary", "ready")
+                .unwrap()
+                .expect_version(0),
         )
         .unwrap();
     runtime
@@ -1102,11 +1153,12 @@ fn record_effect_appends_event_payload_without_a_new_primitive() {
 
 #[test]
 fn activate_node_creates_runtime_activation_without_mutating_templates() {
-    let template = NodeSpec::new("map").with_for_each("items");
+    let template = NodeSpec::new("map").with_for_each(ArtifactRef::new("items").unwrap());
     let mut runtime = Runtime::default();
     runtime
         .start_run("run-a", vec![NodeSpec::new("root")])
         .unwrap();
+    runtime.set_run_status("run-a", RunStatus::Running).unwrap();
 
     let activation_id = runtime
         .activate_node("run-a", &template, Some("items/1"))
@@ -1130,6 +1182,7 @@ fn fanout_activation_uses_artifact_data_and_stable_keys() {
     runtime
         .start_run("run-a", vec![NodeSpec::new("root")])
         .unwrap();
+    runtime.set_run_status("run-a", RunStatus::Running).unwrap();
     runtime
         .deliver_artifact("run-a", "root", "items", "alpha\nbeta\nalpha")
         .unwrap();
@@ -1137,7 +1190,7 @@ fn fanout_activation_uses_artifact_data_and_stable_keys() {
     let activation_ids = runtime
         .fanout_from_artifact(
             "run-a",
-            &NodeSpec::new("process").with_for_each("items"),
+            &NodeSpec::new("process").with_for_each(ArtifactRef::new("items").unwrap()),
             "items",
         )
         .unwrap();
@@ -1157,11 +1210,12 @@ fn fanout_activation_uses_artifact_data_and_stable_keys() {
 }
 
 #[test]
-fn fanout_duplicate_activation_rejects_without_partial_append() {
+fn fanout_after_explicit_lane_advances_only_that_lane_generation_atomically() {
     let mut runtime = Runtime::default();
     runtime
         .start_run("run-a", vec![NodeSpec::new("root")])
         .unwrap();
+    runtime.set_run_status("run-a", RunStatus::Running).unwrap();
     runtime
         .deliver_artifact("run-a", "root", "items", "alpha\nbeta")
         .unwrap();
@@ -1170,21 +1224,30 @@ fn fanout_duplicate_activation_rejects_without_partial_append() {
         .unwrap();
     let event_count = runtime.events().len();
 
-    let err = runtime
+    let activation_ids = runtime
         .fanout_from_artifact(
             "run-a",
-            &NodeSpec::new("process").with_for_each("items"),
+            &NodeSpec::new("process").with_for_each(ArtifactRef::new("items").unwrap()),
             "items",
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(err.to_string(), "duplicate activation: process:items/1");
-    assert_eq!(runtime.events().len(), event_count);
+    assert_eq!(
+        activation_ids,
+        vec!["process:items/0", "process:items/1~g1"]
+    );
+    assert_eq!(runtime.events().len(), event_count + 2);
     assert!(
-        !runtime
+        runtime
             .state()
             .activations
             .contains_key(&activation_key("run-a", "process:items/0"))
+    );
+    assert!(
+        runtime
+            .state()
+            .activations
+            .contains_key(&activation_key("run-a", "process:items/1~g1"))
     );
 }
 
@@ -1262,12 +1325,12 @@ fn preview_flow_routes_returns_plan_without_appending_runtime_events() {
                 },
             ],
             resources: vec![FlowResource {
-                id: "readme.main".into(),
+                id: "README.md".into(),
                 kind: ResourceKind::Readme,
                 source: "inline:Preview local routes.".into(),
             }],
             routes: vec![FlowRoute {
-                predicate: "exists(artifact.ready)".into(),
+                predicate: FlowPredicate::exists_artifact("ready").unwrap(),
                 for_each: None,
                 activate: "finish".into(),
             }],
@@ -1305,12 +1368,12 @@ fn preview_flow_routes_returns_plan_without_appending_runtime_events() {
 fn preview_flow_routes_matches_artifact_and_board_keys_containing_event() {
     let lock = route_preview_lock(vec![
         FlowRoute {
-            predicate: "artifact.event.status".into(),
+            predicate: FlowPredicate::truthy_artifact("event.status").unwrap(),
             for_each: None,
             activate: "artifact_target".into(),
         },
         FlowRoute {
-            predicate: "board.event.ready".into(),
+            predicate: FlowPredicate::truthy_board("event.ready").unwrap(),
             for_each: None,
             activate: "board_target".into(),
         },
@@ -1326,7 +1389,7 @@ fn preview_flow_routes_matches_artifact_and_board_keys_containing_event() {
         .patch_board(
             "run-event-keys",
             "root",
-            BoardPatch::new("event.ready", "true"),
+            BoardPatch::new("event.ready", "true").unwrap(),
         )
         .unwrap();
 
@@ -1353,6 +1416,7 @@ fn apply_flow_lock_records_mode_for_future_activation_policy() {
     runtime
         .start_run("run-a", vec![NodeSpec::new("root")])
         .unwrap();
+    runtime.set_run_status("run-a", RunStatus::Running).unwrap();
 
     runtime
         .apply_flow_lock(
@@ -1408,34 +1472,36 @@ fn apply_flow_lock_records_mode_for_future_activation_policy() {
             if *flow_lock_mode == Some(FlowLockMode::CheckpointRestart)
     ));
 
+    let first_application = runtime
+        .state()
+        .flow_lock_applications
+        .values()
+        .find(|application| application.lock_id == "lock-a")
+        .expect("first flow lock application should remain addressable");
+    let second_application = runtime
+        .state()
+        .flow_lock_applications
+        .values()
+        .find(|application| application.lock_id == "lock-b")
+        .expect("second flow lock application should be addressable");
+
     assert_eq!(
         runtime
             .state()
             .latest_flow_lock_application_index
             .as_deref(),
-        Some("flow-lock-application:9")
+        Some(second_application.application_id.as_str())
     );
-    let first_application = runtime
-        .state()
-        .flow_lock_applications
-        .get("flow-lock-application:5")
-        .expect("first flow lock application should remain addressable");
-    let second_application = runtime
-        .state()
-        .flow_lock_applications
-        .get("flow-lock-application:9")
-        .expect("second flow lock application should be addressable");
-
     assert_eq!(first_application.lock_id, "lock-a");
     assert_eq!(first_application.content_hash, "sha256:first");
-    assert_eq!(first_application.event_sequence, 5);
     assert_eq!(second_application.lock_id, "lock-b");
     assert_eq!(second_application.content_hash, "sha256:second");
+    assert!(second_application.event_sequence > first_application.event_sequence);
     assert!(matches!(
         runtime
             .events()
             .iter()
-            .find(|event| event.sequence == 9)
+            .find(|event| event.sequence == second_application.event_sequence)
             .map(|event| &event.payload),
         Some(EventPayload::FlowUpdate {
             run_id,

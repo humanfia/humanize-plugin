@@ -13,7 +13,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PipeSinkIdentity {
     pub dev: u64,
     pub ino: u64,
@@ -288,8 +288,42 @@ pub fn verify_pipe_sink_ready_ack_under_root(
     expected_transcript: &PipeSinkIdentity,
     expected_exe: &Path,
 ) -> io::Result<PipeSinkReady> {
+    verify_pipe_sink_ready_ack_under_root_inner(
+        root,
+        relative_path.as_ref(),
+        expected_nonce,
+        expected_transcript,
+        expected_exe,
+        true,
+    )
+}
+
+pub(crate) fn verify_pipe_sink_ready_ack_under_root_preserve(
+    root: &Path,
+    relative_path: impl AsRef<Path>,
+    expected_nonce: &str,
+    expected_transcript: &PipeSinkIdentity,
+    expected_exe: &Path,
+) -> io::Result<PipeSinkReady> {
+    verify_pipe_sink_ready_ack_under_root_inner(
+        root,
+        relative_path.as_ref(),
+        expected_nonce,
+        expected_transcript,
+        expected_exe,
+        false,
+    )
+}
+
+fn verify_pipe_sink_ready_ack_under_root_inner(
+    root: &Path,
+    relative_path: &Path,
+    expected_nonce: &str,
+    expected_transcript: &PipeSinkIdentity,
+    expected_exe: &Path,
+    remove_after_verification: bool,
+) -> io::Result<PipeSinkReady> {
     ensure_durable_pipe_capture_supported()?;
-    let relative_path = relative_path.as_ref();
     reject_uncontained_relative_path(relative_path)?;
     let mut ack_file = open_existing_ack_beneath(root, relative_path)?;
     ensure_regular_file(&ack_file)?;
@@ -315,7 +349,9 @@ pub fn verify_pipe_sink_ready_ack_under_root(
         pid: ack.pid,
         process_start_time_ticks: helper_process_start_time_ticks(ack.pid)?,
     };
-    unlink_file_under_root(root, relative_path)?;
+    if remove_after_verification {
+        unlink_file_under_root(root, relative_path)?;
+    }
     Ok(ready)
 }
 

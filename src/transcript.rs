@@ -1,9 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::input_ledger::{
-    MachineInputRecord, MachineInputStatus, machine_input_payload_hash,
-    normalize_machine_input_text,
-};
+use crate::input_ledger::{MachineInputRecord, MachineInputStatus, normalize_machine_input_text};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TranscriptMessage {
@@ -94,29 +91,27 @@ fn classify_next_message(
     if normalized_text.is_empty() {
         return TranscriptClassification::new(TranscriptInputClassification::Unclassified, None);
     }
-    let payload_hash = machine_input_payload_hash(&normalized_text);
-
-    if let Some(transaction_id) = message.transaction_id.as_deref() {
-        if let Some(record) = best_record(records.iter().filter(|record| {
+    if let Some(transaction_id) = message.transaction_id.as_deref()
+        && let Some(record) = best_record(records.iter().filter(|record| {
             record.status == MachineInputStatus::Submitted
                 && !used_transactions.contains(&record.transaction_id)
                 && record.transaction_id == transaction_id
-                && record_matches_payload(record, &normalized_text, &payload_hash)
-        })) {
-            used_transactions.insert(record.transaction_id.clone());
-            return TranscriptClassification::new(
-                TranscriptInputClassification::HumanizeInjected,
-                Some(record.transaction_id.clone()),
-            );
-        }
+                && record_matches_payload(record, &normalized_text)
+        }))
+    {
+        used_transactions.insert(record.transaction_id.clone());
+        return TranscriptClassification::new(
+            TranscriptInputClassification::HumanizeInjected,
+            Some(record.transaction_id.clone()),
+        );
     }
 
-    if let Some(timestamp_ms) = message.timestamp_ms {
-        if let Some(record) = best_time_record(
+    if let Some(timestamp_ms) = message.timestamp_ms
+        && let Some(record) = best_time_record(
             records.iter().filter(|record| {
                 record.status == MachineInputStatus::Submitted
                     && !used_transactions.contains(&record.transaction_id)
-                    && record_matches_payload(record, &normalized_text, &payload_hash)
+                    && record_matches_payload(record, &normalized_text)
                     && timestamp_is_close(
                         timestamp_ms,
                         record.submitted_at_ms,
@@ -124,13 +119,13 @@ fn classify_next_message(
                     )
             }),
             timestamp_ms,
-        ) {
-            used_transactions.insert(record.transaction_id.clone());
-            return TranscriptClassification::new(
-                TranscriptInputClassification::LikelyHumanizeInjected,
-                Some(record.transaction_id.clone()),
-            );
-        }
+        )
+    {
+        used_transactions.insert(record.transaction_id.clone());
+        return TranscriptClassification::new(
+            TranscriptInputClassification::LikelyHumanizeInjected,
+            Some(record.transaction_id.clone()),
+        );
     }
 
     TranscriptClassification::new(
@@ -139,8 +134,8 @@ fn classify_next_message(
     )
 }
 
-fn record_matches_payload(record: &MachineInputRecord, normalized_text: &str, hash: &str) -> bool {
-    record.normalized_text == normalized_text && record.payload_hash == hash
+fn record_matches_payload(record: &MachineInputRecord, normalized_text: &str) -> bool {
+    record.normalized_text == normalized_text
 }
 
 fn best_record<'a>(

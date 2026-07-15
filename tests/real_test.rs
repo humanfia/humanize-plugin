@@ -168,8 +168,8 @@ fn real_test_allocator_fails_when_fresh_session_creation_fails_before_window_or_
 
     assert_eq!(
         err,
-        RealTestError::Tmux(TmuxError::CommandFailed {
-            argv: vec![
+        RealTestError::Tmux(TmuxError::command_failed(
+            &vec![
                 "tmux",
                 "new-session",
                 "-d",
@@ -183,10 +183,10 @@ fn real_test_allocator_fails_when_fresh_session_creation_fails_before_window_or_
             ]
             .into_iter()
             .map(String::from)
-            .collect(),
-            status: 1,
-            stderr: "duplicate session".to_string()
-        })
+            .collect::<Vec<_>>(),
+            1,
+            "duplicate session",
+        ))
     );
     assert_eq!(
         runner.calls(),
@@ -493,14 +493,14 @@ fn real_test_cleanup_reports_mock_runner_failure() {
 
     assert_eq!(
         err,
-        RealTestError::Tmux(TmuxError::CommandFailed {
-            argv: vec!["tmux", "kill-pane", "-t", "humanize-plugin-real-test:%7.%8"]
+        RealTestError::Tmux(TmuxError::command_failed(
+            &vec!["tmux", "kill-pane", "-t", "humanize-plugin-real-test:%7.%8"]
                 .into_iter()
                 .map(String::from)
-                .collect(),
-            status: 1,
-            stderr: "pane missing".to_string()
-        })
+                .collect::<Vec<_>>(),
+            1,
+            "pane missing",
+        ))
     );
     assert_eq!(
         runner.calls(),

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use humanize_plugin::flow::{
     ContractArtifact, ContractCompletion, FlowCheckMode, FlowContract, FlowDraft, FlowExportFormat,
-    FlowNode, FlowResource, ResourceKind, flow_export, flow_lock,
+    FlowLock, FlowNode, FlowResource, ResourceKind, flow_export, flow_lock,
 };
 use humanize_plugin::run_assets::{
     RunAssetActivationUpdate, RunAssetManifest, RunAssetSink, RunAssetStore, RunAssetTmuxTarget,
@@ -37,9 +37,9 @@ fn draft() -> FlowDraft {
             ..FlowNode::default()
         }],
         resources: vec![FlowResource {
-            id: "readme.main".to_string(),
+            id: "README.md".to_string(),
             kind: ResourceKind::Readme,
-            source: "inline:Use Humanize to audit this library.".to_string(),
+            source: "Use Humanize to audit this library.".to_string(),
         }],
         ..FlowDraft::default()
     }
@@ -62,14 +62,14 @@ fn contract_draft_without_effects() -> FlowDraft {
         }],
         resources: vec![
             FlowResource {
-                id: "readme.main".to_string(),
+                id: "README.md".to_string(),
                 kind: ResourceKind::Readme,
-                source: "inline:Use Humanize to audit this library.".to_string(),
+                source: "Use Humanize to audit this library.".to_string(),
             },
             FlowResource {
                 id: "schema.report".to_string(),
                 kind: ResourceKind::Schema,
-                source: "inline:report".to_string(),
+                source: "report".to_string(),
             },
         ],
         ..FlowDraft::default()
@@ -300,23 +300,27 @@ fn start_run_manifest_rejects_existing_storage_with_different_raw_id() {
 }
 
 #[test]
-fn no_effect_flow_preserves_historical_canonical_bytes_and_lock_id() {
-    let lock = flow_lock(&contract_draft_without_effects(), FlowCheckMode::Core).unwrap();
+fn no_effect_flow_exports_a_direct_stable_sha256_package() {
+    let draft = contract_draft_without_effects();
+    let lock = flow_lock(&draft, FlowCheckMode::Core).unwrap();
     let exported = flow_export(&lock, FlowExportFormat::Json);
     let exported_json: Value = serde_json::from_str(&exported).unwrap();
-    let content = exported_json["content"].as_str().unwrap();
 
-    assert!(!content.contains("\"effects\":[]"));
-    assert!(content.contains("\"effect_requirements\":[]"));
-    assert_eq!(lock.id(), "flk_9c79529ac3fd3e4b");
-    assert_eq!(
-        content,
-        "{\"mode\":\"core\",\"draft\":{\"nodes\":[{\"id\":\"root\",\"contract_id\":\"contract.root\",\"action\":null,\"write_scopes\":[],\"extensions\":[]}],\"contracts\":[{\"id\":\"contract.root\",\"completion\":\"all_artifacts\",\"artifacts\":[{\"id\":\"report\",\"schema_resource_id\":\"schema.report\"}]}],\"routes\":[],\"resources\":[{\"id\":\"readme.main\",\"kind\":\"readme\",\"source\":\"inline:Use Humanize to audit this library.\"},{\"id\":\"schema.report\",\"kind\":\"schema\",\"source\":\"inline:report\"}],\"imports\":[],\"policies\":{\"write_scopes\":[]},\"extensions\":[]},\"adapter_capabilities\":[],\"node_contracts\":[{\"node_id\":\"root\",\"contract_id\":\"contract.root\",\"requires\":[],\"prefers\":[],\"accepts\":[],\"completion_policy\":\"all_artifacts\",\"artifact_requirements\":[{\"id\":\"report\",\"schema_resource_id\":\"schema.report\",\"required\":true}],\"effect_requirements\":[],\"stop_gate\":\"required\"}],\"diagnostics\":[]}"
-    );
-    assert_eq!(
-        exported,
-        "{\n  \"id\": \"flk_9c79529ac3fd3e4b\",\n  \"check_mode\": \"core\",\n  \"diagnostics\": [],\n  \"content\": \"{\\\"mode\\\":\\\"core\\\",\\\"draft\\\":{\\\"nodes\\\":[{\\\"id\\\":\\\"root\\\",\\\"contract_id\\\":\\\"contract.root\\\",\\\"action\\\":null,\\\"write_scopes\\\":[],\\\"extensions\\\":[]}],\\\"contracts\\\":[{\\\"id\\\":\\\"contract.root\\\",\\\"completion\\\":\\\"all_artifacts\\\",\\\"artifacts\\\":[{\\\"id\\\":\\\"report\\\",\\\"schema_resource_id\\\":\\\"schema.report\\\"}]}],\\\"routes\\\":[],\\\"resources\\\":[{\\\"id\\\":\\\"readme.main\\\",\\\"kind\\\":\\\"readme\\\",\\\"source\\\":\\\"inline:Use Humanize to audit this library.\\\"},{\\\"id\\\":\\\"schema.report\\\",\\\"kind\\\":\\\"schema\\\",\\\"source\\\":\\\"inline:report\\\"}],\\\"imports\\\":[],\\\"policies\\\":{\\\"write_scopes\\\":[]},\\\"extensions\\\":[]},\\\"adapter_capabilities\\\":[],\\\"node_contracts\\\":[{\\\"node_id\\\":\\\"root\\\",\\\"contract_id\\\":\\\"contract.root\\\",\\\"requires\\\":[],\\\"prefers\\\":[],\\\"accepts\\\":[],\\\"completion_policy\\\":\\\"all_artifacts\\\",\\\"artifact_requirements\\\":[{\\\"id\\\":\\\"report\\\",\\\"schema_resource_id\\\":\\\"schema.report\\\",\\\"required\\\":true}],\\\"effect_requirements\\\":[],\\\"stop_gate\\\":\\\"required\\\"}],\\\"diagnostics\\\":[]}\"\n}"
-    );
+    assert!(exported_json["flow"].is_object());
+    assert!(exported_json.get("content").is_none());
+    assert_eq!(exported_json["lock_id"], lock.id());
+    assert_eq!(exported_json["content_hash"], lock.content_hash());
+
+    let digest = lock.id().strip_prefix("flk_").unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(lock.content_hash(), format!("sha256:{digest}"));
+    assert_eq!(serde_json::from_str::<FlowLock>(&exported).unwrap(), lock);
+
+    let repeated = flow_lock(&draft, FlowCheckMode::Core).unwrap();
+    assert_eq!(repeated.id(), lock.id());
+    assert_eq!(repeated.content_hash(), lock.content_hash());
+    assert_eq!(flow_export(&repeated, FlowExportFormat::Json), exported);
 }
 
 #[test]
@@ -548,6 +552,7 @@ fn activation_transcripts_are_recorded_separately_and_manifest_updates_completio
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -565,6 +570,7 @@ fn activation_transcripts_are_recorded_separately_and_manifest_updates_completio
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%9".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -617,7 +623,23 @@ fn activation_transcripts_are_recorded_separately_and_manifest_updates_completio
     assert_eq!(metadata_json["run_id"], "run-transcripts");
     assert_eq!(metadata_json["activation_id"], "root");
     assert_eq!(metadata_json["node_id"], "root");
-    assert_eq!(metadata_json["tmux_target"], "host-a:%7.%8");
+    assert!(metadata_json.get("tmux_target").is_none());
+    assert!(metadata_json.get("session_id").is_none());
+    assert!(metadata_json.get("window_id").is_none());
+    assert!(metadata_json.get("window_name").is_none());
+    assert!(metadata_json.get("pane_id").is_none());
+    assert!(
+        metadata_json["tmux_target_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        metadata_json["pane_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(metadata_json["adapter"], "tmux");
     assert_eq!(
         metadata_json["relative_paths"]["metadata"],
@@ -671,7 +693,7 @@ fn activation_transcripts_are_recorded_separately_and_manifest_updates_completio
     assert_eq!(manifest_json["completion"]["complete"], false);
     assert_eq!(
         manifest_json["completion"]["incomplete_tmux_activations"],
-        serde_json::json!(["reviewer"])
+        serde_json::json!(["reviewer", "root"])
     );
 }
 
@@ -696,6 +718,7 @@ fn activation_cannot_complete_until_pipe_start_is_acknowledged() {
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -731,6 +754,11 @@ fn activation_cannot_complete_until_pipe_start_is_acknowledged() {
     assert_eq!(complete.capture_phase, "complete");
     assert!(complete.pipe_acknowledged);
     assert!(complete.capture_complete);
+    assert!(!manifest.completion.complete);
+
+    store
+        .mark_activation_resource_cleanup(&mut manifest, "root", "complete", None)
+        .unwrap();
     assert!(manifest.completion.complete);
 }
 
@@ -750,6 +778,211 @@ fn flow_revision_manifest_write_failure_does_not_mark_in_memory_flow_complete() 
     assert_eq!(manifest.flow.status, "pending");
     assert!(manifest.flow.revisions.is_empty());
     assert!(!manifest.completion.complete);
+}
+
+#[test]
+fn load_manifest_rejects_persisted_authority_path_substitution() {
+    let root = test_temp_dir("run-assets-authority-path-substitution");
+    let outside = test_temp_dir("run-assets-authority-path-substitution-outside");
+    fs::create_dir_all(&outside).unwrap();
+    let store = RunAssetStore::new(RunAssetSink::Root(root));
+    let lock = flow_lock(&draft(), FlowCheckMode::Core).unwrap();
+    let mut manifest = store.start_run_manifest("run-authority-paths").unwrap();
+    store
+        .persist_flow_revision(&mut manifest, &lock, "hash:abc123", "not_required")
+        .unwrap();
+    store
+        .start_activation_capture(
+            &mut manifest,
+            RunAssetActivationUpdate {
+                activation_id: "root".to_string(),
+                node_id: "root".to_string(),
+                tmux: RunAssetTmuxTarget {
+                    session_id: "host-a".to_string(),
+                    window_id: "%7".to_string(),
+                    window_name: "flow-a".to_string(),
+                    pane_id: "%8".to_string(),
+                    allocation_generation: 0,
+                },
+                adapter: "tmux".to_string(),
+                termination_reason: None,
+            },
+        )
+        .unwrap();
+    let original = fs::read(&manifest.manifest_path).unwrap();
+    let substitutions = [
+        "/root",
+        "/manifest_path",
+        "/artifact_paths/manifest",
+        "/flow/current_export_path",
+        "/flow/revisions/0/export_path",
+        "/artifact_paths/flow_revisions/0",
+        "/activations/root/metadata_path",
+        "/activations/root/pipe_path",
+        "/activations/root/final_capture_path",
+    ];
+
+    for pointer in substitutions {
+        fs::write(&manifest.manifest_path, &original).unwrap();
+        let mut value: Value = serde_json::from_slice(&original).unwrap();
+        *value.pointer_mut(pointer).unwrap() =
+            Value::String(outside.join("substituted").to_string_lossy().into_owned());
+        fs::write(
+            &manifest.manifest_path,
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .load_manifest("run-authority-paths")
+            .expect_err(pointer);
+        assert!(error.to_string().contains("path"), "{pointer}: {error}");
+    }
+}
+
+#[test]
+fn capture_snapshot_rejects_tampered_manifest_path_before_touching_target() {
+    let root = test_temp_dir("run-assets-capture-path-substitution");
+    let outside = test_temp_dir("run-assets-capture-path-substitution-outside");
+    fs::create_dir_all(&outside).unwrap();
+    let outside_capture = outside.join("foreign-capture.txt");
+    fs::write(&outside_capture, "sentinel").unwrap();
+    let store = RunAssetStore::new(RunAssetSink::Root(root));
+    let mut manifest = store.start_run_manifest("run-capture-paths").unwrap();
+    store
+        .start_activation_capture(
+            &mut manifest,
+            RunAssetActivationUpdate {
+                activation_id: "root".to_string(),
+                node_id: "root".to_string(),
+                tmux: RunAssetTmuxTarget {
+                    session_id: "host-a".to_string(),
+                    window_id: "%7".to_string(),
+                    window_name: "flow-a".to_string(),
+                    pane_id: "%8".to_string(),
+                    allocation_generation: 0,
+                },
+                adapter: "tmux".to_string(),
+                termination_reason: None,
+            },
+        )
+        .unwrap();
+    manifest
+        .activations
+        .get_mut("root")
+        .unwrap()
+        .final_capture_path = outside_capture.clone();
+
+    let result = store.persist_activation_final_capture_snapshot(&manifest, "root", "redirected");
+
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(outside_capture).unwrap(), "sentinel");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_manifest_requires_private_regular_file_and_real_directory_components() {
+    let root = test_temp_dir("run-assets-authority-file");
+    let runs_root = root.join("runs");
+    let store = RunAssetStore::new(RunAssetSink::Root(runs_root.clone()));
+    let manifest = store.start_run_manifest("run-authority-file").unwrap();
+
+    let mut permissions = fs::metadata(&manifest.manifest_path).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&manifest.manifest_path, permissions).unwrap();
+    assert!(store.load_manifest("run-authority-file").is_err());
+
+    let mut permissions = fs::metadata(&manifest.manifest_path).unwrap().permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&manifest.manifest_path, permissions).unwrap();
+    let real_runs_root = root.join("runs-real");
+    fs::rename(&runs_root, &real_runs_root).unwrap();
+    symlink(&real_runs_root, &runs_root).unwrap();
+    assert!(store.load_manifest("run-authority-file").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn load_manifest_rejects_symlink_and_fifo_authority_files_without_blocking() {
+    let root = test_temp_dir("run-assets-manifest-special-files");
+    let outside = test_temp_dir("run-assets-manifest-special-files-outside");
+    fs::create_dir_all(&outside).unwrap();
+    let store = RunAssetStore::new(RunAssetSink::Root(root));
+    let manifest = store.start_run_manifest("run-manifest-special").unwrap();
+    let original = fs::read(&manifest.manifest_path).unwrap();
+
+    fs::remove_file(&manifest.manifest_path).unwrap();
+    let outside_manifest = outside.join("manifest.json");
+    fs::write(&outside_manifest, &original).unwrap();
+    symlink(&outside_manifest, &manifest.manifest_path).unwrap();
+    assert!(store.load_manifest("run-manifest-special").is_err());
+
+    fs::remove_file(&manifest.manifest_path).unwrap();
+    let fifo = std::ffi::CString::new(manifest.manifest_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let started = Instant::now();
+    assert!(store.load_manifest("run-manifest-special").is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_snapshot_rejects_symlink_fifo_and_nonprivate_capture_files() {
+    let root = test_temp_dir("run-assets-capture-special-files");
+    let outside = test_temp_dir("run-assets-capture-special-files-outside");
+    fs::create_dir_all(&outside).unwrap();
+    let store = RunAssetStore::new(RunAssetSink::Root(root));
+    let mut manifest = store.start_run_manifest("run-capture-special").unwrap();
+    store
+        .start_activation_capture(
+            &mut manifest,
+            RunAssetActivationUpdate {
+                activation_id: "root".to_string(),
+                node_id: "root".to_string(),
+                tmux: RunAssetTmuxTarget {
+                    session_id: "host-a".to_string(),
+                    window_id: "%7".to_string(),
+                    window_name: "flow-a".to_string(),
+                    pane_id: "%8".to_string(),
+                    allocation_generation: 0,
+                },
+                adapter: "tmux".to_string(),
+                termination_reason: None,
+            },
+        )
+        .unwrap();
+    let capture = manifest.activations["root"].final_capture_path.clone();
+    let outside_capture = outside.join("capture.txt");
+    fs::write(&outside_capture, "outside").unwrap();
+
+    symlink(&outside_capture, &capture).unwrap();
+    assert!(
+        store
+            .persist_activation_final_capture_snapshot(&manifest, "root", "capture")
+            .is_err()
+    );
+
+    fs::remove_file(&capture).unwrap();
+    let fifo = std::ffi::CString::new(capture.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let started = Instant::now();
+    assert!(
+        store
+            .persist_activation_final_capture_snapshot(&manifest, "root", "capture")
+            .is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    fs::remove_file(&capture).unwrap();
+    fs::write(&capture, "foreign").unwrap();
+    let mut permissions = fs::metadata(&capture).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&capture, permissions).unwrap();
+    assert!(
+        store
+            .persist_activation_final_capture_snapshot(&manifest, "root", "capture")
+            .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -779,6 +1012,7 @@ fn asset_store_rejects_symlink_components_and_pipe_log_destinations() {
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -798,6 +1032,7 @@ fn asset_store_rejects_symlink_components_and_pipe_log_destinations() {
                 window_id: "%7".to_string(),
                 window_name: "flow-a".to_string(),
                 pane_id: "%8".to_string(),
+                allocation_generation: 0,
             },
             adapter: "tmux".to_string(),
             termination_reason: None,
@@ -828,6 +1063,7 @@ fn asset_store_rejects_fifo_transcript_without_blocking() {
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -851,6 +1087,7 @@ fn asset_store_rejects_fifo_transcript_without_blocking() {
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -908,6 +1145,7 @@ fn asset_store_rejects_open_fifo_transcript_before_mutating_it() {
             window_id: "%7".to_string(),
             window_name: "flow-a".to_string(),
             pane_id: "%8".to_string(),
+            allocation_generation: 0,
         },
         adapter: "tmux".to_string(),
         termination_reason: None,
@@ -960,6 +1198,7 @@ fn asset_store_creates_private_directories_and_files() {
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -1025,12 +1264,7 @@ fn fixture_manifest(complete: bool) -> RunAssetManifest {
     let lock = flow_lock(&draft(), FlowCheckMode::Core).unwrap();
     let mut manifest = store.start_run_manifest("worker:artifact/0").unwrap();
     store
-        .persist_flow_revision(
-            &mut manifest,
-            &lock,
-            &lock.id().replace("flk_", "fnv1a64:"),
-            "not_required",
-        )
+        .persist_flow_revision(&mut manifest, &lock, lock.content_hash(), "approved")
         .unwrap();
     store
         .start_activation_capture(
@@ -1043,6 +1277,7 @@ fn fixture_manifest(complete: bool) -> RunAssetManifest {
                     window_id: "%7".to_string(),
                     window_name: "flow-a".to_string(),
                     pane_id: "%8".to_string(),
+                    allocation_generation: 0,
                 },
                 adapter: "tmux".to_string(),
                 termination_reason: None,
@@ -1095,6 +1330,7 @@ fn normalize_fixture_root(mut manifest: RunAssetManifest) -> RunAssetManifest {
         .map(|path| normalize_path(&old_root, &new_root, path))
         .collect();
     for activation in manifest.activations.values_mut() {
+        activation.readiness_nonce = "fixture-readiness-nonce".to_string();
         activation.metadata_path = normalize_path(&old_root, &new_root, &activation.metadata_path);
         activation.pipe_path = normalize_path(&old_root, &new_root, &activation.pipe_path);
         activation.final_capture_path =

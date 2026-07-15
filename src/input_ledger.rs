@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::run_assets::{RunAssetStore, append_machine_input_ledger_direct};
 
@@ -14,6 +15,8 @@ pub struct MachineInputRecord {
     pub run_id: String,
     pub activation_id: String,
     pub pane_id: String,
+    #[serde(default)]
+    pub allocation_generation: u64,
     pub started_at_ms: u64,
     pub submitted_at_ms: u64,
     pub payload_hash: String,
@@ -25,24 +28,50 @@ pub struct MachineInputRecord {
 
 impl MachineInputRecord {
     pub fn started(submission: MachineInputSubmission<'_>) -> Self {
-        Self::from_submission(submission, MachineInputStatus::Started)
+        Self::from_submission(submission, MachineInputStatus::Started, None)
     }
 
     pub fn submitted(submission: MachineInputSubmission<'_>) -> Self {
-        Self::from_submission(submission, MachineInputStatus::Submitted)
+        Self::from_submission(submission, MachineInputStatus::Submitted, None)
     }
 
     pub fn failed(submission: MachineInputSubmission<'_>) -> Self {
-        Self::from_submission(submission, MachineInputStatus::Failed)
+        Self::from_submission(submission, MachineInputStatus::Failed, None)
     }
 
-    fn from_submission(submission: MachineInputSubmission<'_>, status: MachineInputStatus) -> Self {
-        let normalized_text = normalize_machine_input_text(submission.text);
-        let payload_hash = machine_input_payload_hash(&normalized_text);
+    pub fn started_with_projection(
+        submission: MachineInputSubmission<'_>,
+        projection: &str,
+    ) -> Self {
+        Self::from_submission(submission, MachineInputStatus::Started, Some(projection))
+    }
+
+    pub fn submitted_with_projection(
+        submission: MachineInputSubmission<'_>,
+        projection: &str,
+    ) -> Self {
+        Self::from_submission(submission, MachineInputStatus::Submitted, Some(projection))
+    }
+
+    pub fn failed_with_projection(
+        submission: MachineInputSubmission<'_>,
+        projection: &str,
+    ) -> Self {
+        Self::from_submission(submission, MachineInputStatus::Failed, Some(projection))
+    }
+
+    fn from_submission(
+        submission: MachineInputSubmission<'_>,
+        status: MachineInputStatus,
+        projection: Option<&str>,
+    ) -> Self {
+        let normalized_text = normalize_machine_input_text(projection.unwrap_or(submission.text));
+        let payload_hash = machine_input_payload_hash(submission.text);
         Self {
             run_id: submission.run_id.to_string(),
             activation_id: submission.activation_id.to_string(),
             pane_id: submission.pane_id.to_string(),
+            allocation_generation: submission.allocation_generation,
             started_at_ms: submission.started_at_ms,
             submitted_at_ms: submission.submitted_at_ms,
             payload_hash,
@@ -59,6 +88,7 @@ pub struct MachineInputSubmission<'a> {
     pub run_id: &'a str,
     pub activation_id: &'a str,
     pub pane_id: &'a str,
+    pub allocation_generation: u64,
     pub started_at_ms: u64,
     pub submitted_at_ms: u64,
     pub text: &'a str,
@@ -219,20 +249,21 @@ pub fn normalize_machine_input_text(text: &str) -> String {
 }
 
 pub fn machine_input_payload_hash(text: &str) -> String {
-    let normalized = normalize_machine_input_text(text);
-    format!("fnv1a64:{:016x}", stable_hash(normalized.as_bytes()))
+    let digest = Sha256::digest(text.as_bytes());
+    format!("sha256:{digest:x}")
 }
 
 pub fn machine_input_transaction_id(
     run_id: &str,
     activation_id: &str,
     pane_id: &str,
+    allocation_generation: u64,
     payload_hash: &str,
     started_at_ms: u64,
     sequence: u64,
 ) -> String {
     let payload = format!(
-        "{run_id}\0{activation_id}\0{pane_id}\0{payload_hash}\0{started_at_ms}\0{sequence}"
+        "{run_id}\0{activation_id}\0{pane_id}\0{allocation_generation}\0{payload_hash}\0{started_at_ms}\0{sequence}"
     );
     format!("machine-input:{:016x}", stable_hash(payload.as_bytes()))
 }

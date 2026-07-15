@@ -1,7 +1,7 @@
 use crate::flow;
 use serde_json::{Map, Value, json};
 
-pub(crate) fn flow_draft_json(draft: &flow::FlowDraft) -> Value {
+pub(super) fn flow_draft_json(draft: &flow::FlowDraft) -> Value {
     let mut object = Map::new();
     object.insert(
         "nodes".into(),
@@ -144,17 +144,25 @@ fn flow_effect_json(effect: &flow::EffectRequirement) -> Value {
 
 fn flow_route_json(route: &flow::FlowRoute) -> Value {
     let mut object = Map::new();
-    object.insert("predicate".into(), json!(route.predicate));
-    insert_optional_string(&mut object, "for_each", route.for_each.as_deref());
+    object.insert(
+        "predicate".into(),
+        serde_json::to_value(&route.predicate).expect("flow predicate serialization cannot fail"),
+    );
+    if let Some(for_each) = &route.for_each {
+        object.insert(
+            "for_each".into(),
+            serde_json::to_value(for_each).expect("artifact reference serialization cannot fail"),
+        );
+    }
     object.insert("activate".into(), json!(route.activate));
     Value::Object(object)
 }
 
 fn flow_resource_json(resource: &flow::FlowResource) -> Value {
     json!({
-        "id": resource.id,
+        "path": resource.id,
         "kind": resource_kind_name(&resource.kind),
-        "source": resource.source,
+        "content": resource.source,
     })
 }
 
@@ -257,6 +265,141 @@ fn resource_kind_name(kind: &flow::ResourceKind) -> &'static str {
         flow::ResourceKind::Script => "script",
         flow::ResourceKind::Flow => "flow",
         flow::ResourceKind::Readme => "readme",
+        flow::ResourceKind::Skill => "skill",
+    }
+}
+
+pub(super) fn input_severity_name(diagnostics: &[flow::Diagnostic]) -> &'static str {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == flow::Severity::Fatal)
+    {
+        "fatal"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == flow::Severity::Error)
+    {
+        "error"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == flow::Severity::Warning)
+    {
+        "warning"
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == flow::Severity::Note)
+    {
+        "note"
+    } else {
+        "none"
+    }
+}
+
+pub(super) fn repair_candidates_json(candidates: &[flow::FlowRepairCandidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "repair_kind": repair_kind_name(candidate.repair_kind),
+                "location": candidate.location,
+                "replacement": candidate.replacement
+            })
+        })
+        .collect()
+}
+
+pub(super) fn repair_guidance_json(diagnostics: &[flow::Diagnostic]) -> Vec<Value> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "code": diagnostic.code,
+                "location": diagnostic.location,
+                "message": diagnostic.message,
+                "fix_hint": diagnostic.fix_hint,
+                "why_it_matters": diagnostic.why_it_matters,
+                "repairability": repairability_name(diagnostic.repairability),
+                "repair_kinds": diagnostic
+                    .repair_kinds
+                    .iter()
+                    .map(|kind| repair_kind_name(*kind))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
+pub(super) fn diagnostics_json(diagnostics: &[flow::Diagnostic]) -> Vec<Value> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "code": diagnostic.code,
+                "severity": severity_name(diagnostic.severity),
+                "domain": diagnostic_domain_name(diagnostic.domain),
+                "repairability": repairability_name(diagnostic.repairability),
+                "location": diagnostic.location,
+                "message": diagnostic.message,
+                "fix_hint": diagnostic.fix_hint,
+                "why_it_matters": diagnostic.why_it_matters,
+                "repair_kinds": diagnostic
+                    .repair_kinds
+                    .iter()
+                    .map(|kind| repair_kind_name(*kind))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
+pub(super) fn diagnostic_codes_text(diagnostics: &[flow::Diagnostic]) -> String {
+    if diagnostics.is_empty() {
+        "none".to_string()
+    } else {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn severity_name(severity: flow::Severity) -> &'static str {
+    match severity {
+        flow::Severity::Fatal => "fatal",
+        flow::Severity::Error => "error",
+        flow::Severity::Warning => "warning",
+        flow::Severity::Note => "note",
+    }
+}
+
+fn diagnostic_domain_name(domain: flow::DiagnosticDomain) -> &'static str {
+    match domain {
+        flow::DiagnosticDomain::Package => "package",
+        flow::DiagnosticDomain::Contract => "contract",
+        flow::DiagnosticDomain::Resource => "resource",
+        flow::DiagnosticDomain::Route => "route",
+        flow::DiagnosticDomain::Policy => "policy",
+        flow::DiagnosticDomain::RuntimeCompat => "runtime_compat",
+    }
+}
+
+fn repairability_name(repairability: flow::Repairability) -> &'static str {
+    match repairability {
+        flow::Repairability::Automatic => "automatic",
+        flow::Repairability::Candidate => "candidate",
+        flow::Repairability::GuidanceOnly => "guidance_only",
+        flow::Repairability::None => "none",
+    }
+}
+
+fn repair_kind_name(kind: flow::RepairKind) -> &'static str {
+    match kind {
+        flow::RepairKind::AddRouteTarget => "add_route_target",
+        flow::RepairKind::AddArtifactSchema => "add_artifact_schema",
+        flow::RepairKind::AddContractCompletion => "add_contract_completion",
+        flow::RepairKind::NarrowWriteScope => "narrow_write_scope",
+        flow::RepairKind::ProvideRuntimeResource => "provide_runtime_resource",
     }
 }
 
@@ -318,13 +461,13 @@ mod tests {
             ],
             routes: vec![
                 flow::FlowRoute {
-                    predicate: "exists(artifact.brief)".into(),
+                    predicate: flow::FlowPredicate::exists_artifact("brief").unwrap(),
                     for_each: None,
                     activate: "review".into(),
                 },
                 flow::FlowRoute {
-                    predicate: "exists(resource.ticket)".into(),
-                    for_each: Some("resource.ticket".into()),
+                    predicate: flow::FlowPredicate::exists_artifact("ticket").unwrap(),
+                    for_each: Some(flow::ArtifactRef::new("ticket").unwrap()),
                     activate: "root".into(),
                 },
             ],
@@ -384,7 +527,7 @@ mod tests {
             "schema.report"
         );
         assert!(value["routes"][0].get("for_each").is_none());
-        assert_eq!(value["routes"][1]["for_each"], "resource.ticket");
+        assert_eq!(value["routes"][1]["for_each"], json!({"key": "ticket"}));
         assert!(value["imports"][0].get("alias").is_none());
         assert_eq!(value["imports"][1]["alias"], "fix_prompt");
     }

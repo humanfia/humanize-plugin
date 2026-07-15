@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 
+use humanize_plugin::flow::{
+    ArtifactRef, FlowDraft, FlowNode, FlowPredicate, FlowRoute, NodeAction, NodeDriver,
+};
 use humanize_plugin::runtime::{BoardPatch, NodeSpec, Runtime, StopContract};
 use humanize_plugin::view::{
     AdapterCapabilityReview, DiffEntry, FlowGraph, FlowGraphEdge, FlowGraphNode,
     FlowReviewContract, FlowReviewNode, FlowReviewRoute, FlowReviewSnapshot, FlowValueFlow,
     FlowVisualDiff, PaneMappingSnapshot, ReviewRisk, RuntimeBudgetSnapshot,
-    RuntimeDecisionSnapshot, RuntimeEventSnapshot, VisualizationSnapshot, render_browser_document,
-    render_flow_review_document, render_terminal_dashboard, snapshot_json,
+    RuntimeDecisionSnapshot, RuntimeEventSnapshot, VisualizationSnapshot, derive_flow_graph,
+    render_browser_document, render_flow_review_document, render_terminal_dashboard, snapshot_json,
 };
 use serde_json::Value;
 
@@ -20,7 +23,11 @@ fn runtime_with_view_data() -> Runtime {
         .deliver_artifact("run-a", "root", "brief", "ready")
         .unwrap();
     runtime
-        .patch_board("run-a", "root", BoardPatch::new("summary", "ready"))
+        .patch_board(
+            "run-a",
+            "root",
+            BoardPatch::new("summary", "ready").unwrap(),
+        )
         .unwrap();
     runtime
         .record_effect("run-a", "root", "shell", "cargo test")
@@ -44,7 +51,7 @@ fn visualization_snapshot_projects_runtime_counts_and_stop_contract_gaps() {
     assert_eq!(run.activation_count, 1);
     assert_eq!(run.artifact_count, 1);
     assert_eq!(run.effect_count, 1);
-    assert_eq!(run.board_version, 1);
+    assert_eq!(run.board_version, 4);
     assert_eq!(run.message_count, 1);
     assert_eq!(run.missing_stop_contract_count, 2);
     assert_eq!(
@@ -107,7 +114,7 @@ fn terminal_dashboard_is_compact_and_deterministic() {
         concat!(
             "humanize dashboard\n",
             "runs 1\n",
-            "run run-a | activations 1 | board version 1 | messages 1 | artifacts 1 | effects 1 | missing 2 | status ready | panes 1\n",
+            "run run-a | activations 1 | board version 4 | messages 1 | artifacts 1 | effects 1 | missing 2 | status ready | panes 1\n",
             "  why brief exists and report is still missing\n",
             "  last decision route-root-review | hold root until report is ready | why contract gap blocks completion\n",
             "  event 7 | artifact received | brief from root\n",
@@ -155,6 +162,7 @@ fn flow_review_document_renders_static_graph_contracts_capabilities_risks_and_di
             from: "collect".to_string(),
             to: "review".to_string(),
             predicate: "exists(artifact.brief)".to_string(),
+            for_each: None,
             outcome: "activates review".to_string(),
         }],
         contracts: vec![FlowReviewContract {
@@ -278,4 +286,184 @@ fn browser_document_bootstraps_snapshot_json() {
         + start;
     let bootstrapped: Value = serde_json::from_str(&html[start..end]).unwrap();
     assert_eq!(bootstrapped, parsed);
+}
+
+#[test]
+fn derived_graph_uses_fact_nodes_without_inventing_external_sources() {
+    let draft = FlowDraft {
+        nodes: vec![
+            FlowNode {
+                id: "root".into(),
+                action: Some(NodeAction {
+                    driver: NodeDriver::Agent,
+                    prompt_ref: None,
+                    resource_refs: Vec::new(),
+                    reads: Vec::new(),
+                    writes: vec!["artifact.ready".into(), "artifact.items".into()],
+                    verdict_artifact: None,
+                }),
+                ..FlowNode::default()
+            },
+            FlowNode {
+                id: "left".into(),
+                ..FlowNode::default()
+            },
+            FlowNode {
+                id: "right".into(),
+                ..FlowNode::default()
+            },
+            FlowNode {
+                id: "worker".into(),
+                ..FlowNode::default()
+            },
+        ],
+        routes: vec![
+            FlowRoute {
+                predicate: FlowPredicate::exists_artifact("ready").unwrap(),
+                for_each: None,
+                activate: "left".into(),
+            },
+            FlowRoute {
+                predicate: FlowPredicate::exists_artifact("ready").unwrap(),
+                for_each: None,
+                activate: "right".into(),
+            },
+            FlowRoute {
+                predicate: FlowPredicate::truthy_board("retry").unwrap(),
+                for_each: None,
+                activate: "root".into(),
+            },
+            FlowRoute {
+                predicate: FlowPredicate::exists_artifact("items").unwrap(),
+                for_each: Some(ArtifactRef::new("items").unwrap()),
+                activate: "worker".into(),
+            },
+            FlowRoute {
+                predicate: FlowPredicate::exists_artifact("global_input").unwrap(),
+                for_each: None,
+                activate: "worker".into(),
+            },
+        ],
+        ..FlowDraft::default()
+    };
+
+    let graph = derive_flow_graph(&draft);
+
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "root" && node.kind == "work")
+    );
+    for fact in [
+        "fact:artifact.ready",
+        "fact:artifact.items",
+        "fact:artifact.global_input",
+        "fact:board.retry",
+    ] {
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == fact && node.kind == "fact")
+        );
+    }
+    assert!(graph.edges.iter().any(|edge| {
+        edge.from == "root" && edge.to == "fact:artifact.ready" && edge.label == "produces"
+    }));
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "fact:artifact.ready" && edge.to == "left")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "fact:artifact.ready" && edge.to == "right")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "fact:board.retry" && edge.to == "root")
+    );
+    assert!(graph.edges.iter().any(|edge| {
+        edge.from == "fact:artifact.items"
+            && edge.to == "worker"
+            && edge.label.contains("for each artifact.items")
+    }));
+    assert!(
+        !graph
+            .edges
+            .iter()
+            .any(|edge| { edge.to == "fact:artifact.global_input" && edge.label == "produces" })
+    );
+}
+
+#[test]
+fn fanout_graph_uses_the_for_each_artifact_not_the_predicate_fact() {
+    let draft = FlowDraft {
+        nodes: vec![
+            FlowNode {
+                id: "ready-producer".into(),
+                action: Some(NodeAction {
+                    driver: NodeDriver::Human,
+                    prompt_ref: None,
+                    resource_refs: Vec::new(),
+                    reads: Vec::new(),
+                    writes: vec!["artifact.ready".into()],
+                    verdict_artifact: None,
+                }),
+                ..FlowNode::default()
+            },
+            FlowNode {
+                id: "items-producer".into(),
+                action: Some(NodeAction {
+                    driver: NodeDriver::Human,
+                    prompt_ref: None,
+                    resource_refs: Vec::new(),
+                    reads: Vec::new(),
+                    writes: vec!["artifact.items".into()],
+                    verdict_artifact: None,
+                }),
+                ..FlowNode::default()
+            },
+            FlowNode {
+                id: "worker".into(),
+                ..FlowNode::default()
+            },
+        ],
+        routes: vec![
+            FlowRoute {
+                predicate: FlowPredicate::truthy_board("open").unwrap(),
+                for_each: Some(ArtifactRef::new("items").unwrap()),
+                activate: "worker".into(),
+            },
+            FlowRoute {
+                predicate: FlowPredicate::exists_artifact("ready").unwrap(),
+                for_each: Some(ArtifactRef::new("items").unwrap()),
+                activate: "worker".into(),
+            },
+        ],
+        ..FlowDraft::default()
+    };
+
+    let graph = derive_flow_graph(&draft);
+
+    assert!(graph.edges.iter().any(|edge| {
+        edge.from == "items-producer"
+            && edge.to == "fact:artifact.items"
+            && edge.label == "produces"
+    }));
+    assert!(graph.edges.iter().any(|edge| {
+        edge.from == "fact:artifact.items" && edge.to == "worker" && edge.label.contains("for each")
+    }));
+    assert!(graph.edges.iter().any(|edge| {
+        edge.from == "fact:board.open" && edge.to == "worker" && edge.label.contains("truthy")
+    }));
+    assert!(graph.edges.iter().any(|edge| {
+        edge.from == "fact:artifact.ready" && edge.to == "worker" && edge.label.contains("exists")
+    }));
 }

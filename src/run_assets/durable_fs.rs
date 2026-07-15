@@ -7,14 +7,24 @@ use crate::pipe_sink::{PipeSinkIdentity, pipe_sink_identity_from_file};
 
 use super::{RunAssetError, now_ms};
 
+mod secure;
+
+pub(crate) use secure::{
+    EntryKind, SecureDir, SecureEntry, SecureFsError, open_dir_path, open_parent,
+};
+
+#[cfg(test)]
+use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DirectorySyncEvent {
+    #[cfg(test)]
     DirectoryCreated,
+    #[cfg(test)]
     DirectoryEntryCreated,
     FileCreated,
     FileRenamed,
@@ -26,52 +36,75 @@ pub(super) fn create_dir_all(path: &Path) -> Result<(), RunAssetError> {
 
 fn create_dir_all_with_directory_sync(
     path: &Path,
-    sync: &mut impl FnMut(&Path, DirectorySyncEvent) -> Result<(), RunAssetError>,
+    _sync: &mut impl FnMut(&Path, DirectorySyncEvent) -> Result<(), RunAssetError>,
 ) -> Result<(), RunAssetError> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if current.as_os_str().is_empty() {
-            continue;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(RunAssetError::new(format!(
-                    "asset path component {} is a symlink",
-                    current.display()
-                )));
-            }
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(RunAssetError::new(format!(
-                    "asset path component {} is not a directory",
-                    current.display()
-                )));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                create_private_dir_with_directory_sync(&current, sync)?;
-            }
-            Err(err) => {
-                return Err(RunAssetError::new(format!(
-                    "inspect run asset directory {} failed: {err}",
-                    current.display()
-                )));
-            }
-        }
-    }
-    Ok(())
+    open_dir_path(path, true, false)
+        .map(|_| ())
+        .map_err(|err| private_directory_error("create", path, err))
 }
 
 pub(super) fn ensure_private_dir(path: &Path) -> Result<(), RunAssetError> {
-    #[cfg(unix)]
+    let directory = open_dir_path(path, false, false)
+        .map_err(|err| private_directory_error("open", path, err))?;
+    directory
+        .ensure_private()
+        .map_err(|err| private_directory_error("secure", path, err))
+}
+
+pub(super) fn validate_private_dir_path(path: &Path) -> Result<(), RunAssetError> {
+    open_dir_path(path, false, true)
+        .map(|_| ())
+        .map_err(|err| private_directory_error("validate", path, err))
+}
+
+pub(crate) fn open_private_lock_file(path: &Path) -> Result<fs::File, RunAssetError> {
+    let (parent, name) = open_parent(path, true)
+        .map_err(|err| private_directory_error("open parent for", path, err))?;
+    parent
+        .validate_private()
+        .map_err(|err| private_directory_error("validate parent for", path, err))?;
+    parent
+        .open_or_create_lock_file(&name)
+        .map_err(|err| RunAssetError::new(format!("open private lock failed: {err}")))
+}
+
+pub(crate) fn read_private_directory(
+    path: &Path,
+) -> Result<Option<super::PrivateDirectoryFiles>, RunAssetError> {
+    let directory = match open_dir_path(path, false, true) {
+        Ok(directory) => directory,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(private_directory_error("open", path, err)),
+    };
+    let mut files = Vec::new();
+    for entry in directory
+        .entries()
+        .map_err(|err| private_directory_error("enumerate", path, err))?
     {
-        chmod_no_follow(path, 0o700, true)?;
+        let bytes = directory.read_file(&entry.name).map_err(|err| {
+            RunAssetError::new(format!("read private directory entry failed: {err}"))
+        })?;
+        files.push((entry.name, bytes));
     }
-    #[cfg(not(unix))]
-    {
-        reject_symlink(path)?;
-    }
-    Ok(())
+    Ok(Some(files))
+}
+
+pub(crate) fn remove_regular_private(path: &Path) -> Result<(), RunAssetError> {
+    let (parent, name) = open_parent(path, false)
+        .map_err(|err| private_directory_error("open parent for", path, err))?;
+    parent
+        .validate_private()
+        .map_err(|err| private_directory_error("validate parent for", path, err))?;
+    parent
+        .remove_regular_file(&name)
+        .map_err(|err| RunAssetError::new(format!("remove private file failed: {err}")))
+}
+
+fn private_directory_error(action: &str, path: &Path, err: SecureFsError) -> RunAssetError {
+    RunAssetError::new(format!(
+        "{action} private directory {} failed: {err}",
+        path.display()
+    ))
 }
 
 pub(super) fn open_pipe_log_private(path: &Path) -> Result<PipeSinkIdentity, RunAssetError> {
@@ -114,8 +147,9 @@ pub(super) fn open_pipe_log_private(path: &Path) -> Result<PipeSinkIdentity, Run
         }
     };
     if created {
-        ensure_private_open_file(&file, path, 0o600)?;
+        set_private_open_permissions(&file, path, 0o600)?;
     }
+    validate_private_regular_open_file(&file, path, 0o600)?;
     let pipe_identity = pipe_sink_identity_from_file(&file).map_err(|err| {
         RunAssetError::new(format!(
             "inspect transcript pipe sink {} failed: {err}",
@@ -150,7 +184,7 @@ pub(super) fn open_pipe_log_private(path: &Path) -> Result<PipeSinkIdentity, Run
     Ok(pipe_identity)
 }
 
-pub(super) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {
     atomic_write_private_with_directory_sync(path, bytes, &mut sync_directory_event)
 }
 
@@ -163,6 +197,7 @@ fn atomic_write_private_with_directory_sync(
         create_dir_all_with_directory_sync(parent, sync)?;
         ensure_private_dir(parent)?;
     }
+    validate_private_file_parent(path)?;
     reject_existing_symlink(path)?;
     reject_existing_non_regular(path)?;
     let temp_path = temp_sibling_path(path);
@@ -183,7 +218,7 @@ fn atomic_write_private_with_directory_sync(
     write_result
 }
 
-pub(super) fn read_regular_private(path: &Path) -> Result<Option<Vec<u8>>, RunAssetError> {
+pub(crate) fn read_regular_private(path: &Path) -> Result<Option<Vec<u8>>, RunAssetError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(RunAssetError::new(format!(
@@ -206,25 +241,17 @@ pub(super) fn read_regular_private(path: &Path) -> Result<Option<Vec<u8>>, RunAs
             )));
         }
     }
+    validate_private_file_parent(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).map_err(|err| {
         RunAssetError::new(format!("open asset file {} failed: {err}", path.display()))
     })?;
-    if !file
-        .metadata()
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-    {
-        return Err(RunAssetError::new(format!(
-            "asset file {} is not a regular file",
-            path.display()
-        )));
-    }
+    validate_private_regular_open_file(&file, path, 0o600)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|err| {
         RunAssetError::new(format!("read asset file {} failed: {err}", path.display()))
@@ -232,11 +259,12 @@ pub(super) fn read_regular_private(path: &Path) -> Result<Option<Vec<u8>>, RunAs
     Ok(Some(bytes))
 }
 
-pub(super) fn append_private_line(path: &Path, line: &[u8]) -> Result<(), RunAssetError> {
+pub(crate) fn append_private_line(path: &Path, line: &[u8]) -> Result<(), RunAssetError> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
         ensure_private_dir(parent)?;
     }
+    validate_private_file_parent(path)?;
     let created = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(RunAssetError::new(format!(
@@ -265,22 +293,15 @@ pub(super) fn append_private_line(path: &Path, line: &[u8]) -> Result<(), RunAss
     {
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).map_err(|err| {
         RunAssetError::new(format!("open asset file {} failed: {err}", path.display()))
     })?;
-    ensure_private_open_file(&file, path, 0o600)?;
-    if !file
-        .metadata()
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-    {
-        return Err(RunAssetError::new(format!(
-            "asset file {} is not a regular file",
-            path.display()
-        )));
+    if created {
+        set_private_open_permissions(&file, path, 0o600)?;
     }
+    validate_private_regular_open_file(&file, path, 0o600)?;
     file.write_all(line).map_err(|err| {
         RunAssetError::new(format!("write asset file {} failed: {err}", path.display()))
     })?;
@@ -298,9 +319,38 @@ pub(super) fn append_private_line(path: &Path, line: &[u8]) -> Result<(), RunAss
     Ok(())
 }
 
+pub(crate) fn truncate_private(path: &Path, len: u64) -> Result<(), RunAssetError> {
+    validate_private_file_parent(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|err| {
+        RunAssetError::new(format!("open asset file {} failed: {err}", path.display()))
+    })?;
+    validate_private_regular_open_file(&file, path, 0o600)?;
+    file.set_len(len).map_err(|err| {
+        RunAssetError::new(format!(
+            "truncate asset file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|err| {
+        RunAssetError::new(format!("sync asset file {} failed: {err}", path.display()))
+    })
+}
+
 pub(super) fn write_create_new_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {
-    reject_existing_symlink(path)?;
-    write_new_private_with_directory_sync(path, bytes, &mut sync_directory_event)
+    let (parent, name) = open_parent(path, true)
+        .map_err(|err| private_directory_error("open parent for", path, err))?;
+    parent
+        .validate_private()
+        .map_err(|err| private_directory_error("validate parent for", path, err))?;
+    parent
+        .atomic_create_file(&name, bytes)
+        .map_err(|err| RunAssetError::new(format!("create private file failed: {err}")))
 }
 
 fn write_new_private_with_directory_sync(
@@ -314,7 +364,7 @@ fn write_new_private_with_directory_sync(
     {
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).map_err(|err| {
         RunAssetError::new(format!(
@@ -328,7 +378,8 @@ fn write_new_private_with_directory_sync(
             path.display()
         ))
     })?;
-    ensure_private_open_file(&file, path, 0o600)?;
+    set_private_open_permissions(&file, path, 0o600)?;
+    validate_private_regular_open_file(&file, path, 0o600)?;
     file.sync_all().map_err(|err| {
         RunAssetError::new(format!(
             "sync new asset file {} failed: {err}",
@@ -339,6 +390,7 @@ fn write_new_private_with_directory_sync(
     sync_parent_for(path, DirectorySyncEvent::FileCreated, sync)
 }
 
+#[cfg(test)]
 fn create_private_dir_with_directory_sync(
     path: &Path,
     sync: &mut impl FnMut(&Path, DirectorySyncEvent) -> Result<(), RunAssetError>,
@@ -386,7 +438,9 @@ fn sync_directory_event(path: &Path, event: DirectorySyncEvent) -> Result<(), Ru
 
 fn directory_sync_event_name(event: DirectorySyncEvent) -> &'static str {
     match event {
+        #[cfg(test)]
         DirectorySyncEvent::DirectoryCreated => "directory creation",
+        #[cfg(test)]
         DirectorySyncEvent::DirectoryEntryCreated => "directory entry creation",
         DirectorySyncEvent::FileCreated => "file creation",
         DirectorySyncEvent::FileRenamed => "file rename",
@@ -409,7 +463,11 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn ensure_private_open_file(file: &fs::File, path: &Path, mode: u32) -> Result<(), RunAssetError> {
+fn set_private_open_permissions(
+    file: &fs::File,
+    path: &Path,
+    mode: u32,
+) -> Result<(), RunAssetError> {
     #[cfg(unix)]
     {
         // SAFETY: fchmod operates on the valid descriptor owned by file.
@@ -429,22 +487,84 @@ fn ensure_private_open_file(file: &fs::File, path: &Path, mode: u32) -> Result<(
     Ok(())
 }
 
-#[cfg(unix)]
-fn chmod_no_follow(path: &Path, mode: u32, directory: bool) -> Result<(), RunAssetError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    if directory {
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY);
-    }
-    let file = options.open(path).map_err(|err| {
+fn validate_private_regular_open_file(
+    file: &fs::File,
+    path: &Path,
+    mode: u32,
+) -> Result<(), RunAssetError> {
+    let open_metadata = file.metadata().map_err(|err| {
         RunAssetError::new(format!(
-            "open private asset path {} failed: {err}",
+            "inspect asset file {} failed: {err}",
             path.display()
         ))
     })?;
-    ensure_private_open_file(&file, path, mode)
+    let path_metadata = fs::symlink_metadata(path).map_err(|err| {
+        RunAssetError::new(format!(
+            "inspect asset file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || !open_metadata.is_file()
+    {
+        return Err(RunAssetError::new(format!(
+            "asset file {} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        validate_private_regular_metadata_identity(&open_metadata, path, mode)?;
+        validate_private_regular_metadata_identity(&path_metadata, path, mode)?;
+        if open_metadata.dev() != path_metadata.dev() || open_metadata.ino() != path_metadata.ino()
+        {
+            return Err(RunAssetError::new(format!(
+                "asset file {} changed identity while being opened",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_metadata_identity(
+    metadata: &fs::Metadata,
+    path: &Path,
+    mode: u32,
+) -> Result<(), RunAssetError> {
+    #[cfg(unix)]
+    {
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o777 != mode {
+            return Err(RunAssetError::new(format!(
+                "asset file {} must be current-user mode {mode:o}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_regular_metadata_identity(
+    metadata: &fs::Metadata,
+    path: &Path,
+    mode: u32,
+) -> Result<(), RunAssetError> {
+    validate_private_metadata_identity(metadata, path, mode)?;
+    if metadata.nlink() != 1 {
+        return Err(RunAssetError::new(format!(
+            "asset file {} must have exactly one link",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_private_file_parent(path: &Path) -> Result<(), RunAssetError> {
+    let parent = nonempty_parent(path);
+    validate_private_dir_path(parent)
 }
 
 fn reject_existing_symlink(path: &Path) -> Result<(), RunAssetError> {
@@ -464,7 +584,13 @@ fn reject_existing_symlink(path: &Path) -> Result<(), RunAssetError> {
 
 fn reject_existing_non_regular(path: &Path) -> Result<(), RunAssetError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(metadata) if metadata.is_file() => {
+            #[cfg(unix)]
+            {
+                validate_private_regular_metadata_identity(&metadata, path, 0o600)?;
+            }
+            Ok(())
+        }
         Ok(_) => Err(RunAssetError::new(format!(
             "asset file {} is not a regular file",
             path.display()
@@ -504,11 +630,14 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DirectorySyncEvent, atomic_write_private_with_directory_sync,
-        create_private_dir_with_directory_sync, sync_directory, sync_parent_for,
+        DirectorySyncEvent, atomic_write_private_with_directory_sync, create_dir_all,
+        create_private_dir_with_directory_sync, read_regular_private, sync_directory,
+        sync_parent_for,
     };
     use crate::run_assets::RunAssetError;
 
@@ -627,6 +756,29 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_private_directory_creation_reopens_and_validates_the_winner() {
+        let root = test_temp_dir("concurrent-directory-create");
+        fs::create_dir_all(&root).unwrap();
+        let path = Arc::new(root.join("shared/deep"));
+        let barrier = Arc::new(Barrier::new(16));
+        let mut threads = Vec::new();
+
+        for _ in 0..16 {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                create_dir_all(&path)
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn relative_file_sync_uses_current_directory_as_parent() {
         let mut observed = None;
 
@@ -643,6 +795,21 @@ mod tests {
         assert_eq!(observed, Some(PathBuf::from(".")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn missing_optional_private_file_under_absent_directory_reads_as_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_temp_dir("missing-optional-file");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("driver").join("driver-events.jsonl");
+
+        assert_eq!(read_regular_private(&path).unwrap(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_directory_sync_accepts_a_real_directory_descriptor() {
@@ -652,5 +819,19 @@ mod tests {
         sync_directory(&root).unwrap();
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_identity_rejects_foreign_owner_metadata() {
+        let metadata = fs::metadata("/etc/passwd").unwrap();
+        let error = super::validate_private_metadata_identity(
+            &metadata,
+            std::path::Path::new("/etc/passwd"),
+            0o600,
+        )
+        .expect_err("foreign or public authority file must be rejected");
+
+        assert!(error.to_string().contains("current-user mode 600"));
     }
 }

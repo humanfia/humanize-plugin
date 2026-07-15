@@ -3,6 +3,10 @@ mod support;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use humanize_plugin::flow::{
+    FlowLock, FlowQosIntent, NetworkAccess, QosUrgency, ToolExecution, WorkIntent, WorkProfile,
+    WorkspaceAccess, flow_draft_qos, flow_node_work_profile,
+};
 use humanize_plugin::mcp::McpServer;
 use humanize_plugin::run_assets::{RunAssetSink, RunAssetStore};
 use serde_json::{Value, json};
@@ -84,13 +88,47 @@ fn flow_lock_exports_work_profile_and_qos_only_when_authored() {
 
     let document = structured(&exported)["document"].as_str().unwrap();
     let exported_json: Value = serde_json::from_str(document).unwrap();
-    let content = exported_json["content"].as_str().unwrap();
+    assert!(exported_json["flow"].is_object());
+    assert!(exported_json.get("content").is_none());
 
-    assert!(content.contains(
-        "\"qos\":{\"urgency\":\"interactive\",\"completion_target\":\"artifact.final_summary\"}"
-    ));
-    assert!(content.contains("\"work_profile\":{\"intent\":\"explore\",\"workspace_access\":\"read_only\",\"tool_execution\":\"allowed\",\"network_access\":\"restricted\"}"));
-    assert!(content.contains("\"work_profile\":{\"intent\":\"evaluate\",\"workspace_access\":\"none\",\"tool_execution\":\"none\",\"network_access\":\"none\"}"));
+    let exported_lock = serde_json::from_str::<FlowLock>(document).unwrap();
+    assert_eq!(
+        flow_draft_qos(exported_lock.draft()),
+        FlowQosIntent {
+            urgency: QosUrgency::Interactive,
+            completion_target: Some("artifact.final_summary".into()),
+        }
+    );
+    let investigate = exported_lock
+        .draft()
+        .nodes
+        .iter()
+        .find(|node| node.id == "investigate")
+        .unwrap();
+    assert_eq!(
+        flow_node_work_profile(investigate),
+        WorkProfile {
+            intent: WorkIntent::Explore,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            tool_execution: ToolExecution::Allowed,
+            network_access: NetworkAccess::Restricted,
+        }
+    );
+    let review = exported_lock
+        .draft()
+        .nodes
+        .iter()
+        .find(|node| node.id == "review")
+        .unwrap();
+    assert_eq!(
+        flow_node_work_profile(review),
+        WorkProfile {
+            intent: WorkIntent::Evaluate,
+            workspace_access: WorkspaceAccess::None,
+            tool_execution: ToolExecution::None,
+            network_access: NetworkAccess::None,
+        }
+    );
 }
 
 #[test]

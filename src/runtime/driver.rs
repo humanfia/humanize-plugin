@@ -3,17 +3,12 @@ use std::collections::BTreeMap;
 use crate::flow;
 
 use super::{
-    ActivationStatus, EventPayload, NodeSpec, RunStatus, Runtime, RuntimeState, StopDecision,
-    StopDecisionKind, StopObservation,
+    ActivationStatus, EventPayload, NodeSpec, RouteTrigger, RunMode, RunStatus, Runtime,
+    RuntimeError, RuntimeState, SchedulingIntent, StopDecision, StopDecisionKind, StopObservation,
+    scheduling_enabled,
 };
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum RunCompletionMode {
-    #[default]
-    Finite,
-    Continuous,
-    Manual,
-}
+pub type RunCompletionMode = RunMode;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LoopBudget {
@@ -80,6 +75,7 @@ pub struct DriverTickInput {
     pub tick_budget: TickBudget,
     pub loop_budget: LoopBudget,
     pub completion_mode: RunCompletionMode,
+    pub activation_limit: Option<u64>,
 }
 
 impl Default for DriverTickInput {
@@ -91,6 +87,7 @@ impl Default for DriverTickInput {
             tick_budget: TickBudget::default(),
             loop_budget: LoopBudget::default(),
             completion_mode: RunCompletionMode::Finite,
+            activation_limit: None,
         }
     }
 }
@@ -134,6 +131,15 @@ impl DriverTickInput {
         self.completion_mode = completion_mode;
         self
     }
+
+    pub fn with_run_mode(self, run_mode: RunMode) -> Self {
+        self.with_completion_mode(run_mode)
+    }
+
+    pub fn with_activation_limit(mut self, activation_limit: u64) -> Self {
+        self.activation_limit = Some(activation_limit);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -145,6 +151,7 @@ pub struct DriverRender {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DriverTickReport {
     pub pipeline: Vec<&'static str>,
+    pub control_errors: Vec<RuntimeError>,
     pub stop_decisions: Vec<StopDecision>,
     pub route_decisions: Vec<RouteDecision>,
     pub render: DriverRender,
@@ -159,6 +166,7 @@ pub struct RouteDecision {
     pub predicate: String,
     pub for_each: Option<String>,
     pub source_artifact: Option<RouteSourceArtifact>,
+    pub trigger: RouteTrigger,
     pub planned_activation_ids: Vec<String>,
     pub applied_activation_ids: Vec<String>,
 }
@@ -172,11 +180,69 @@ pub struct RouteSourceArtifact {
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct DriverState {
     runtime: Runtime,
-    completion_modes: BTreeMap<String, RunCompletionMode>,
     ticks: u64,
 }
 
 impl DriverState {
+    pub fn from_runtime(runtime: Runtime) -> Self {
+        Self { runtime, ticks: 0 }
+    }
+
+    pub fn record_participant_exit(
+        &mut self,
+        run_id: &str,
+        activation_id: &str,
+        allocation_generation: u64,
+        exit_status: i32,
+    ) -> Result<bool, RuntimeError> {
+        if !self
+            .runtime
+            .state
+            .activations
+            .contains_key(&(run_id.to_string(), activation_id.to_string()))
+        {
+            return Err(RuntimeError::ActivationNotFoundInRun {
+                run_id: run_id.to_string(),
+                activation_id: activation_id.to_string(),
+            });
+        }
+        if let Some(recorded) =
+            self.runtime
+                .events()
+                .iter()
+                .find_map(|event| match &event.payload {
+                    EventPayload::ParticipantExited {
+                        run_id: recorded_run,
+                        activation_id: recorded_activation,
+                        allocation_generation: recorded_generation,
+                        exit_status,
+                    } if recorded_run == run_id
+                        && recorded_activation == activation_id
+                        && *recorded_generation == allocation_generation =>
+                    {
+                        Some(*exit_status)
+                    }
+                    _ => None,
+                })
+        {
+            if recorded == exit_status {
+                return Ok(false);
+            }
+            return Err(RuntimeError::ParticipantExitConflict {
+                run_id: run_id.to_string(),
+                activation_id: activation_id.to_string(),
+                allocation_generation,
+            });
+        }
+        self.runtime.append(EventPayload::ParticipantExited {
+            run_id: run_id.to_string(),
+            activation_id: activation_id.to_string(),
+            allocation_generation,
+            exit_status,
+        });
+        Ok(true)
+    }
+
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
@@ -199,7 +265,11 @@ impl DriverState {
         self.ticks = self.ticks.saturating_add(1);
 
         self.replay();
-        self.handle_control(&input.controls, input.completion_mode);
+        let control_errors = self.handle_control(
+            &input.controls,
+            input.completion_mode,
+            input.activation_limit,
+        );
 
         let mut stop_decisions = Vec::new();
         let mut route_decisions = Vec::new();
@@ -215,7 +285,7 @@ impl DriverState {
 
             progressed |= self.route(&input.route_locks, &mut action_budget, &mut route_decisions);
             progressed |= self.actuate(&mut action_budget);
-            progressed |= self.complete(&mut action_budget);
+            progressed |= self.complete(&input.route_locks, &mut action_budget);
 
             if !progressed || action_budget == 0 {
                 break;
@@ -226,6 +296,7 @@ impl DriverState {
 
         DriverTickReport {
             pipeline,
+            control_errors,
             stop_decisions,
             route_decisions,
             render,
@@ -241,37 +312,140 @@ impl DriverState {
         &mut self,
         controls: &[ControlCommand],
         default_completion_mode: RunCompletionMode,
-    ) {
+        requested_activation_limit: Option<u64>,
+    ) -> Vec<RuntimeError> {
+        let mut errors = Vec::new();
         for control in controls {
-            match control {
+            let result = match control {
                 ControlCommand::StartRun { run_id, nodes } => {
-                    self.completion_modes
-                        .insert(run_id.clone(), default_completion_mode);
-                    if !self.runtime.has_run(run_id)
-                        && self
+                    let activation_limit = requested_activation_limit.unwrap_or(u64::MAX);
+                    if self.runtime.has_run(run_id) {
+                        let actual_mode = self.runtime.state.run_mode(run_id).unwrap_or_default();
+                        let actual_limit = self
                             .runtime
-                            .start_run(run_id.clone(), nodes.clone())
-                            .is_err()
-                    {
-                        self.set_run_status(run_id, RunStatus::Failed);
-                        continue;
+                            .state
+                            .initial_activation_limit(run_id)
+                            .unwrap_or(u64::MAX);
+                        if actual_mode != default_completion_mode
+                            || actual_limit != activation_limit
+                        {
+                            Err(RuntimeError::RunConfigurationConflict {
+                                run_id: run_id.clone(),
+                                expected_mode: actual_mode,
+                                actual_mode: default_completion_mode,
+                                expected_activation_limit: actual_limit,
+                                actual_activation_limit: activation_limit,
+                            })
+                        } else {
+                            self.runtime.set_run_status(run_id, RunStatus::Running)
+                        }
+                    } else {
+                        self.runtime
+                            .start_run_with_options(
+                                run_id.clone(),
+                                nodes.clone(),
+                                default_completion_mode,
+                                activation_limit,
+                            )
+                            .and_then(|_| self.runtime.set_run_status(run_id, RunStatus::Running))
                     }
-                    self.set_run_status(run_id, RunStatus::Running);
                 }
-                ControlCommand::PauseRun { run_id } => {
-                    self.set_run_status(run_id, RunStatus::Paused);
-                }
+                ControlCommand::PauseRun { run_id } => self.pause_run(run_id),
                 ControlCommand::ResumeRun { run_id } => {
-                    self.set_run_status(run_id, RunStatus::Running);
+                    self.resume_run(run_id, requested_activation_limit)
                 }
-                ControlCommand::StopRun { run_id } => {
-                    self.set_run_status(run_id, RunStatus::Stopping);
-                }
-                ControlCommand::CompleteRun { run_id } => {
-                    self.set_run_status(run_id, RunStatus::Completed);
-                }
+                ControlCommand::StopRun { run_id } => self.request_stop(run_id),
+                ControlCommand::CompleteRun { run_id } => self.complete_run(run_id),
+            };
+            if let Err(error) = result {
+                errors.push(error);
             }
         }
+        errors
+    }
+
+    fn request_stop(&mut self, run_id: &str) -> Result<(), RuntimeError> {
+        let status = self.run_status_for_control(run_id)?;
+        if is_terminal_run_status(status) {
+            return Ok(());
+        }
+        self.runtime.set_run_status(run_id, RunStatus::Stopping)
+    }
+
+    fn resume_run(
+        &mut self,
+        run_id: &str,
+        requested_activation_limit: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        let status = self.run_status_for_control(run_id)?;
+        if !matches!(status, RunStatus::Paused | RunStatus::Quiescent) {
+            return Err(RuntimeError::InvalidRunStatusTransition {
+                run_id: run_id.to_owned(),
+                action: "resume".to_string(),
+                status,
+            });
+        }
+        let current_limit = self.runtime.state.activation_limit(run_id).ok_or_else(|| {
+            RuntimeError::RunNotFound {
+                run_id: run_id.to_owned(),
+            }
+        })?;
+        if self.runtime.state.run_status_reason(run_id) == Some("activation_limit_exhausted")
+            && requested_activation_limit.is_none_or(|limit| limit <= current_limit)
+        {
+            return Err(RuntimeError::ActivationLimitIncreaseRequired {
+                run_id: run_id.to_owned(),
+                current: current_limit,
+            });
+        }
+        if let Some(limit) = requested_activation_limit {
+            self.runtime.raise_activation_limit(run_id, limit)?;
+        }
+        self.runtime.set_run_status(run_id, RunStatus::Running)
+    }
+
+    fn pause_run(&mut self, run_id: &str) -> Result<(), RuntimeError> {
+        let status = self.run_status_for_control(run_id)?;
+        match status {
+            RunStatus::Running | RunStatus::Quiescent => {
+                self.runtime
+                    .set_run_status_with_reason(run_id, RunStatus::Paused, None)
+            }
+            RunStatus::Paused => Ok(()),
+            _ => Err(RuntimeError::InvalidRunStatusTransition {
+                run_id: run_id.to_owned(),
+                action: "pause".to_string(),
+                status,
+            }),
+        }
+    }
+
+    fn complete_run(&mut self, run_id: &str) -> Result<(), RuntimeError> {
+        let status = self.run_status_for_control(run_id)?;
+        if status != RunStatus::Quiescent {
+            return Err(RuntimeError::RunNotQuiescent {
+                run_id: run_id.to_owned(),
+                status,
+            });
+        }
+        let mode = self.runtime.state.run_mode(run_id).unwrap_or_default();
+        if mode != RunMode::Manual {
+            return Err(RuntimeError::RunModeDoesNotAllowControl {
+                run_id: run_id.to_owned(),
+                action: "complete".to_string(),
+                mode,
+            });
+        }
+        self.runtime.set_run_status(run_id, RunStatus::Completed)
+    }
+
+    fn run_status_for_control(&self, run_id: &str) -> Result<RunStatus, RuntimeError> {
+        self.runtime
+            .state
+            .run_status(run_id)
+            .ok_or_else(|| RuntimeError::RunNotFound {
+                run_id: run_id.to_owned(),
+            })
     }
 
     fn observe(
@@ -408,7 +582,12 @@ impl DriverState {
             if *action_budget == 0 {
                 break;
             }
-            if self.runtime.state.run_status(&run_id) != Some(RunStatus::Running) {
+            let status = self.runtime.state.run_status(&run_id);
+            if !scheduling_enabled(
+                &self.runtime.state,
+                &run_id,
+                SchedulingIntent::FactTriggeredRoute,
+            ) {
                 continue;
             }
 
@@ -423,20 +602,30 @@ impl DriverState {
                 continue;
             };
 
-            for preview in previews.into_iter().filter(|preview| preview.matched) {
+            for preview in previews {
                 if *action_budget == 0 {
                     break;
+                }
+                if preview.reason.as_deref() == Some("activation_limit_exhausted") {
+                    progressed |= self.set_run_status_with_reason(
+                        &run_id,
+                        RunStatus::Paused,
+                        Some("activation_limit_exhausted"),
+                    );
+                    break;
+                }
+                if !preview.matched {
+                    continue;
                 }
                 let planned_count = preview.planned_activations.len() as u64;
                 if planned_count == 0 {
                     continue;
                 }
-                if planned_count > *action_budget {
-                    *action_budget = 0;
-                    break;
-                }
 
                 let Some(route) = lock.draft().routes.get(preview.route_index) else {
+                    continue;
+                };
+                let Some(trigger) = preview.trigger.clone() else {
                     continue;
                 };
                 let planned_activation_ids = preview
@@ -445,21 +634,28 @@ impl DriverState {
                     .map(|activation| activation.activation_id.clone())
                     .collect::<Vec<_>>();
                 let source_artifact = route_source_artifact(&self.runtime.state, &run_id, route);
-                let activated = match route.for_each.as_deref() {
+                let node = match route.for_each.as_ref() {
                     Some(for_each) => {
-                        let Some(artifact_key) = route_for_each_artifact_key(for_each) else {
-                            continue;
-                        };
-                        let node = node_spec_for_route(lock, route).with_for_each(artifact_key);
-                        self.runtime
-                            .fanout_from_artifact(&run_id, &node, artifact_key)
-                            .unwrap_or_default()
+                        node_spec_for_route(lock, route).with_for_each(for_each.clone())
                     }
-                    None => self
-                        .runtime
-                        .activate_node(&run_id, &node_spec_for_route(lock, route), None)
-                        .map(|activation_id| vec![activation_id])
-                        .unwrap_or_default(),
+                    None => node_spec_for_route(lock, route),
+                };
+                let activated = match self.runtime.apply_route_plan(
+                    &run_id,
+                    &node,
+                    &trigger,
+                    &preview.planned_activations,
+                ) {
+                    Ok(activated) => activated,
+                    Err(RuntimeError::ActivationLimitExceeded { .. }) => {
+                        progressed |= self.set_run_status_with_reason(
+                            &run_id,
+                            RunStatus::Paused,
+                            Some("activation_limit_exhausted"),
+                        );
+                        break;
+                    }
+                    Err(_) => continue,
                 };
 
                 if activated.is_empty() {
@@ -469,14 +665,18 @@ impl DriverState {
                     run_id: run_id.clone(),
                     flow_lock_id: lock.id().to_string(),
                     route_index: preview.route_index,
-                    route_id: format!("route-{}", preview.route_index),
-                    predicate: route.predicate.clone(),
-                    for_each: route.for_each.clone(),
+                    route_id: preview.route_id,
+                    predicate: route.predicate.to_string(),
+                    for_each: route.for_each.as_ref().map(ToString::to_string),
                     source_artifact,
+                    trigger,
                     planned_activation_ids,
                     applied_activation_ids: activated.clone(),
                 });
-                *action_budget = (*action_budget).saturating_sub(activated.len() as u64);
+                if status == Some(RunStatus::Quiescent) {
+                    self.set_run_status(&run_id, RunStatus::Running);
+                }
+                *action_budget = (*action_budget).saturating_sub(1);
                 progressed = true;
             }
         }
@@ -492,11 +692,11 @@ impl DriverState {
             .values()
             .filter(|activation| {
                 activation.status == ActivationStatus::Pending
-                    && self
-                        .runtime
-                        .state
-                        .run_status(&activation.run_id)
-                        .is_some_and(|status| status == RunStatus::Running)
+                    && scheduling_enabled(
+                        &self.runtime.state,
+                        &activation.run_id,
+                        SchedulingIntent::Explicit,
+                    )
             })
             .map(|activation| (activation.run_id.clone(), activation.activation_id.clone()))
             .collect::<Vec<_>>();
@@ -514,15 +714,14 @@ impl DriverState {
         progressed
     }
 
-    fn complete(&mut self, action_budget: &mut u64) -> bool {
+    fn complete(&mut self, route_locks: &[flow::FlowLock], action_budget: &mut u64) -> bool {
         let run_ids = self.runtime.state.runs.iter().cloned().collect::<Vec<_>>();
         let mut progressed = false;
         for run_id in run_ids {
             let status = self.runtime.state.run_status(&run_id);
-            if matches!(
-                status,
-                Some(RunStatus::Completed | RunStatus::Failed | RunStatus::Stopped)
-            ) {
+            if status
+                .is_some_and(|status| is_terminal_run_status(status) || status == RunStatus::Paused)
+            {
                 continue;
             }
             if status == Some(RunStatus::Stopping) {
@@ -538,9 +737,6 @@ impl DriverState {
                 .filter(|activation| activation.run_id == run_id)
                 .map(|activation| activation.status)
                 .collect::<Vec<_>>();
-            if activations.is_empty() {
-                continue;
-            }
             if activations.contains(&ActivationStatus::Blocked) {
                 if *action_budget == 0 {
                     break;
@@ -557,11 +753,10 @@ impl DriverState {
                         | ActivationStatus::Cancelled
                 )
             }) {
-                let completion_mode = self
-                    .completion_modes
-                    .get(&run_id)
-                    .copied()
-                    .unwrap_or(RunCompletionMode::Finite);
+                if self.has_pending_route(&run_id, route_locks) {
+                    continue;
+                }
+                let completion_mode = self.runtime.state.run_mode(&run_id).unwrap_or_default();
                 match completion_mode {
                     RunCompletionMode::Finite => {
                         if *action_budget == 0 {
@@ -581,6 +776,20 @@ impl DriverState {
             }
         }
         progressed
+    }
+
+    fn has_pending_route(&self, run_id: &str, route_locks: &[flow::FlowLock]) -> bool {
+        let Some(lock_id) = self.runtime.state.flow_lock_id_by_run.get(run_id) else {
+            return false;
+        };
+        let Some(lock) = route_locks.iter().find(|lock| lock.id() == lock_id) else {
+            return false;
+        };
+        super::preview_flow_routes(&self.runtime.state, run_id, lock).is_ok_and(|previews| {
+            previews.iter().any(|preview| {
+                preview.matched || preview.reason.as_deref() == Some("activation_limit_exhausted")
+            })
+        })
     }
 
     fn render(&self) -> DriverRender {
@@ -639,12 +848,24 @@ impl DriverState {
     }
 
     fn set_run_status(&mut self, run_id: &str, status: RunStatus) -> bool {
-        if self.runtime.state.run_status(run_id) == Some(status) {
+        self.set_run_status_with_reason(run_id, status, None)
+    }
+
+    fn set_run_status_with_reason(
+        &mut self,
+        run_id: &str,
+        status: RunStatus,
+        reason: Option<&str>,
+    ) -> bool {
+        if self.runtime.state.run_status(run_id) == Some(status)
+            && self.runtime.state.run_status_reason(run_id) == reason
+        {
             return false;
         }
         self.runtime.append(EventPayload::RunStatusChanged {
             run_id: run_id.to_owned(),
             status,
+            reason: reason.map(str::to_owned),
         });
         true
     }
@@ -716,11 +937,11 @@ impl DriverState {
     }
 }
 
-fn route_for_each_artifact_key(for_each: &str) -> Option<&str> {
-    for_each
-        .trim()
-        .strip_prefix("artifact.")
-        .filter(|key| !key.is_empty())
+fn is_terminal_run_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Stopped
+    )
 }
 
 fn route_source_artifact(
@@ -728,33 +949,21 @@ fn route_source_artifact(
     run_id: &str,
     route: &flow::FlowRoute,
 ) -> Option<RouteSourceArtifact> {
-    let key = route
-        .for_each
-        .as_deref()
-        .and_then(route_for_each_artifact_key)
-        .or_else(|| route_predicate_artifact_key(&route.predicate))?;
+    let key = if let Some(for_each) = &route.for_each {
+        for_each.key()
+    } else if let flow::FactRef::Artifact { key } = route.predicate.fact_ref() {
+        key
+    } else {
+        return None;
+    };
     let artifact_id = state
         .latest_artifact_by_slot_index
-        .get(&(run_id.to_string(), key.to_string()))
+        .get(&(run_id.to_string(), key.as_str().to_string()))
         .cloned();
     Some(RouteSourceArtifact {
         key: key.to_string(),
         artifact_id,
     })
-}
-
-fn route_predicate_artifact_key(predicate: &str) -> Option<&str> {
-    let predicate = predicate.trim();
-    if let Some(path) = predicate
-        .strip_prefix("exists(")
-        .and_then(|value| value.strip_suffix(')'))
-        .map(str::trim)
-    {
-        return path.strip_prefix("artifact.").filter(|key| !key.is_empty());
-    }
-    predicate
-        .strip_prefix("artifact.")
-        .filter(|key| !key.is_empty())
 }
 
 fn node_spec_for_route(lock: &flow::FlowLock, route: &flow::FlowRoute) -> NodeSpec {

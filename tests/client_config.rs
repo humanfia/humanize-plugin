@@ -57,6 +57,44 @@ fn session_json_parses_with_expected_server_shape() {
 }
 
 #[test]
+fn hook_json_targets_render_participant_lifecycle_commands() {
+    let cases = [
+        (
+            ClientConfigTarget::CodexHooksJson,
+            "codex_session_start",
+            "--codex-pre-tool-use-hook",
+            "--codex-stop-hook",
+        ),
+        (
+            ClientConfigTarget::ClaudeHooksJson,
+            "claude_session_start",
+            "--claude-pre-tool-use-hook",
+            "--claude-stop-hook",
+        ),
+    ];
+
+    for (target, ready_source, guard_flag, stop_flag) in cases {
+        let rendered = render_client_config(target, COMMAND).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            json!(format!(
+                "{COMMAND} --agent-ready-hook --source {ready_source}"
+            ))
+        );
+        assert_eq!(parsed["hooks"]["PreToolUse"][0]["matcher"], json!("Bash"));
+        assert_eq!(
+            parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            json!(format!("{COMMAND} {guard_flag}"))
+        );
+        assert_eq!(
+            parsed["hooks"]["Stop"][0]["hooks"][0]["command"],
+            json!(format!("{COMMAND} {stop_flag}"))
+        );
+    }
+}
+
+#[test]
 fn shell_snippets_quote_paths_with_spaces_and_single_quotes() {
     let command = "/opt/Humanize Plugin/o'hare/bin/humanize-plugin-mcp";
 
@@ -83,8 +121,10 @@ fn target_names_parse_to_expected_variants() {
     let cases = [
         ("codex-session", ClientConfigTarget::CodexSession),
         ("codex-persistent", ClientConfigTarget::CodexPersistent),
+        ("codex-hooks-json", ClientConfigTarget::CodexHooksJson),
         ("claude-project", ClientConfigTarget::ClaudeProject),
         ("claude-session-json", ClientConfigTarget::ClaudeSessionJson),
+        ("claude-hooks-json", ClientConfigTarget::ClaudeHooksJson),
     ];
 
     for (name, target) in cases {

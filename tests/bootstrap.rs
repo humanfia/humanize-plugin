@@ -1,19 +1,19 @@
 use humanize_plugin::{
     adapters::tmux::{PaneActivation, TmuxAdapter},
     flow::{FlowDraft, flow_check},
-    kernel::{Artifact, Board, Contract, Event, Node, Route},
+    kernel::{Artifact, Board, Contract, Event, Node, kernel_primitive_names},
     mcp::McpSurface,
     runtime::{Activation, EventStore, LocalEventStore},
 };
 
 #[test]
-fn kernel_primitives_are_importable() {
+fn kernel_value_types_are_importable() {
     let _node = Node::default();
     let _contract = Contract::default();
     let _artifact = Artifact::default();
     let _board = Board::default();
-    let _route = Route::default();
     let _event = Event::default();
+    assert!(kernel_primitive_names().contains(&"Route"));
 }
 
 #[test]

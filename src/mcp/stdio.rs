@@ -19,7 +19,7 @@ where
     Reader: BufRead,
     Writer: Write,
 {
-    let mut server = McpServer::new();
+    let mut server = McpServer::from_environment()?;
     serve_stdio_with_server(&mut server, reader, writer)
 }
 
@@ -33,8 +33,7 @@ where
     Reader: BufRead,
     Writer: Write,
 {
-    let result = run_blocking_loop(server, reader, writer);
-    finish_with_cleanup(result, server.shutdown_active_tmux_assets("mcp_shutdown"))
+    run_blocking_loop(server, reader, writer)
 }
 
 #[cfg(unix)]
@@ -46,7 +45,7 @@ where
     Reader: Read + AsRawFd,
     Writer: Write,
 {
-    let mut server = McpServer::new();
+    let mut server = McpServer::from_environment()?;
     serve_stdio_signal_aware_with_server(&mut server, reader, writer)
 }
 
@@ -59,9 +58,8 @@ where
     Reader: BufRead,
     Writer: Write,
 {
-    let mut server = McpServer::new();
-    let result = run_blocking_loop(&mut server, &mut reader, &mut writer);
-    finish_with_cleanup(result, server.shutdown_active_tmux_assets("mcp_shutdown"))?;
+    let mut server = McpServer::from_environment()?;
+    run_blocking_loop(&mut server, &mut reader, &mut writer)?;
     Ok(writer)
 }
 
@@ -77,8 +75,7 @@ where
     Writer: Write,
 {
     let signal_wakeup = SignalWakeup::new()?;
-    let result = run_signal_aware_loop(server, &mut reader, &mut writer, &signal_wakeup);
-    finish_with_cleanup(result, server.shutdown_active_tmux_assets("mcp_shutdown")).map(|()| writer)
+    run_signal_aware_loop(server, &mut reader, &mut writer, &signal_wakeup).map(|()| writer)
 }
 
 #[cfg(not(unix))]
@@ -92,24 +89,8 @@ where
     Reader: BufRead,
     Writer: Write,
 {
-    let result = run_blocking_loop(server, &mut reader, &mut writer);
-    finish_with_cleanup(result, server.shutdown_active_tmux_assets("mcp_shutdown"))?;
+    run_blocking_loop(server, &mut reader, &mut writer)?;
     Ok(writer)
-}
-
-fn finish_with_cleanup(
-    result: io::Result<()>,
-    cleanup: Result<Value, super::ToolError>,
-) -> io::Result<()> {
-    match (result, cleanup) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(err), Ok(_)) => Err(err),
-        (Ok(()), Err(err)) => Err(io::Error::other(err.message)),
-        (Err(err), Err(cleanup_err)) => Err(io::Error::new(
-            err.kind(),
-            format!("{err}; {}", cleanup_err.message),
-        )),
-    }
 }
 
 fn run_blocking_loop<R, Reader, Writer>(

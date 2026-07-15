@@ -1,5 +1,6 @@
 mod support;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,8 +10,8 @@ use serde_json::json;
 
 use support::mcp::{
     RecordingRunner, assert_prefixed_hex, assert_tool_error, blank_inline_readme_flow, call_tool,
-    diagnostic_codes, lock_valid_flow, missing_readme_flow, node_less_missing_readme_flow,
-    readme_resource, structured, valid_flow,
+    diagnostic_codes, missing_readme_flow, node_less_missing_readme_flow, readme_resource,
+    structured, valid_flow,
 };
 
 static NEXT_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -30,18 +31,68 @@ fn isolated_server() -> McpServer<RecordingRunner> {
 }
 
 #[test]
-fn flow_suggest_schema_covers_goal_nodes_and_artifact() {
+fn flow_suggest_schema_requires_agent_authored_readme() {
     let surface = McpSurface;
     let descriptor = surface
         .lookup("flow_suggest")
         .expect("flow_suggest descriptor should be present");
     let schema = descriptor.input_schema();
 
-    assert_eq!(schema["required"], json!(["goal"]));
+    assert_eq!(schema["required"], json!(["goal", "readme"]));
     assert_eq!(schema["properties"]["goal"]["type"], "string");
+    assert_eq!(schema["properties"]["readme"]["type"], "string");
+    assert_eq!(schema["properties"]["readme"]["minLength"], 1);
     assert_eq!(schema["properties"]["artifact"]["type"], "string");
     assert_eq!(schema["properties"]["nodes"]["type"], "array");
     assert_eq!(schema["properties"]["nodes"]["items"]["type"], "string");
+}
+
+#[test]
+fn flow_suggest_rejects_missing_readme_instead_of_generating_one() {
+    let mut server = isolated_server();
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_suggest",
+        json!({
+            "goal": "Draft a concise migration brief."
+        }),
+    );
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("error should include a message")
+            .contains("readme")
+    );
+}
+
+#[test]
+fn flow_suggest_preserves_readme_verbatim_as_package_root_file() {
+    let mut server = isolated_server();
+    let readme = "# Audit flow\n\nKeep  two spaces.\n";
+
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_suggest",
+        json!({
+            "goal": "Draft a concise migration brief.",
+            "readme": readme
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(
+        structured(&response)["flow"]["resources"][0],
+        json!({
+            "path": "README.md",
+            "kind": "readme",
+            "content": readme
+        })
+    );
 }
 #[test]
 fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
@@ -53,6 +104,7 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
         "flow_suggest",
         json!({
             "goal": "Draft a concise migration brief.",
+            "readme": "Draft a concise migration brief.",
             "nodes": ["Collect facts", "Review output"],
             "artifact": "Brief"
         }),
@@ -71,8 +123,8 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
                 "contract_id": "contract.collect_facts",
                 "action": {
                     "driver": "agent",
-                    "prompt_ref": "prompt.collect_facts",
-                    "resource_refs": ["readme.main"],
+                    "prompt_ref": "prompts/collect_facts.md",
+                    "resource_refs": ["README.md"],
                     "reads": [],
                     "writes": ["artifact.brief"]
                 },
@@ -84,8 +136,8 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
                 "contract_id": "contract.review_output",
                 "action": {
                     "driver": "agent",
-                    "prompt_ref": "prompt.review_output",
-                    "resource_refs": ["readme.main"],
+                    "prompt_ref": "prompts/review_output.md",
+                    "resource_refs": ["README.md"],
                     "reads": [],
                     "writes": ["artifact.brief"]
                 },
@@ -102,7 +154,7 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
             "artifacts": [
                 {
                     "id": "brief",
-                    "schema_resource_id": "schema.collect_facts.brief"
+                    "schema_resource_id": "schemas/collect_facts/brief.txt"
                 }
             ]
         })
@@ -110,25 +162,25 @@ fn flow_suggest_returns_valid_draft_accepted_by_flow_check() {
     assert_eq!(
         structured(&suggested)["flow"]["resources"][0],
         json!({
-            "id": "readme.main",
+            "path": "README.md",
             "kind": "readme",
-            "source": "inline:Draft a concise migration brief."
+            "content": "Draft a concise migration brief."
         })
     );
     assert_eq!(
         structured(&suggested)["flow"]["resources"][3],
         json!({
-            "id": "prompt.collect_facts",
+            "path": "prompts/collect_facts.md",
             "kind": "prompt",
-            "source": "inline:Run node collect_facts for goal: Draft a concise migration brief. Deliver artifact with artifact_key \"brief\"."
+            "content": "Run node collect_facts for goal: Draft a concise migration brief. Deliver artifact with artifact_key \"brief\"."
         })
     );
     assert_eq!(
         structured(&suggested)["flow"]["resources"][4],
         json!({
-            "id": "prompt.review_output",
+            "path": "prompts/review_output.md",
             "kind": "prompt",
-            "source": "inline:Run node review_output for goal: Draft a concise migration brief. Deliver artifact with artifact_key \"brief\"."
+            "content": "Run node review_output for goal: Draft a concise migration brief. Deliver artifact with artifact_key \"brief\"."
         })
     );
     assert_eq!(structured(&suggested)["flow"]["routes"], json!([]));
@@ -169,8 +221,8 @@ fn flow_check_accepts_node_action_descriptor() {
                         "id": "root",
                         "action": {
                             "driver": "agent",
-                            "promptRef": "prompt.review",
-                            "resourceRefs": ["script.collect"],
+                            "promptRef": "prompts/review.md",
+                            "resourceRefs": ["scripts/collect.sh"],
                             "reads": ["artifact.handoff", "board.ready"],
                             "writes": ["artifact.summary"],
                             "verdictArtifact": "artifact.review_verdict"
@@ -180,14 +232,14 @@ fn flow_check_accepts_node_action_descriptor() {
                 "resources": [
                     readme_resource(),
                     {
-                        "id": "prompt.review",
+                        "path": "prompts/review.md",
                         "kind": "prompt",
-                        "source": "inline:Review the facts."
+                        "content": "Review the facts."
                     },
                     {
-                        "id": "script.collect",
+                        "path": "scripts/collect.sh",
                         "kind": "script",
-                        "source": "scripts/collect.sh"
+                        "content": "collect"
                     }
                 ]
             }
@@ -215,8 +267,8 @@ fn flow_action_export_uses_snake_case_after_lock() {
                         "id": "root",
                         "action": {
                             "driver": "review",
-                            "promptRef": "prompt.review",
-                            "resourceRefs": ["script.collect"],
+                            "promptRef": "prompts/review.md",
+                            "resourceRefs": ["scripts/collect.sh"],
                             "reads": ["artifact.handoff", "board.ready"],
                             "writes": ["artifact.summary"],
                             "verdictArtifact": "artifact.review_verdict"
@@ -226,14 +278,14 @@ fn flow_action_export_uses_snake_case_after_lock() {
                 "resources": [
                     readme_resource(),
                     {
-                        "id": "prompt.review",
+                        "path": "prompts/review.md",
                         "kind": "prompt",
-                        "source": "inline:Review the facts."
+                        "content": "Review the facts."
                     },
                     {
-                        "id": "script.collect",
+                        "path": "scripts/collect.sh",
                         "kind": "script",
-                        "source": "scripts/collect.sh"
+                        "content": "collect"
                     }
                 ]
             }
@@ -263,19 +315,23 @@ fn flow_action_export_uses_snake_case_after_lock() {
         .expect("export should include a document");
     let exported_json = serde_json::from_str::<serde_json::Value>(document)
         .expect("exported document should be JSON");
-    let content = exported_json["content"]
-        .as_str()
-        .expect("exported document should include normalized content");
-
-    assert!(content.contains("\"prompt_ref\":\"prompt.review\""));
-    assert!(content.contains("\"resource_refs\":[\"script.collect\"]"));
-    assert!(content.contains("\"verdict_artifact\":\"artifact.review_verdict\""));
-    assert!(!content.contains("promptRef"));
-    assert!(!content.contains("resourceRefs"));
-    assert!(!content.contains("verdictArtifact"));
+    let flow = &exported_json["flow"];
+    assert_eq!(
+        flow["nodes"][0]["action"]["prompt_ref"],
+        "prompts/review.md"
+    );
+    assert_eq!(
+        flow["nodes"][0]["action"]["resource_refs"],
+        json!(["scripts/collect.sh"])
+    );
+    assert_eq!(
+        flow["nodes"][0]["action"]["verdict_artifact"],
+        "artifact.review_verdict"
+    );
+    assert!(exported_json.get("content").is_none());
 }
 #[test]
-fn flow_repair_returns_mechanical_patches_and_unranked_candidates() {
+fn flow_repair_returns_no_candidates_for_valid_typed_flows() {
     let mut server = isolated_server();
 
     let response = call_tool(
@@ -283,52 +339,104 @@ fn flow_repair_returns_mechanical_patches_and_unranked_candidates() {
         1,
         "flow_repair",
         json!({
-            "flow": valid_flow(),
-            "route_authoring": [
-                {
-                    "when": "exists(artifact.ready)",
-                    "to": "finish"
-                },
-                {
-                    "predicate": {
-                        "artifact": "summary"
-                    },
-                    "activate": "finish"
-                },
-                {
-                    "predicate": "artifact.report.delivered",
-                    "activate": ""
-                }
-            ]
+            "flow": valid_flow()
         }),
     );
 
     assert_eq!(response["result"]["isError"], false);
     assert_eq!(structured(&response)["ok"], true);
-    assert_eq!(structured(&response)["repairable"], true);
+    assert_eq!(structured(&response)["repairable"], false);
     assert_eq!(structured(&response)["input_severity"], "none");
     assert_eq!(
-        structured(&response)["patches"][0],
-        json!({
-            "repair_kind": "route_when_to_predicate",
-            "location": "routes[0].when",
-            "replacement": "predicate: exists(artifact.ready)"
-        })
+        structured(&response)
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "candidates",
+            "diagnostics",
+            "guidance",
+            "input_severity",
+            "ok",
+            "repairable",
+        ])
     );
-    let candidate = structured(&response)["candidates"][0]
-        .as_object()
-        .expect("candidate should be an object");
-    assert_eq!(
-        candidate.get("repair_kind"),
-        Some(&json!("route_bare_artifact_delivered_to_exists"))
-    );
-    assert!(candidate.get("rank").is_none());
-    assert!(candidate.get("recommended").is_none());
-    assert!(candidate.get("best_candidate").is_none());
+    assert_eq!(structured(&response)["candidates"], json!([]));
 }
 
 #[test]
-fn flow_repair_keeps_fatal_input_patch_free() {
+fn flow_repair_returns_unranked_local_route_target_candidates() {
+    let mut server = isolated_server();
+    let response = call_tool(
+        &mut server,
+        1,
+        "flow_repair",
+        json!({
+            "flow": {
+                "nodes": [{"id": "zeta"}, {"id": "alpha"}],
+                "resources": [readme_resource()],
+                "routes": [{
+                    "predicate": {
+                        "op": "exists",
+                        "fact": {"kind": "artifact", "key": "ready"}
+                    },
+                    "activate": "missing"
+                }]
+            }
+        }),
+    );
+
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(structured(&response)["repairable"], true);
+    assert!(structured(&response).get("patches").is_none());
+    assert_eq!(
+        structured(&response)["candidates"],
+        json!([
+            {
+                "repair_kind": "add_route_target",
+                "location": "routes[0].activate",
+                "replacement": "zeta"
+            },
+            {
+                "repair_kind": "add_route_target",
+                "location": "routes[0].activate",
+                "replacement": "alpha"
+            }
+        ])
+    );
+}
+
+#[test]
+fn flow_repair_warning_guidance_is_opt_in() {
+    let mut server = isolated_server();
+    let flow = json!({
+        "nodes": [{"id": "root"}],
+        "resources": [readme_resource()],
+        "policies": {"write_scopes": ["workspace"]}
+    });
+
+    let default_response = call_tool(&mut server, 1, "flow_repair", json!({"flow": flow.clone()}));
+    let included_response = call_tool(
+        &mut server,
+        2,
+        "flow_repair",
+        json!({"flow": flow, "include_warnings": true}),
+    );
+
+    assert_eq!(structured(&default_response)["diagnostics"], json!([]));
+    assert_eq!(structured(&default_response)["guidance"], json!([]));
+    assert_eq!(
+        diagnostic_codes(&included_response),
+        vec!["FLOW_BROAD_WRITE_SCOPE"]
+    );
+    assert_eq!(structured(&included_response)["repairable"], false);
+    assert_eq!(structured(&included_response)["candidates"], json!([]));
+}
+
+#[test]
+fn flow_repair_keeps_fatal_input_candidate_free() {
     let mut server = isolated_server();
 
     let response = call_tool(
@@ -340,13 +448,7 @@ fn flow_repair_keeps_fatal_input_patch_free() {
                 "nodes": ["root"],
                 "resources": [readme_resource()],
                 "extensions": ["NodeActivation"]
-            },
-            "route_authoring": [
-                {
-                    "when": "exists(artifact.ready)",
-                    "to": "root"
-                }
-            ]
+            }
         }),
     );
 
@@ -354,7 +456,8 @@ fn flow_repair_keeps_fatal_input_patch_free() {
     assert_eq!(structured(&response)["ok"], true);
     assert_eq!(structured(&response)["repairable"], false);
     assert_eq!(structured(&response)["input_severity"], "fatal");
-    assert_eq!(structured(&response)["patches"], json!([]));
+    assert!(structured(&response).get("patches").is_none());
+    assert_eq!(structured(&response)["candidates"], json!([]));
     assert_eq!(
         diagnostic_codes(&response),
         vec!["FLOW_AUTHORING_PRIMITIVE_MISUSE"]
@@ -379,7 +482,7 @@ fn propose_flow_update_locks_flow_and_reports_review_risk() {
     assert_eq!(proposed["result"]["isError"], false);
     assert_eq!(structured(&proposed)["ok"], true);
     assert_eq!(structured(&proposed)["apply_mode"], "future_activations");
-    assert_eq!(structured(&proposed)["review_required"], true);
+    assert!(structured(&proposed).get("review_required").is_none());
     assert_eq!(structured(&proposed)["risk"], "medium");
     assert_prefixed_hex(
         structured(&proposed)["flow_lock_id"]
@@ -391,8 +494,19 @@ fn propose_flow_update_locks_flow_and_reports_review_risk() {
         structured(&proposed)["content_hash"]
             .as_str()
             .expect("proposal should include a content hash"),
-        "fnv1a64:",
+        "sha256:",
     );
+    let package = &structured(&proposed)["revision_package"];
+    assert_eq!(package["lock_id"], structured(&proposed)["flow_lock_id"]);
+    assert_eq!(
+        package["content_hash"],
+        structured(&proposed)["content_hash"]
+    );
+    assert_eq!(package["format"], "humanize.flow_lock.v1");
+    assert!(package["flow"].is_object());
+    assert!(package.get("bytes").is_none());
+    assert!(package.get("json").is_none());
+    assert!(structured(&proposed).get("run_id").is_none());
 }
 
 #[test]
@@ -440,6 +554,7 @@ fn flow_suggest_flow_round_trips_through_lock_and_export() {
         "flow_suggest",
         json!({
             "goal": "Draft a concise migration brief.",
+            "readme": "Draft a concise migration brief.",
             "nodes": ["Collect facts", "Review output"],
             "artifact": "Brief"
         }),
@@ -469,7 +584,7 @@ fn flow_suggest_flow_round_trips_through_lock_and_export() {
         structured(&locked)["content_hash"]
             .as_str()
             .expect("flow_lock should return a content hash"),
-        "fnv1a64:",
+        "sha256:",
     );
 
     let exported = call_tool(
@@ -489,7 +604,7 @@ fn flow_suggest_flow_round_trips_through_lock_and_export() {
         .as_str()
         .expect("export should include a document");
     assert!(document.contains(lock_id));
-    assert!(document.contains("readme.main"));
+    assert!(document.contains("README.md"));
 }
 #[test]
 fn flow_suggest_rejects_blank_goal() {
@@ -500,7 +615,8 @@ fn flow_suggest_rejects_blank_goal() {
         1,
         "flow_suggest",
         json!({
-            "goal": " \t\n "
+            "goal": " \t\n ",
+            "readme": "Explicit package description."
         }),
     );
 
@@ -513,7 +629,7 @@ fn flow_suggest_rejects_blank_goal() {
     );
 }
 #[test]
-fn flow_check_rejects_effectful_predicate_diagnostics() {
+fn flow_check_rejects_string_predicate_at_the_typed_boundary() {
     let mut server = isolated_server();
 
     let response = call_tool(
@@ -538,11 +654,7 @@ fn flow_check_rejects_effectful_predicate_diagnostics() {
         }),
     );
 
-    assert_tool_error(&response);
-    assert_eq!(
-        diagnostic_codes(&response),
-        vec!["FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN"]
-    );
+    assert_eq!(response["error"]["code"], -32602);
 }
 #[test]
 fn flow_check_rejects_missing_readme_in_core_and_strict() {
@@ -736,7 +848,7 @@ fn flow_apply_rejects_empty_and_non_object_flows() {
     );
 }
 #[test]
-fn flow_apply_rejects_effectful_predicate_with_diagnostics() {
+fn flow_apply_rejects_string_predicate_at_the_typed_boundary() {
     let mut server = isolated_server();
 
     let response = call_tool(
@@ -760,12 +872,7 @@ fn flow_apply_rejects_effectful_predicate_with_diagnostics() {
         }),
     );
 
-    assert_eq!(response["result"]["isError"], true);
-    assert_eq!(structured(&response)["ok"], false);
-    assert_eq!(
-        diagnostic_codes(&response),
-        vec!["FLOW_ROUTE_PREDICATE_NOT_FACT_DRIVEN"]
-    );
+    assert_eq!(response["error"]["code"], -32602);
 }
 #[test]
 fn flow_apply_records_valid_flow_lock_for_export() {
@@ -784,7 +891,10 @@ fn flow_apply_records_valid_flow_lock_for_export() {
                 "resources": [readme_resource()],
                 "routes": [
                     {
-                        "predicate": "exists(artifact.ready)",
+                        "predicate": {
+                            "op": "exists",
+                            "fact": {"kind": "artifact", "key": "ready"}
+                        },
                         "activate": "finish"
                     }
                 ]
@@ -802,7 +912,7 @@ fn flow_apply_records_valid_flow_lock_for_export() {
         structured(&applied)["content_hash"]
             .as_str()
             .expect("flow_apply should return content hash")
-            .starts_with("fnv1a64:")
+            .starts_with("sha256:")
     );
 
     let exported = call_tool(
@@ -825,339 +935,6 @@ fn flow_apply_records_valid_flow_lock_for_export() {
         structured(&exported)["document"]
             .as_str()
             .expect("export should include a document")
-            .contains("readme.main")
+            .contains("README.md")
     );
-}
-#[test]
-fn apply_flow_lock_requires_and_records_lock_provenance() {
-    let mut server = isolated_server();
-
-    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
-
-    let started = call_tool(
-        &mut server,
-        2,
-        "start_run",
-        json!({
-            "run_id": "run-lock",
-            "nodes": ["root"]
-        }),
-    );
-    assert_eq!(structured(&started)["ok"], true);
-
-    let missing_provenance = call_tool(
-        &mut server,
-        3,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-lock",
-            "mode": "future_activations",
-            "content_hash": content_hash
-        }),
-    );
-    assert_eq!(missing_provenance["error"]["code"], -32602);
-    assert!(
-        missing_provenance["error"]["message"]
-            .as_str()
-            .expect("error should include a message")
-            .contains("lock_id")
-    );
-
-    let applied = call_tool(
-        &mut server,
-        4,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-lock",
-            "mode": "future_activations",
-            "lock_id": lock_id,
-            "content_hash": content_hash
-        }),
-    );
-    assert_eq!(structured(&applied)["ok"], true);
-    assert_eq!(structured(&applied)["lock_id"], lock_id);
-    assert_eq!(structured(&applied)["content_hash"], content_hash);
-
-    let context = call_tool(
-        &mut server,
-        5,
-        "get_context",
-        json!({
-            "run_id": "run-lock"
-        }),
-    );
-    let applications = structured(&context)["context"]["flow_lock_applications"]
-        .as_object()
-        .expect("flow lock applications should be exported from runtime state");
-    let latest = applications
-        .values()
-        .next()
-        .expect("one flow lock application should be recorded");
-    assert_eq!(latest["lock_id"], lock_id);
-    assert_eq!(latest["content_hash"], content_hash);
-}
-#[test]
-fn apply_flow_lock_rejects_unknown_lock_without_runtime_apply() {
-    let mut server = isolated_server();
-
-    let started = call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-unknown-lock",
-            "nodes": ["root"]
-        }),
-    );
-    assert_eq!(structured(&started)["ok"], true);
-
-    let response = call_tool(
-        &mut server,
-        2,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-unknown-lock",
-            "mode": "future_activations",
-            "lock_id": "lock-missing",
-            "content_hash": "fnv1a64:0000000000000000"
-        }),
-    );
-
-    assert_tool_error(&response);
-    assert_eq!(structured(&response)["lock_id"], "lock-missing");
-    assert_eq!(structured(&response)["error"], "flow lock not found");
-
-    let context = call_tool(
-        &mut server,
-        3,
-        "get_context",
-        json!({
-            "run_id": "run-unknown-lock"
-        }),
-    );
-    assert!(structured(&context)["context"]["flow_lock_mode"].is_null());
-    assert_eq!(
-        structured(&context)["context"]["flow_lock_applications"],
-        json!({})
-    );
-}
-#[test]
-fn apply_flow_lock_rejects_hash_mismatch_without_runtime_apply() {
-    let mut server = isolated_server();
-
-    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
-
-    let started = call_tool(
-        &mut server,
-        2,
-        "start_run",
-        json!({
-            "run_id": "run-hash-mismatch",
-            "nodes": ["root"]
-        }),
-    );
-    assert_eq!(structured(&started)["ok"], true);
-
-    let response = call_tool(
-        &mut server,
-        3,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-hash-mismatch",
-            "mode": "future_activations",
-            "lock_id": lock_id,
-            "content_hash": "fnv1a64:0000000000000000"
-        }),
-    );
-
-    assert_tool_error(&response);
-    assert_eq!(structured(&response)["lock_id"], lock_id);
-    assert_eq!(
-        structured(&response)["content_hash"],
-        "fnv1a64:0000000000000000"
-    );
-    assert_eq!(structured(&response)["expected_content_hash"], content_hash);
-    assert_eq!(
-        structured(&response)["error"],
-        "flow lock content hash mismatch"
-    );
-
-    let context = call_tool(
-        &mut server,
-        4,
-        "get_context",
-        json!({
-            "run_id": "run-hash-mismatch"
-        }),
-    );
-    assert!(structured(&context)["context"]["flow_lock_mode"].is_null());
-    assert_eq!(
-        structured(&context)["context"]["flow_lock_applications"],
-        json!({})
-    );
-}
-
-#[test]
-fn apply_flow_lock_missing_run_returns_start_run_guidance() {
-    let mut server = isolated_server();
-
-    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
-
-    let response = call_tool(
-        &mut server,
-        2,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-apply-missing",
-            "mode": "future_activations",
-            "lock_id": lock_id,
-            "content_hash": content_hash
-        }),
-    );
-
-    assert_tool_error(&response);
-    assert!(response.get("error").is_none());
-    assert_eq!(structured(&response)["run_id"], "run-apply-missing");
-    assert_eq!(structured(&response)["mode"], "future_activations");
-    assert_eq!(structured(&response)["lock_id"], lock_id);
-    assert_eq!(structured(&response)["flow_lock_id"], lock_id);
-    assert_eq!(structured(&response)["content_hash"], content_hash);
-    assert_eq!(structured(&response)["error"], "run not found");
-    assert_eq!(structured(&response)["next_tool"], "start_run");
-    assert_eq!(
-        structured(&response)["next_arguments"],
-        json!({
-            "run_id": "run-apply-missing",
-            "nodes": ["root"]
-        })
-    );
-}
-
-#[test]
-fn apply_flow_lock_unknown_lock_takes_precedence_over_missing_run() {
-    let mut server = isolated_server();
-
-    let response = call_tool(
-        &mut server,
-        1,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-missing-unknown-lock",
-            "mode": "future_activations",
-            "lock_id": "lock-missing",
-            "content_hash": "fnv1a64:0000000000000000"
-        }),
-    );
-
-    assert_tool_error(&response);
-    assert!(response.get("error").is_none());
-    assert_eq!(structured(&response)["run_id"], "run-missing-unknown-lock");
-    assert_eq!(structured(&response)["lock_id"], "lock-missing");
-    assert_eq!(structured(&response)["flow_lock_id"], "lock-missing");
-    assert_eq!(structured(&response)["error"], "flow lock not found");
-    assert!(structured(&response)["next_tool"].is_null());
-    assert!(structured(&response)["next_arguments"].is_null());
-}
-
-#[test]
-fn apply_flow_lock_hash_mismatch_takes_precedence_over_missing_run() {
-    let mut server = isolated_server();
-
-    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
-
-    let response = call_tool(
-        &mut server,
-        2,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-missing-hash-mismatch",
-            "mode": "future_activations",
-            "flow_lock_id": lock_id,
-            "content_hash": "fnv1a64:0000000000000000"
-        }),
-    );
-
-    assert_tool_error(&response);
-    assert!(response.get("error").is_none());
-    assert_eq!(structured(&response)["run_id"], "run-missing-hash-mismatch");
-    assert_eq!(structured(&response)["mode"], "future_activations");
-    assert_eq!(structured(&response)["lock_id"], lock_id);
-    assert_eq!(structured(&response)["flow_lock_id"], lock_id);
-    assert_eq!(
-        structured(&response)["content_hash"],
-        "fnv1a64:0000000000000000"
-    );
-    assert_eq!(structured(&response)["expected_content_hash"], content_hash);
-    assert_eq!(
-        structured(&response)["error"],
-        "flow lock content hash mismatch"
-    );
-    assert!(structured(&response)["next_tool"].is_null());
-    assert!(structured(&response)["next_arguments"].is_null());
-}
-#[test]
-fn apply_flow_lock_accepts_flow_lock_id_alias_for_stored_lock() {
-    let mut server = isolated_server();
-
-    let (lock_id, content_hash) = lock_valid_flow(&mut server, 1);
-    let started = call_tool(
-        &mut server,
-        2,
-        "start_run",
-        json!({
-            "run_id": "run-lock-alias",
-            "nodes": ["root"]
-        }),
-    );
-    assert_eq!(structured(&started)["ok"], true);
-
-    let applied = call_tool(
-        &mut server,
-        3,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-lock-alias",
-            "mode": "checkpoint_restart",
-            "flow_lock_id": lock_id,
-            "content_hash": content_hash
-        }),
-    );
-
-    assert_eq!(structured(&applied)["ok"], true);
-    assert_eq!(structured(&applied)["lock_id"], lock_id);
-    assert_eq!(structured(&applied)["content_hash"], content_hash);
-    assert_eq!(structured(&applied)["mode"], "checkpoint_restart");
-}
-#[test]
-fn apply_flow_lock_rejects_lock_created_in_another_server() {
-    let mut authoring_server = isolated_server();
-    let (lock_id, content_hash) = lock_valid_flow(&mut authoring_server, 1);
-
-    let mut runtime_server = isolated_server();
-    let started = call_tool(
-        &mut runtime_server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-other-server-lock",
-            "nodes": ["root"]
-        }),
-    );
-    assert_eq!(structured(&started)["ok"], true);
-
-    let response = call_tool(
-        &mut runtime_server,
-        2,
-        "apply_flow_lock",
-        json!({
-            "run_id": "run-other-server-lock",
-            "mode": "future_activations",
-            "flow_lock_id": lock_id,
-            "content_hash": content_hash
-        }),
-    );
-
-    assert_tool_error(&response);
-    assert_eq!(structured(&response)["lock_id"], lock_id);
-    assert_eq!(structured(&response)["error"], "flow lock not found");
 }

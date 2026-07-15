@@ -2,21 +2,21 @@ mod support;
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use humanize_plugin::flow::{
-    FlowCheckMode, FlowDraft, FlowNode, FlowResource, ResourceKind, flow_lock,
-};
+use humanize_plugin::flow::{FlowQosIntent, QosUrgency};
 use humanize_plugin::input_ledger::{MachineInputLedger, MachineInputRecord, MachineInputStatus};
 use humanize_plugin::mcp::McpServer;
 use humanize_plugin::run_assets::{
-    RunAssetActivationUpdate, RunAssetSink, RunAssetStore, RunAssetTmuxTarget, SessionRelation,
+    HookFactDetail, HookFactInput, RunAssetActivationUpdate, RunAssetManifest, RunAssetSink,
+    RunAssetStore, RunAssetTmuxTarget, SessionRelation, TopologyDecisionInput,
+    TopologyDecisionSource,
 };
 use serde_json::{Value, json};
 
-use support::mcp::{RecordingRunner, call_tool, lock_flow, structured, valid_flow};
+use support::mcp::{RecordingRunner, call_tool};
 
 static NEXT_ASSET_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -31,55 +31,37 @@ fn test_temp_dir(name: &str) -> PathBuf {
     path
 }
 
-fn read_jsonl(path: impl Into<PathBuf>) -> Vec<Value> {
-    let path = path.into();
-    fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("{} should be readable: {err}", path.display()))
+fn journal_events(manifest: &RunAssetManifest) -> Vec<Value> {
+    fs::read_to_string(manifest.root.join("records/events.jsonl"))
+        .unwrap_or_default()
         .lines()
-        .map(|line| serde_json::from_str(line).expect("record line should be JSON"))
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
 
-fn read_record_index(root: impl Into<PathBuf>) -> Value {
-    let root = root.into();
-    serde_json::from_str(&fs::read_to_string(root.join("records/index.json")).unwrap()).unwrap()
+fn events_of_kind(manifest: &RunAssetManifest, kind: &str) -> Vec<Value> {
+    journal_events(manifest)
+        .into_iter()
+        .filter(|event| event["kind"] == kind)
+        .collect()
 }
 
-fn rpc_error_message(response: &Value) -> String {
-    response["error"]["message"]
-        .as_str()
-        .or_else(|| response["result"]["structuredContent"]["error"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn draft() -> FlowDraft {
-    FlowDraft {
-        nodes: vec![FlowNode {
-            id: "root".to_string(),
-            ..FlowNode::default()
-        }],
-        resources: vec![FlowResource {
-            id: "readme.main".to_string(),
-            kind: ResourceKind::Readme,
-            source: "inline:Exercise durable runtime records.".to_string(),
-        }],
-        ..FlowDraft::default()
+fn qos() -> FlowQosIntent {
+    FlowQosIntent {
+        urgency: QosUrgency::Interactive,
+        completion_target: Some("artifact.done".to_string()),
     }
 }
 
-fn machine_input_record_with_transaction(
-    run_id: &str,
-    transaction_id: &str,
-    submitted_at_ms: u64,
-) -> MachineInputRecord {
+fn machine_input_record(run_id: &str, transaction_id: &str) -> MachineInputRecord {
     MachineInputRecord {
         run_id: run_id.to_string(),
         activation_id: "root".to_string(),
         pane_id: "%8".to_string(),
+        allocation_generation: 0,
         started_at_ms: 1_700_000_000_100,
-        submitted_at_ms,
-        payload_hash: "fnv1a64:0000000000000001".to_string(),
+        submitted_at_ms: 1_700_000_000_120,
+        payload_hash: format!("sha256:{}", "a".repeat(64)),
         normalized_text: "inspect".to_string(),
         submit_key_count: 1,
         transaction_id: transaction_id.to_string(),
@@ -87,8 +69,25 @@ fn machine_input_record_with_transaction(
     }
 }
 
-fn machine_input_record(run_id: &str) -> MachineInputRecord {
-    machine_input_record_with_transaction(run_id, "machine-input:abc", 1_700_000_000_120)
+fn start_activation(store: &RunAssetStore, manifest: &mut RunAssetManifest) {
+    store
+        .start_activation_capture(
+            manifest,
+            RunAssetActivationUpdate {
+                activation_id: "root".into(),
+                node_id: "root".into(),
+                adapter: "tmux".into(),
+                tmux: RunAssetTmuxTarget {
+                    session_id: "host-a".into(),
+                    window_id: "%7".into(),
+                    window_name: "flow-a".into(),
+                    pane_id: "%8".into(),
+                    allocation_generation: 0,
+                },
+                termination_reason: None,
+            },
+        )
+        .unwrap();
 }
 
 #[test]
@@ -100,15 +99,17 @@ fn auto_sink_uses_humanize_override_and_ignores_sforge_patch_dir() {
         let root = RunAssetStore::runtime_default()
             .run_root("run-auto")
             .unwrap();
-
         assert!(root.starts_with(&expected_root), "{}", root.display());
         assert!(!root.to_string_lossy().contains(".flowbench"));
         assert!(!root.to_string_lossy().contains("sforge"));
         return;
     }
 
-    let humanize_root = test_temp_dir("humanize-runs-override");
-    let sforge_root = test_temp_dir("sforge-patch-dir");
+    let humanize_root = std::env::temp_dir().join(format!(
+        "humanize-runs-override-{}-{}",
+        std::process::id(),
+        NEXT_ASSET_ROOT.fetch_add(1, Ordering::SeqCst)
+    ));
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -118,171 +119,78 @@ fn auto_sink_uses_humanize_override_and_ignores_sforge_patch_dir() {
         .env(CHILD, "1")
         .env(EXPECT_ROOT, &humanize_root)
         .env("HUMANIZE_RUNS_DIR", &humanize_root)
-        .env("SFORGE_PATCH_DIR", &sforge_root)
+        .env("SFORGE_PATCH_DIR", test_temp_dir("sforge-patch-dir"))
         .status()
-        .expect("child test should run");
-
+        .unwrap();
     assert!(status.success());
 }
 
 #[test]
-fn duplicate_record_append_is_idempotent_by_source_identity() {
-    let root = test_temp_dir("durable-records-idempotent");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
+fn typed_journal_append_is_idempotent_and_has_no_split_streams() {
+    let store = RunAssetStore::new_with_fixed_clock(
+        RunAssetSink::Root(test_temp_dir("durable-idempotent")),
+        1_700_000_000_123,
+    );
     let mut manifest = store.start_run_manifest("run-idempotent").unwrap();
+    store.record_qos_intent(&mut manifest, &qos()).unwrap();
+    store.record_qos_intent(&mut manifest, &qos()).unwrap();
 
-    store
-        .record_qos_intent(
-            &mut manifest,
-            &humanize_plugin::flow::FlowQosIntent {
-                urgency: humanize_plugin::flow::QosUrgency::Interactive,
-                completion_target: Some("artifact.done".to_string()),
-            },
-        )
-        .unwrap();
-    store
-        .record_qos_intent(
-            &mut manifest,
-            &humanize_plugin::flow::FlowQosIntent {
-                urgency: humanize_plugin::flow::QosUrgency::Interactive,
-                completion_target: Some("artifact.done".to_string()),
-            },
-        )
-        .unwrap();
-
-    let qos_records = read_jsonl(manifest.root.join("records/qos.jsonl"));
-    let index = read_record_index(&manifest.root);
-    assert_eq!(qos_records.len(), 1);
-    assert_eq!(index["files"]["qos"]["record_count"], 1);
-    assert_eq!(index["files"]["qos"]["latest_sequence"], 1);
+    let events = events_of_kind(&manifest, "qos.observed");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["data"]["source"], "run_assets");
+    assert_eq!(events[0]["data"]["payload"]["state"], "observed");
+    assert_eq!(events[0]["data"]["payload"]["urgency"], "interactive");
+    for path in [
+        "records/index.json",
+        "records/qos.jsonl",
+        "records/runtime.jsonl",
+        "records/topology.jsonl",
+        "machine-inputs.jsonl",
+    ] {
+        assert!(!manifest.root.join(path).exists(), "{path}");
+    }
 }
 
 #[test]
-fn record_index_rebuilds_by_scanning_streams_after_index_loss() {
-    let root = test_temp_dir("durable-records-rebuild-index");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let mut manifest = store.start_run_manifest("run-rebuild-index").unwrap();
-    store
-        .record_machine_input(
-            &mut manifest,
-            "node_prompt",
-            &machine_input_record("run-rebuild-index"),
-        )
-        .unwrap();
-    fs::remove_file(manifest.root.join("records/index.json")).unwrap();
-
-    let rebuilt = store.rebuild_record_index(&manifest).unwrap();
-
-    assert_eq!(rebuilt["files"]["storage"]["record_count"], 1);
-    assert_eq!(rebuilt["files"]["tmux"]["record_count"], 1);
-    assert_eq!(rebuilt["files"]["machine_input_ledger"]["record_count"], 1);
-    assert!(manifest.root.join("records/index.json").exists());
-}
-
-#[test]
-fn record_index_rebuild_recovers_torn_final_jsonl_record() {
-    let root = test_temp_dir("durable-records-torn-tail");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let mut manifest = store.start_run_manifest("run-torn-tail").unwrap();
-    let storage_path = manifest.root.join("records/storage.jsonl");
-    let torn_tail = br#"{"record_id":"rec-storage-torn""#;
+fn journal_rebuild_recovers_torn_tail_and_rejects_interior_corruption() {
+    let store = RunAssetStore::new_with_fixed_clock(
+        RunAssetSink::Root(test_temp_dir("durable-journal-recovery")),
+        1_700_000_000_123,
+    );
+    let mut manifest = store.start_run_manifest("run-journal-recovery").unwrap();
+    store.record_qos_intent(&mut manifest, &qos()).unwrap();
+    let events_path = manifest.root.join("records/events.jsonl");
+    let torn = br#"{"seq":999"#;
     fs::OpenOptions::new()
         .append(true)
-        .open(&storage_path)
+        .open(&events_path)
         .unwrap()
-        .write_all(torn_tail)
+        .write_all(torn)
         .unwrap();
-    fs::remove_file(manifest.root.join("records/index.json")).unwrap();
 
     let rebuilt = store.rebuild_record_index(&manifest).unwrap();
-
-    assert_eq!(rebuilt["files"]["storage"]["record_count"], 1);
-    assert_eq!(rebuilt["files"]["storage"]["latest_sequence"], 1);
-    let storage_payload = fs::read_to_string(&storage_path).unwrap();
-    assert!(storage_payload.ends_with('\n'));
-    assert!(!storage_payload.contains("rec-storage-torn"));
-    let quarantine_dir = manifest.root.join("records/quarantine");
-    let quarantine_entries = fs::read_dir(&quarantine_dir)
+    assert_eq!(rebuilt["files"]["events"]["record_count"], 1);
+    assert!(fs::read_to_string(&events_path).unwrap().ends_with('\n'));
+    let quarantine = fs::read_dir(manifest.root.join("records/quarantine"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
-    assert_eq!(quarantine_entries.len(), 1);
-    assert_eq!(fs::read(&quarantine_entries[0]).unwrap(), torn_tail);
+    assert_eq!(quarantine.len(), 1);
+    assert_eq!(fs::read(&quarantine[0]).unwrap(), torn);
 
-    store
-        .record_qos_intent(
-            &mut manifest,
-            &humanize_plugin::flow::FlowQosIntent {
-                urgency: humanize_plugin::flow::QosUrgency::Interactive,
-                completion_target: None,
-            },
-        )
-        .unwrap();
-    let qos_records = read_jsonl(manifest.root.join("records/qos.jsonl"));
-    assert_eq!(qos_records.len(), 1);
-}
-
-#[test]
-fn record_index_rebuild_rejects_interior_jsonl_corruption() {
-    let root = test_temp_dir("durable-records-interior-corruption");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let manifest = store.start_run_manifest("run-interior-corruption").unwrap();
-    let storage_path = manifest.root.join("records/storage.jsonl");
-    let original_payload = fs::read(&storage_path).unwrap();
-    let mut file = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .append(true)
-        .open(&storage_path)
+        .open(&events_path)
+        .unwrap()
+        .write_all(b"{not-json}\n")
         .unwrap();
-    file.write_all(b"{not-json}\n").unwrap();
-    file.write_all(&original_payload).unwrap();
-    drop(file);
-    fs::remove_file(manifest.root.join("records/index.json")).unwrap();
-
-    let err = store.rebuild_record_index(&manifest).unwrap_err();
-
-    assert!(err.to_string().contains("parse durable record file"));
-    assert!(!manifest.root.join("records/quarantine").exists());
+    let error = store.rebuild_record_index(&manifest).unwrap_err();
+    assert!(error.to_string().contains("parse public journal"));
 }
 
 #[cfg(unix)]
 #[test]
-fn record_append_rejects_concurrent_writer_lock() {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-
-    let root = test_temp_dir("durable-records-writer-lock");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let mut manifest = store.start_run_manifest("run-lock").unwrap();
-    let lock_path = manifest.root.join("records/.writer.lock");
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-        .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
-
-    let err = store
-        .record_qos_intent(
-            &mut manifest,
-            &humanize_plugin::flow::FlowQosIntent {
-                urgency: humanize_plugin::flow::QosUrgency::Interactive,
-                completion_target: None,
-            },
-        )
-        .unwrap_err();
-
-    assert!(err.to_string().contains("record store writer lock"));
-}
-
-#[cfg(unix)]
-#[test]
-fn record_stream_rejects_fifo_without_blocking() {
+fn journal_append_rejects_fifo_without_blocking() {
     use std::os::unix::ffi::OsStrExt;
 
     const CHILD_ROOT: &str = "HUMANIZE_RECORD_FIFO_ROOT";
@@ -291,31 +199,26 @@ fn record_stream_rejects_fifo_without_blocking() {
         (std::env::var(CHILD_ROOT), std::env::var(CHILD_MANIFEST))
     {
         let store = RunAssetStore::new(RunAssetSink::Root(PathBuf::from(root)));
-        let mut manifest: humanize_plugin::run_assets::RunAssetManifest =
-            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
-        let result = store.record_qos_intent(
-            &mut manifest,
-            &humanize_plugin::flow::FlowQosIntent {
-                urgency: humanize_plugin::flow::QosUrgency::Interactive,
-                completion_target: None,
-            },
-        );
-        assert!(result.is_err());
+        let mut manifest: RunAssetManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert!(store.record_qos_intent(&mut manifest, &qos()).is_err());
         return;
     }
 
-    let root = test_temp_dir("durable-records-fifo");
+    let root = test_temp_dir("durable-journal-fifo");
     let store = RunAssetStore::new(RunAssetSink::Root(root));
-    let manifest = store.start_run_manifest("run-fifo-record").unwrap();
-    let qos_path = manifest.root.join("records/qos.jsonl");
-    let fifo_c = std::ffi::CString::new(qos_path.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-    let manifest_path = manifest.root.join("child-manifest.json");
+    let mut manifest = store.start_run_manifest("run-fifo").unwrap();
+    store.record_qos_intent(&mut manifest, &qos()).unwrap();
+    let events_path = manifest.root.join("records/events.jsonl");
+    fs::remove_file(&events_path).unwrap();
+    let fifo = std::ffi::CString::new(events_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let manifest_path = manifest.root.join("private-test-manifest.json");
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "record_stream_rejects_fifo_without_blocking",
+            "journal_append_rejects_fifo_without_blocking",
             "--nocapture",
         ])
         .env(CHILD_ROOT, manifest.root.parent().unwrap())
@@ -323,777 +226,263 @@ fn record_stream_rejects_fifo_without_blocking() {
         .spawn()
         .unwrap();
     let started = std::time::Instant::now();
-    let status = loop {
+    loop {
         if let Some(status) = child.try_wait().unwrap() {
-            break status;
+            assert!(status.success());
+            break;
         }
         if started.elapsed() >= std::time::Duration::from_secs(1) {
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!("record stream append blocked on FIFO");
+            panic!("journal append blocked on FIFO");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-
-    assert!(status.success());
+    }
 }
 
 #[cfg(unix)]
 #[test]
-fn machine_input_ledger_rejects_symlink_target() {
-    use std::os::unix::fs::symlink;
+fn private_machine_input_ledger_rejects_symlink_hardlink_and_public_mode() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let root = test_temp_dir("durable-records-ledger-symlink");
-    let store = RunAssetStore::new(RunAssetSink::Root(root));
-    let mut manifest = store.start_run_manifest("run-ledger-symlink").unwrap();
-    let outside = manifest.root.join("outside.jsonl");
-    fs::write(&outside, "").unwrap();
-    symlink(&outside, manifest.root.join("machine-inputs.jsonl")).unwrap();
-
-    let err = store
-        .record_machine_input(
-            &mut manifest,
-            "node_prompt",
-            &machine_input_record("run-ledger-symlink"),
-        )
-        .unwrap_err();
-
-    assert!(err.to_string().contains("machine input ledger"));
+    for case in ["symlink", "hardlink", "public-mode"] {
+        let root = test_temp_dir(&format!("durable-ledger-{case}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let ledger = root.join("machine-inputs.jsonl");
+        let outside = root.join("outside.jsonl");
+        fs::write(&outside, b"").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        match case {
+            "symlink" => symlink(&outside, &ledger).unwrap(),
+            "hardlink" => fs::hard_link(&outside, &ledger).unwrap(),
+            "public-mode" => {
+                fs::write(&ledger, b"").unwrap();
+                fs::set_permissions(&ledger, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let error = MachineInputLedger::at_path(&ledger)
+            .append(machine_input_record("run-ledger", "machine-input:one"))
+            .unwrap_err();
+        assert!(error.to_string().contains("machine input ledger"));
+        assert_eq!(fs::read(&outside).unwrap(), b"");
+    }
 }
 
 #[test]
-fn run_asset_records_index_manifest_and_append_source_native_facts() {
-    let root = test_temp_dir("durable-records-store");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let lock = flow_lock(&draft(), FlowCheckMode::Core).unwrap();
-    let mut manifest = store.start_run_manifest("run-records").unwrap();
+fn private_machine_input_ledger_recovers_torn_tail_idempotently() {
+    use std::os::unix::fs::PermissionsExt;
 
-    let record_index = read_record_index(&manifest.root);
-    assert_eq!(record_index["root_relative_path"], "records");
-    assert_eq!(
-        record_index["files"]["storage"]["relative_path"],
-        "records/storage.jsonl"
-    );
-    assert_eq!(record_index["files"]["storage"]["latest_sequence"], 1);
-    let lifecycle_records = read_jsonl(manifest.root.join("records/storage.jsonl"));
-    assert_eq!(lifecycle_records.len(), 1);
-    assert_eq!(
-        lifecycle_records[0]["record_id"],
-        "rec-storage-00000000000000000001"
-    );
-    assert_eq!(lifecycle_records[0]["run_id"], "run-records");
-    assert_eq!(lifecycle_records[0]["activation_id"], Value::Null);
-    assert_eq!(lifecycle_records[0]["source"], "run_assets");
-    assert_eq!(
-        lifecycle_records[0]["source_native_id"],
-        "run_asset_manifest:started"
-    );
-    assert_eq!(lifecycle_records[0]["wall_time_ms"], 1_700_000_000_123_u64);
-    assert_eq!(lifecycle_records[0]["source_sequence"], 1);
-    assert_eq!(
-        lifecycle_records[0]["fact"]["manifest_path"],
-        "manifest.json"
-    );
-
-    store
-        .persist_flow_revision(&mut manifest, &lock, "hash:abc123", "not_required")
+    let root = test_temp_dir("durable-ledger-torn");
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.join("machine-inputs.jsonl");
+    let ledger = MachineInputLedger::at_path(&path);
+    ledger
+        .append(machine_input_record("run-ledger", "machine-input:one"))
         .unwrap();
-    store
-        .record_session_association(
-            &mut manifest,
-            "host-master",
-            SessionRelation::Orchestrates,
-            None,
-        )
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(br#"{"transaction_id":"torn""#)
         .unwrap();
-    store
-        .register_expected_activation(&mut manifest, "root", "root", "tmux")
-        .unwrap();
-    store
-        .start_activation_capture(
-            &mut manifest,
-            RunAssetActivationUpdate {
-                activation_id: "root".to_string(),
-                node_id: "root".to_string(),
-                tmux: RunAssetTmuxTarget {
-                    session_id: "host-a".to_string(),
-                    window_id: "%7".to_string(),
-                    window_name: "run-records".to_string(),
-                    pane_id: "%8".to_string(),
-                },
-                adapter: "tmux".to_string(),
-                termination_reason: None,
-            },
-        )
-        .unwrap();
-    store
-        .mark_activation_capture_acknowledged(&mut manifest, "root")
-        .unwrap();
-    store
-        .complete_activation_capture(&mut manifest, "root", "contract_satisfied", "final")
-        .unwrap();
-    store
-        .record_preservation_error(
-            &mut manifest,
-            Some("root"),
-            Some("test_failure"),
-            "final_capture",
-            "capture failed after final snapshot",
-        )
-        .unwrap();
-
-    let record_index = read_record_index(&manifest.root);
-    assert_eq!(record_index["files"]["flow"]["latest_sequence"], 2);
-    assert_eq!(record_index["files"]["tmux"]["latest_sequence"], 3);
-    assert_eq!(record_index["files"]["probe"]["latest_sequence"], 4);
-    assert_eq!(record_index["files"]["preservation"]["latest_sequence"], 1);
-    assert_eq!(
-        record_index["sessions"]["host-a"]["relations"][0]["relation"],
-        "executes"
-    );
-    assert_eq!(
-        record_index["sessions"]["host-a"]["relations"][0]["activation_id"],
-        "root"
-    );
-    assert_eq!(
-        record_index["sessions"]["host-master"]["relations"][0]["relation"],
-        "orchestrates"
-    );
-    assert_eq!(
-        record_index["sessions"]["host-master"]["relations"][0]["activation_id"],
-        Value::Null
-    );
-
-    let flow_records = read_jsonl(manifest.root.join("records/flow.jsonl"));
-    assert_eq!(
-        flow_records[0]["source_native_id"],
-        "flow_revision:rev-0001:prepared"
-    );
-    assert_eq!(
-        flow_records[0]["fact"]["revision"]["apply_state"],
-        "prepared"
-    );
-    assert_eq!(
-        flow_records[1]["source_native_id"],
-        "flow_revision:rev-0001:applied"
-    );
-    assert_eq!(
-        flow_records[1]["fact"]["revision"]["apply_state"],
-        "applied"
-    );
-
-    let probe_records = read_jsonl(manifest.root.join("records/probe.jsonl"));
-    assert_eq!(probe_records[0]["fact"]["probe_state"], "planned");
-    assert_eq!(probe_records[1]["fact"]["probe_state"], "ready");
-    assert_eq!(probe_records[2]["fact"]["probe_state"], "closed");
-    assert_eq!(probe_records[3]["fact"]["probe_state"], "suspended");
-
-    let preservation_records = read_jsonl(manifest.root.join("records/preservation.jsonl"));
-    assert_eq!(
-        preservation_records[0]["fact"]["preservation_error"]["stage"],
-        "final_capture"
-    );
+    let second = machine_input_record("run-ledger", "machine-input:two");
+    ledger.append(second.clone()).unwrap();
+    ledger.append(second).unwrap();
+    let records = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MachineInputRecord>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
 }
 
 #[test]
-fn failed_flow_revision_appends_preservation_record() {
-    let root = test_temp_dir("durable-records-flow-failure");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let lock = flow_lock(&draft(), FlowCheckMode::Core).unwrap();
-    let mut manifest = store.start_run_manifest("run-flow-failed").unwrap();
-    let revision = store
-        .prepare_flow_revision(&mut manifest, &lock, "hash:abc123", "not_required")
-        .unwrap();
-
-    store
-        .mark_flow_revision_failed(&mut manifest, &revision.revision_id, "runtime apply failed")
-        .unwrap();
-
-    let record_index = read_record_index(&manifest.root);
-    assert_eq!(record_index["files"]["preservation"]["latest_sequence"], 1);
-    assert_eq!(record_index["files"]["preservation"]["record_count"], 1);
-    let preservation_records = read_jsonl(manifest.root.join("records/preservation.jsonl"));
-    assert_eq!(
-        preservation_records[0]["source_native_id"],
-        "preservation:run:1700000000123"
+fn machine_input_event_is_typed_without_prompt_or_public_ledger() {
+    let store = RunAssetStore::new_with_fixed_clock(
+        RunAssetSink::Root(test_temp_dir("durable-machine-input")),
+        1_700_000_000_123,
     );
-    assert_eq!(
-        preservation_records[0]["fact"]["preservation_error"]["stage"],
-        "flow_package"
-    );
-    assert_eq!(
-        preservation_records[0]["fact"]["preservation_error"]["error"],
-        "runtime apply failed"
-    );
-}
-
-#[test]
-fn machine_input_ledger_is_indexed_in_manifest_records() {
-    let root = test_temp_dir("durable-records-machine-input");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
     let mut manifest = store.start_run_manifest("run-machine-input").unwrap();
-    let record = MachineInputRecord {
-        run_id: "run-machine-input".to_string(),
-        activation_id: "root".to_string(),
-        pane_id: "%8".to_string(),
-        started_at_ms: 1_700_000_000_100,
-        submitted_at_ms: 1_700_000_000_120,
-        payload_hash: "fnv1a64:0000000000000001".to_string(),
-        normalized_text: "inspect".to_string(),
-        submit_key_count: 1,
-        transaction_id: "machine-input:abc".to_string(),
-        status: MachineInputStatus::Submitted,
-    };
-
+    start_activation(&store, &mut manifest);
+    let record = machine_input_record("run-machine-input", "machine-input:one");
+    store
+        .record_machine_input(&mut manifest, "node_prompt", &record)
+        .unwrap();
     store
         .record_machine_input(&mut manifest, "node_prompt", &record)
         .unwrap();
 
-    let record_index = read_record_index(&manifest.root);
-    assert_eq!(
-        record_index["files"]["machine_input_ledger"]["relative_path"],
-        "machine-inputs.jsonl"
+    let events = events_of_kind(&manifest, "machine_input.delivered");
+    assert_eq!(events.len(), 1);
+    let payload = &events[0]["data"]["payload"];
+    assert_eq!(payload["status"], "node_prompt:submitted");
+    assert_eq!(payload["content"]["sha256"], record.payload_hash);
+    assert_eq!(payload["content"]["length"], 7);
+    assert!(payload["content"].get("path").is_none());
+    let public_bytes = fs::read(manifest.root.join("records/events.jsonl")).unwrap();
+    assert!(
+        !public_bytes
+            .windows(b"inspect".len())
+            .any(|window| window == b"inspect")
     );
-    assert_eq!(
-        record_index["files"]["machine_input_ledger"]["latest_sequence"],
-        1
-    );
-    assert_eq!(
-        record_index["files"]["machine_input_ledger"]["record_count"],
-        1
-    );
+    assert!(!manifest.root.join("machine-inputs.jsonl").exists());
 }
 
 #[test]
-fn machine_input_ledger_recovers_torn_tail_before_append_and_keeps_retry_idempotent() {
-    let root = test_temp_dir("durable-records-machine-input-torn-tail");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let mut manifest = store.start_run_manifest("run-machine-input-torn").unwrap();
-    let first = machine_input_record_with_transaction(
-        "run-machine-input-torn",
-        "machine-input:abc",
-        1_700_000_000_120,
+fn route_event_is_typed_and_uses_public_refs() {
+    let store = RunAssetStore::new_with_fixed_clock(
+        RunAssetSink::Root(test_temp_dir("durable-route")),
+        1_700_000_000_123,
     );
-    let second = machine_input_record_with_transaction(
-        "run-machine-input-torn",
-        "machine-input:def",
-        1_700_000_000_220,
-    );
-    let ledger_path = manifest.root.join("machine-inputs.jsonl");
+    let mut manifest = store.start_run_manifest("run-route").unwrap();
+    let input = TopologyDecisionInput {
+        source: TopologyDecisionSource::Runtime,
+        source_native_id: "route:route-0".to_string(),
+        flow_lock_id: "flow-a".to_string(),
+        route_index: 0,
+        route_id: "route-0".to_string(),
+        predicate: "exists(artifact.ready)".to_string(),
+        for_each: None,
+        source_artifact_id: Some("artifact-ready".to_string()),
+        trigger_fact_ref: "artifact.ready".to_string(),
+        trigger_fact_version: 1,
+        planned_activation_ids: vec!["finish".to_string()],
+        applied_activation_ids: vec!["finish".to_string()],
+        causal_id: None,
+        correlation_id: None,
+    };
     store
-        .record_machine_input(&mut manifest, "node_prompt", &first)
-        .unwrap();
-    let torn_tail = br#"{"transaction_id":"machine-input:torn""#;
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&ledger_path)
-        .unwrap()
-        .write_all(torn_tail)
-        .unwrap();
-
-    store
-        .record_machine_input(&mut manifest, "node_prompt", &second)
+        .record_topology_decision(&mut manifest, input.clone())
         .unwrap();
     store
-        .record_machine_input(&mut manifest, "node_prompt", &second)
+        .record_topology_decision(&mut manifest, input)
         .unwrap();
 
-    let ledger_payload = fs::read_to_string(&ledger_path).unwrap();
-    let ledger_records = ledger_payload
-        .lines()
-        .map(|line| serde_json::from_str::<MachineInputRecord>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(ledger_records.len(), 2);
-    assert_eq!(ledger_records[0].transaction_id, "machine-input:abc");
-    assert_eq!(ledger_records[1].transaction_id, "machine-input:def");
-    assert!(!ledger_payload.contains("machine-input:torn"));
-    let record_index = read_record_index(&manifest.root);
-    assert_eq!(
-        record_index["files"]["machine_input_ledger"]["record_count"],
-        2
-    );
-    assert_eq!(
-        record_index["files"]["machine_input_ledger"]["latest_sequence"],
-        2
-    );
-    let quarantine_entries = fs::read_dir(manifest.root.join("records/quarantine"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-    assert_eq!(quarantine_entries.len(), 1);
-    assert_eq!(fs::read(&quarantine_entries[0]).unwrap(), torn_tail);
+    let events = events_of_kind(&manifest, "route.decided");
+    assert_eq!(events.len(), 1);
+    let payload = &events[0]["data"]["payload"];
+    for field in ["flow_ref", "route_ref", "trigger_ref"] {
+        assert!(payload[field].as_str().unwrap().starts_with("sha256:"));
+    }
+    assert_eq!(payload["route_index"], 0);
+    assert_eq!(payload["trigger_version"], 1);
+    let rendered = serde_json::to_string(&events).unwrap();
+    assert!(!rendered.contains("run-route"));
+    assert!(!rendered.contains("artifact-ready"));
 }
 
 #[test]
-fn direct_machine_input_ledger_append_recovers_torn_tail_and_keeps_retry_idempotent() {
-    let root = test_temp_dir("durable-records-direct-machine-input-torn-tail");
-    fs::create_dir_all(&root).unwrap();
-    let ledger_path = root.join("machine-inputs.jsonl");
-    let ledger = MachineInputLedger::at_path(&ledger_path);
-    let first = machine_input_record_with_transaction(
-        "run-direct-machine-input-torn",
-        "machine-input:abc",
-        1_700_000_000_120,
+fn native_session_lifecycle_is_exactly_once_across_two_compaction_cycles() {
+    let store = RunAssetStore::new_with_fixed_clock(
+        RunAssetSink::Root(test_temp_dir("durable-session")),
+        1_700_000_000_123,
     );
-    let second = machine_input_record_with_transaction(
-        "run-direct-machine-input-torn",
-        "machine-input:def",
-        1_700_000_000_220,
-    );
-    ledger.append(first).unwrap();
-    let torn_tail = br#"{"transaction_id":"machine-input:torn""#;
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&ledger_path)
-        .unwrap()
-        .write_all(torn_tail)
-        .unwrap();
-
-    ledger.append(second.clone()).unwrap();
-    ledger.append(second).unwrap();
-
-    let ledger_payload = fs::read_to_string(&ledger_path).unwrap();
-    let ledger_records = ledger_payload
-        .lines()
-        .map(|line| serde_json::from_str::<MachineInputRecord>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(ledger_records.len(), 2);
-    assert_eq!(ledger_records[0].transaction_id, "machine-input:abc");
-    assert_eq!(ledger_records[1].transaction_id, "machine-input:def");
-    assert!(!ledger_payload.contains("machine-input:torn"));
-    let quarantine_entries = fs::read_dir(root.join("records/quarantine"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-    assert_eq!(quarantine_entries.len(), 1);
-    assert_eq!(fs::read(&quarantine_entries[0]).unwrap(), torn_tail);
-}
-
-#[test]
-fn machine_input_ledger_rebuild_rejects_interior_corruption() {
-    let root = test_temp_dir("durable-records-machine-input-interior-corruption");
-    let store = RunAssetStore::new_with_fixed_clock(RunAssetSink::Root(root), 1_700_000_000_123);
-    let mut manifest = store
-        .start_run_manifest("run-machine-input-corruption")
-        .unwrap();
-    let first = machine_input_record("run-machine-input-corruption");
-    let second = machine_input_record_with_transaction(
-        "run-machine-input-corruption",
-        "machine-input:def",
-        1_700_000_000_220,
-    );
-    store
-        .record_machine_input(&mut manifest, "node_prompt", &first)
-        .unwrap();
-    let ledger_path = manifest.root.join("machine-inputs.jsonl");
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&ledger_path)
-        .unwrap();
-    file.write_all(b"{not-json}\n").unwrap();
-    file.write_all(serde_json::to_string(&second).unwrap().as_bytes())
-        .unwrap();
-    file.write_all(b"\n").unwrap();
-    drop(file);
-    fs::remove_file(manifest.root.join("records/index.json")).unwrap();
-
-    let err = store.rebuild_record_index(&manifest).unwrap_err();
-
-    assert!(err.to_string().contains("parse machine input ledger"));
-    assert!(!manifest.root.join("records/quarantine").exists());
-}
-
-#[test]
-fn mcp_records_runtime_delivery_hook_and_session_context_generation() {
-    let root = test_temp_dir("durable-records-mcp");
-    let mut server = McpServer::with_tmux_runner_and_run_asset_store(
-        RecordingRunner::default(),
-        RunAssetStore::new(RunAssetSink::Root(root)),
-    );
-
-    call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-mcp-records",
-            "nodes": ["root"],
-            "qos": {
-                "urgency": "interactive",
-                "completion_target": "summary.ready"
-            }
-        }),
-    );
-    call_tool(
-        &mut server,
-        2,
-        "deliver_artifact",
-        json!({
-            "run_id": "run-mcp-records",
-            "activation_id": "root",
-            "artifact_key": "summary",
-            "payload": "ready"
-        }),
-    );
-    let pending = call_tool(
-        &mut server,
-        3,
-        "record_hook_fact",
-        json!({
-            "run_id": "run-mcp-records",
-            "session_id": "host-a",
-            "activation_id": "root",
-            "hook": "compaction_pending",
-            "source_native_id": "hook-1",
-            "payload": {
-                "reason": "token_budget"
-            }
-        }),
-    );
-    let finished = call_tool(
-        &mut server,
-        4,
-        "record_hook_fact",
-        json!({
-            "run_id": "run-mcp-records",
-            "session_id": "host-a",
-            "hook": "compaction_finished",
-            "source_native_id": "hook-2",
-            "payload": {
-                "summary_artifact": "artifact.summary"
-            }
-        }),
-    );
-
-    assert_eq!(structured(&pending)["context_generation"], 0);
-    assert_eq!(structured(&finished)["context_generation"], 1);
-
-    let context = call_tool(
-        &mut server,
-        5,
-        "get_context",
-        json!({
-            "run_id": "run-mcp-records"
-        }),
-    );
-    let manifest = &structured(&context)["context"]["run_assets"];
-    let run_root = PathBuf::from(manifest["root"].as_str().unwrap());
-
-    assert_eq!(
-        manifest["records"]["files"]["runtime"]["latest_sequence"],
-        2
-    );
-    assert_eq!(
-        manifest["records"]["files"]["delivery"]["latest_sequence"],
-        3
-    );
-    assert_eq!(manifest["records"]["files"]["delivery"]["record_count"], 1);
-    assert_eq!(manifest["records"]["files"]["hook"]["latest_sequence"], 2);
-    assert_eq!(manifest["records"]["files"]["qos"]["latest_sequence"], 1);
-    assert_eq!(
-        manifest["records"]["sessions"]["host-a"]["context_generation"],
-        1
-    );
-    assert_eq!(
-        manifest["records"]["sessions"]["host-a"]["relations"][0]["relation"],
-        "executes"
-    );
-    assert_eq!(
-        manifest["records"]["sessions"]["host-a"]["relations"][0]["activation_id"],
-        "root"
-    );
-
-    let runtime_records = read_jsonl(run_root.join("records/runtime.jsonl"));
-    assert_eq!(runtime_records[0]["fact"]["event"]["kind"], "run_started");
-    assert_eq!(
-        runtime_records[1]["fact"]["event"]["kind"],
-        "node_activated"
-    );
-
-    let delivery_records = read_jsonl(run_root.join("records/delivery.jsonl"));
-    assert_eq!(
-        delivery_records[0]["fact"]["event"]["kind"],
-        "artifact_delivered"
-    );
-    assert_eq!(
-        delivery_records[0]["fact"]["event"]["payload"]["artifact_key"],
-        "summary"
-    );
-
-    let hook_records = read_jsonl(run_root.join("records/hook.jsonl"));
-    assert_eq!(hook_records[0]["fact"]["hook"], "compaction_pending");
-    assert_eq!(hook_records[0]["fact"]["context_generation"], 0);
-    assert_eq!(hook_records[1]["fact"]["hook"], "compaction_finished");
-    assert_eq!(hook_records[1]["fact"]["context_generation"], 1);
-
-    let qos_records = read_jsonl(run_root.join("records/qos.jsonl"));
-    assert_eq!(qos_records[0]["source_native_id"], "qos:run_intent");
-    assert_eq!(qos_records[0]["fact"]["qos"]["urgency"], "interactive");
-    assert_eq!(
-        qos_records[0]["fact"]["qos"]["completion_target"],
-        "summary.ready"
-    );
-}
-
-#[test]
-fn mcp_rejects_invalid_hook_and_runtime_qos_inputs() {
-    let root = test_temp_dir("durable-records-mcp-validation");
-    let mut server = McpServer::with_tmux_runner_and_run_asset_store(
-        RecordingRunner::default(),
-        RunAssetStore::new(RunAssetSink::Root(root)),
-    );
-    call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-hook-validation",
-            "nodes": ["root"]
-        }),
-    );
-
-    for (id, arguments, expected) in [
-        (
-            2,
-            json!({
-                "run_id": "run-hook-validation",
-                "session_id": "",
-                "hook": "compaction_pending"
-            }),
-            "session_id must be non-empty",
-        ),
-        (
-            3,
-            json!({
-                "run_id": "run-hook-validation",
-                "session_id": "host-a",
-                "hook": "unknown_hook"
-            }),
-            "hook must be a documented hook name or namespaced extension",
-        ),
-        (
-            4,
-            json!({
-                "run_id": "run-hook-validation",
-                "session_id": "host-a",
-                "hook": "vendor.custom_hook",
-                "source_native_id": ""
-            }),
-            "source_native_id must be non-empty",
-        ),
-        (
-            5,
-            json!({
-                "run_id": "run-hook-validation",
-                "session_id": "host-a",
-                "activation_id": "missing",
-                "hook": "compaction_pending"
-            }),
-            "activation not found",
-        ),
-        (
-            6,
-            json!({
-                "run_id": "run-hook-validation",
-                "session_id": "host-a",
-                "hook": "compaction_pending",
-                "payload": "x".repeat(70000)
-            }),
-            "payload exceeds",
-        ),
-    ] {
-        let response = call_tool(&mut server, id, "record_hook_fact", arguments);
-        assert!(
-            rpc_error_message(&response).contains(expected),
-            "{response}"
-        );
+    let mut manifest = store.start_run_manifest("run-session").unwrap();
+    for _ in 0..2 {
+        store
+            .record_session_association(
+                &mut manifest,
+                "native-session",
+                SessionRelation::Orchestrates,
+                None,
+                "codex",
+                None,
+            )
+            .unwrap();
+        store
+            .record_session_association(
+                &mut manifest,
+                "native-session",
+                SessionRelation::Executes,
+                Some("root"),
+                "codex",
+                None,
+            )
+            .unwrap();
+    }
+    for cycle in 0..2 {
+        for (hook, suffix) in [
+            ("compaction_pending", "start"),
+            ("compaction_finished", "finish"),
+        ] {
+            store
+                .record_hook_fact(
+                    &mut manifest,
+                    HookFactInput {
+                        session_id: "native-session".to_string(),
+                        activation_id: Some("root".to_string()),
+                        hook: hook.to_string(),
+                        source_native_id: format!("compaction-{cycle}-{suffix}"),
+                        detail: HookFactDetail::Compaction,
+                        causal_id: None,
+                        correlation_id: Some(format!("compaction-{cycle}")),
+                    },
+                )
+                .unwrap();
+        }
+    }
+    for _ in 0..2 {
+        store
+            .record_session_association(
+                &mut manifest,
+                "native-session",
+                SessionRelation::Ended,
+                Some("root"),
+                "codex",
+                Some(0),
+            )
+            .unwrap();
     }
 
-    let bad_qos = call_tool(
-        &mut server,
-        7,
-        "start_run",
-        json!({
-            "run_id": "run-bad-qos",
-            "nodes": ["root"],
-            "qos": {
-                "urgency": "interactive",
-                "completion_target": ""
-            }
-        }),
-    );
-    assert!(rpc_error_message(&bad_qos).contains("qos.completion_target must be non-empty"));
+    assert_eq!(events_of_kind(&manifest, "agent_session.started").len(), 1);
+    assert_eq!(events_of_kind(&manifest, "agent_session.bound").len(), 1);
+    assert_eq!(events_of_kind(&manifest, "agent_session.ended").len(), 1);
+    let started = events_of_kind(&manifest, "context_compaction.started")
+        .into_iter()
+        .map(|event| {
+            event["data"]["payload"]["context_generation"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let finished = events_of_kind(&manifest, "context_compaction.finished")
+        .into_iter()
+        .map(|event| {
+            event["data"]["payload"]["context_generation"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(started, vec![0, 1]);
+    assert_eq!(finished, vec![1, 2]);
+    let rendered = serde_json::to_string(&journal_events(&manifest)).unwrap();
+    assert!(!rendered.contains("native-session"));
 }
 
 #[test]
-fn mcp_record_hook_unknown_run_does_not_create_run_assets() {
-    let root = test_temp_dir("durable-records-unknown-hook-run");
+fn operator_mcp_hides_hook_only_tools_without_creating_runs() {
+    let root = test_temp_dir("durable-hidden-hooks");
     let store = RunAssetStore::new(RunAssetSink::Root(root));
-    let unknown_run_root = store.run_root("run-missing-hook").unwrap();
+    let missing = store.run_root("run-missing").unwrap();
     let mut server =
         McpServer::with_tmux_runner_and_run_asset_store(RecordingRunner::default(), store);
-
     let response = call_tool(
         &mut server,
         1,
         "record_hook_fact",
         json!({
-            "run_id": "run-missing-hook",
-            "session_id": "host-a",
-            "hook": "compaction_pending",
-            "source_native_id": "hook-missing-run"
+            "run_id": "run-missing",
+            "session_id": "native-session",
+            "hook": "compaction_pending"
         }),
     );
-
-    assert!(rpc_error_message(&response).contains("run not found"));
-    assert!(!unknown_run_root.exists(), "{}", unknown_run_root.display());
+    assert_eq!(response["error"]["message"], "unknown tool");
+    assert!(!missing.exists());
 }
 
-#[test]
-fn mcp_records_explicit_fanout_and_route_topology_decisions() {
-    let root = test_temp_dir("durable-records-topology");
-    let mut server = McpServer::with_tmux_runner_and_run_asset_store(
-        RecordingRunner::default(),
-        RunAssetStore::new(RunAssetSink::Root(root)),
-    );
-
-    call_tool(
-        &mut server,
-        1,
-        "start_run",
-        json!({
-            "run_id": "run-explicit-fanout",
-            "nodes": ["root"]
-        }),
-    );
-    call_tool(
-        &mut server,
-        2,
-        "deliver_artifact",
-        json!({
-            "run_id": "run-explicit-fanout",
-            "activation_id": "root",
-            "artifact_key": "items",
-            "payload": "alpha\nbeta"
-        }),
-    );
-    call_tool(
-        &mut server,
-        3,
-        "fanout_from_artifact",
-        json!({
-            "run_id": "run-explicit-fanout",
-            "node_id": "process",
-            "artifact_key": "items",
-            "for_each": "items"
-        }),
-    );
-    let explicit_context = call_tool(
-        &mut server,
-        4,
-        "get_context",
-        json!({
-            "run_id": "run-explicit-fanout"
-        }),
-    );
-    let explicit_manifest = &structured(&explicit_context)["context"]["run_assets"];
-    let explicit_root = PathBuf::from(explicit_manifest["root"].as_str().unwrap());
-    assert_eq!(
-        explicit_manifest["records"]["files"]["topology"]["latest_sequence"],
-        1
-    );
-    let fanout_records = read_jsonl(explicit_root.join("records/topology.jsonl"));
-    assert_eq!(
-        fanout_records[0]["source_native_id"],
-        "fanout:process:items"
-    );
-    assert_eq!(
-        fanout_records[0]["fact"]["decision"],
-        "fanout_from_artifact"
-    );
-    assert_eq!(fanout_records[0]["fact"]["node_id"], "process");
-    assert_eq!(fanout_records[0]["fact"]["source_artifact"]["key"], "items");
-    assert_eq!(
-        fanout_records[0]["fact"]["planned_activation_ids"],
-        json!(["process:items/0", "process:items/1"])
-    );
-    assert_eq!(
-        fanout_records[0]["fact"]["applied_activation_ids"],
-        json!(["process:items/0", "process:items/1"])
-    );
-    assert_eq!(
-        fanout_records[0]["causal_id"],
-        fanout_records[0]["fact"]["source_artifact"]["artifact_id"]
-    );
-
-    let (lock_id, content_hash) = lock_flow(&mut server, 5, valid_flow());
-    let route_started = call_tool(
-        &mut server,
-        6,
-        "run_flow",
-        json!({
-            "run_id": "run-route-decision",
-            "flow_lock_id": lock_id,
-            "content_hash": content_hash,
-            "review_required": false
-        }),
-    );
-    assert_eq!(structured(&route_started)["ok"], true);
-    call_tool(
-        &mut server,
-        7,
-        "deliver_artifact",
-        json!({
-            "run_id": "run-route-decision",
-            "activation_id": "root",
-            "artifact_key": "ready",
-            "payload": "true"
-        }),
-    );
-    call_tool(
-        &mut server,
-        8,
-        "observe_stop",
-        json!({
-            "run_id": "run-route-decision",
-            "activation_id": "root",
-            "reason": "root done"
-        }),
-    );
-    let route_context = call_tool(
-        &mut server,
-        9,
-        "get_context",
-        json!({
-            "run_id": "run-route-decision"
-        }),
-    );
-    let route_manifest = &structured(&route_context)["context"]["run_assets"];
-    let route_root = PathBuf::from(route_manifest["root"].as_str().unwrap());
-    assert_eq!(
-        route_manifest["records"]["files"]["topology"]["latest_sequence"],
-        1
-    );
-    let route_records = read_jsonl(route_root.join("records/topology.jsonl"));
-    assert_eq!(route_records[0]["source_native_id"], "route:route-0");
-    assert_eq!(route_records[0]["fact"]["decision"], "route_applied");
-    assert_eq!(route_records[0]["fact"]["route"]["route_index"], 0);
-    assert_eq!(route_records[0]["fact"]["route"]["route_id"], "route-0");
-    assert_eq!(
-        route_records[0]["fact"]["route"]["predicate"],
-        "exists(artifact.ready)"
-    );
-    assert_eq!(
-        route_records[0]["fact"]["planned_activation_ids"],
-        json!(["finish"])
-    );
-    assert_eq!(
-        route_records[0]["fact"]["applied_activation_ids"],
-        json!(["finish"])
-    );
-    assert_eq!(route_records[0]["fact"]["source_artifact"]["key"], "ready");
-    assert_eq!(
-        route_records[0]["causal_id"],
-        route_records[0]["fact"]["source_artifact"]["artifact_id"]
-    );
+fn _assert_path_is_relative(path: &Path) {
+    assert!(!path.is_absolute());
 }
