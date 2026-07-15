@@ -14,6 +14,10 @@ fn main() {
 
 fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    if matches!(raw_args.as_slice(), [arg] if arg == "--version") {
+        println!("humanize-plugin-driver {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if raw_args.first().is_some_and(|arg| arg == "--pipe-sink") {
         return run_pipe_sink(&raw_args[1..]);
     }
