@@ -564,7 +564,7 @@ fn validate_directory_file(file: &File, private: bool) -> Result<(), SecureFsErr
     let metadata = file
         .metadata()
         .map_err(|error| SecureFsError::from_io("inspect directory descriptor", error))?;
-    if !metadata.file_type().is_dir() || metadata.nlink() < 2 {
+    if !metadata.file_type().is_dir() {
         return Err(SecureFsError::new(
             "directory descriptor is not a real directory",
         ));
@@ -648,4 +648,20 @@ fn temporary_name(target: &OsStr, tag: &str) -> OsString {
         .as_bytes(),
     );
     OsString::from_vec(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn non_private_directory_path_accepts_single_link_directory_fds() {
+        let path = Path::new("/proc/sys");
+        let metadata = fs::metadata(path).expect("/proc/sys should be available on Linux");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.nlink(), 1);
+
+        open_dir_path(path, false, false).expect("single-link directory fd should be accepted");
+    }
 }
