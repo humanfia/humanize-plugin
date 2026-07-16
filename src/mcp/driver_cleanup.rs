@@ -135,11 +135,10 @@ pub(super) fn persist_private_mcp_diagnostic(run_root: &Path, kind: &str, detail
     let Ok(runtime_root) = runtime_root_for_run_root(run_root) else {
         return false;
     };
-    append_private_line(
-        &private_driver_dir(&runtime_root, run_root).join("mcp-diagnostics.jsonl"),
-        &line,
-    )
-    .is_ok()
+    let Ok(driver_dir) = private_driver_dir(&runtime_root, run_root) else {
+        return false;
+    };
+    append_private_line(&driver_dir.join("mcp-diagnostics.jsonl"), &line).is_ok()
 }
 
 fn public_error_object(response: &mut Value) -> &mut Map<String, Value> {

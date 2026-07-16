@@ -100,10 +100,7 @@ pub struct DriverPaneConfig {
 impl DriverConfig {
     pub fn socket_path(&self) -> io::Result<PathBuf> {
         let run_root = self.run_root()?;
-        Ok(socket_path_for_run_root(
-            &runtime_root_for_run_root(&run_root)?,
-            &run_root,
-        ))
+        socket_path_for_run_root(&runtime_root_for_run_root(&run_root)?, &run_root)
     }
 
     fn run_root(&self) -> io::Result<PathBuf> {
@@ -113,8 +110,8 @@ impl DriverConfig {
     }
 }
 
-pub fn socket_path_for_run_root(runtime_root: &Path, run_root: &Path) -> PathBuf {
-    private_run_root_for_run_root(runtime_root, run_root).join("s")
+pub fn socket_path_for_run_root(runtime_root: &Path, run_root: &Path) -> io::Result<PathBuf> {
+    Ok(crate::private_state::private_run_root_for_socket_path(runtime_root, run_root)?.join("s"))
 }
 
 pub fn run_driver(config: DriverConfig) -> io::Result<()> {
@@ -495,7 +492,7 @@ struct RuntimeDriverService {
 impl RuntimeDriverService {
     fn load(config: DriverConfig) -> io::Result<Self> {
         let run_root = config.run_root()?;
-        let private_run_root = private_run_root_for_run_root(&config.runtime_root, &run_root);
+        let private_run_root = private_run_root_for_run_root(&config.runtime_root, &run_root)?;
         let run_asset_store = RunAssetStore::new_driver_owned(
             RunAssetSink::HumanizeRunsDir(config.runs_root.clone()),
             config.runtime_root.clone(),
@@ -518,6 +515,9 @@ impl RuntimeDriverService {
                 .authorize(&review_store)
                 .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.message))?;
         }
+        let capture_root = run_asset_store
+            .activation_capture_root(&manifest)
+            .map_err(|err| io::Error::other(err.to_string()))?;
         let tmux_pipe_captures = std::mem::take(&mut replay.pipe_captures)
             .into_iter()
             .map(|(activation_id, (allocation_generation, descriptor))| {
@@ -525,10 +525,7 @@ impl RuntimeDriverService {
                     activation_id,
                     (
                         allocation_generation,
-                        TmuxPipeCapture::from_descriptor(
-                            run_asset_store.activation_capture_root(&manifest),
-                            descriptor,
-                        ),
+                        TmuxPipeCapture::from_descriptor(capture_root.clone(), descriptor),
                     ),
                 )
             })

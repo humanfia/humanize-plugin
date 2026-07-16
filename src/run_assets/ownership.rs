@@ -91,7 +91,8 @@ fn discover_owned_tmux_panes(runs_root: &Path) -> Result<Vec<OwnedTmuxPane>, Run
             .map_err(|err| RunAssetError::new(err.to_string()))?;
     for identity in identities {
         let private_driver_dir =
-            crate::state_path::private_run_root(&runtime_root, &identity.public_run_root)
+            crate::private_state::private_run_root(&runtime_root, &identity.public_run_root)
+                .map_err(|err| RunAssetError::new(err.to_string()))?
                 .join("driver");
         owned.extend(live_private_panes(
             &private_driver_dir,

@@ -3,6 +3,8 @@
 mod driver_flows;
 #[path = "support/driver_tmux.rs"]
 mod driver_tmux_support;
+#[path = "driver_mutation_consistency/prompt_lifecycle.rs"]
+mod prompt_lifecycle;
 #[path = "driver_mutation_consistency/publication.rs"]
 mod publication;
 
@@ -582,182 +584,6 @@ fn bind_death_after_agent_enter_exposes_ambiguity_without_resend() {
 }
 
 #[test]
-fn bind_death_after_prompt_enter_exposes_ambiguity_without_resend() {
-    let fixture = DriverFixture::new("driver-bind-prompt-enter-death");
-    let run_id = "run-bind-prompt-enter-death";
-    let crashing_tmux = fixture.fake_tmux_for_bind_crash("prompt_enter");
-    let crashing_tmux_value = crashing_tmux.to_string_lossy().to_string();
-    let mut driver = fixture.spawn_with_env(
-        run_id,
-        &[
-            ("HUMANIZE_TMUX_BIN", &crashing_tmux_value),
-            ("HUMANIZE_DRIVER_AGENT_READY_TIMEOUT_MS", "500"),
-        ],
-    );
-    let request = fixture.initial_agent_bind_request(run_id);
-
-    let response: Value =
-        serde_json::from_str(&fixture.request_until_disconnect(request.clone())).unwrap();
-    assert_eq!(response["ok"], true, "{response}");
-    assert_eq!(
-        response["tmux"]["actuation"]["warnings"][0]["status"],
-        "readiness_pending"
-    );
-    driver.wait_for_exit(Duration::from_secs(4));
-    assert_eq!(fixture.agent_launch_count(), 1);
-    assert_eq!(
-        fixture.tmux_log_text().matches("Create the brief.").count(),
-        1
-    );
-
-    let stable_tmux = fixture.fake_tmux(false);
-    let stable_tmux_value = stable_tmux.to_string_lossy().to_string();
-    let mut restarted =
-        fixture.spawn_with_env(run_id, &[("HUMANIZE_TMUX_BIN", &stable_tmux_value)]);
-    let recovered = fixture.request(request);
-    assert_eq!(recovered["ok"], true, "{recovered}");
-    assert_eq!(
-        recovered["tmux"]["actuation"]["warnings"][0]["role"],
-        "node_prompt"
-    );
-    assert_eq!(fixture.agent_launch_count(), 1);
-    assert_eq!(
-        fixture.tmux_log_text().matches("Create the brief.").count(),
-        1
-    );
-    restarted.shutdown();
-}
-
-#[test]
-fn prompt_death_exposes_barrier_and_submitted_resolution_survives_restart() {
-    let fixture = DriverFixture::new("driver-prompt-death-ambiguity");
-    RunAssetStore::new(RunAssetSink::HumanizeRunsDir(fixture.root.join("runs")))
-        .start_run_manifest("run-prompt-death-ambiguity")
-        .unwrap();
-    let killing_tmux = fixture.fake_tmux_kills_driver_after_prompt_enter();
-    let killing_tmux_value = killing_tmux.to_string_lossy().to_string();
-    let mut driver = fixture.spawn_with_env(
-        "run-prompt-death-ambiguity",
-        &[
-            ("HUMANIZE_TMUX_BIN", &killing_tmux_value),
-            ("HUMANIZE_DRIVER_AGENT_READY_TIMEOUT_MS", "500"),
-        ],
-    );
-    fixture.bind(
-        &mut driver,
-        "run-prompt-death-ambiguity",
-        manual_flow(NodeDriver::Agent),
-        Some(fixture.tmux_request()),
-    );
-
-    let response: Value = serde_json::from_str(&fixture.request_until_disconnect(json!({
-        "id": "activate-agent-before-prompt-death",
-        "token": fixture.token,
-        "op": "activate",
-        "run_id": "run-prompt-death-ambiguity",
-        "node_id": "manual"
-    })))
-    .unwrap();
-    assert_eq!(response["ok"], true, "{response}");
-    assert_eq!(
-        response["actuation"]["warnings"][0]["status"],
-        "readiness_pending"
-    );
-    driver.wait_for_exit(Duration::from_secs(4));
-    assert_eq!(fixture.agent_launch_count(), 1);
-    assert_eq!(
-        fixture
-            .tmux_log_text()
-            .matches("Inspect the manual node.")
-            .count(),
-        1
-    );
-
-    let stable_tmux = fixture.fake_tmux(false);
-    let stable_tmux_value = stable_tmux.to_string_lossy().to_string();
-    let mut restarted = fixture.spawn_with_env(
-        "run-prompt-death-ambiguity",
-        &[
-            ("HUMANIZE_TMUX_BIN", &stable_tmux_value),
-            ("HUMANIZE_DRIVER_AGENT_READY_TIMEOUT_MS", "50"),
-        ],
-    );
-    let resumed = fixture.request(json!({
-        "id": "resume-prompt-ambiguity",
-        "token": fixture.token,
-        "op": "resume",
-        "run_id": "run-prompt-death-ambiguity"
-    }));
-    assert_eq!(resumed["ok"], true, "{resumed}");
-    assert_eq!(resumed["actuation"]["warnings"][0]["role"], "node_prompt");
-    assert_eq!(fixture.agent_launch_count(), 1);
-    assert_eq!(
-        fixture
-            .tmux_log_text()
-            .matches("Inspect the manual node.")
-            .count(),
-        1
-    );
-    let ambiguous = fixture.status("run-prompt-death-ambiguity");
-    let started_event_sequence =
-        ambiguous["context"]["ambiguous_deliveries"][0]["started_event_sequence"]
-            .as_u64()
-            .unwrap();
-
-    let resolved = fixture.request(json!({
-        "id": "resolve-prompt-as-submitted",
-        "token": fixture.token,
-        "op": "resume",
-        "run_id": "run-prompt-death-ambiguity",
-        "delivery_resolution": {
-            "started_event_sequence": started_event_sequence,
-            "outcome": "submitted",
-            "evidence": "receiver acknowledged the prompt transaction"
-        }
-    }));
-    assert_eq!(resolved["ok"], true, "{resolved}");
-    assert_eq!(
-        resolved["delivery_resolution"]["started_event_sequence"],
-        started_event_sequence
-    );
-    assert_eq!(resolved["delivery_resolution"]["role"], "node_prompt");
-    assert_eq!(resolved["delivery_resolution"]["outcome"], "submitted");
-    assert_eq!(
-        fixture.status("run-prompt-death-ambiguity")["context"]["ambiguous_deliveries"],
-        json!([])
-    );
-    restarted.crash();
-
-    let calls_before_second_restart = fixture.tmux_log_text();
-    let mut replayed = fixture.spawn_with_env(
-        "run-prompt-death-ambiguity",
-        &[("HUMANIZE_TMUX_BIN", &stable_tmux_value)],
-    );
-    assert_eq!(
-        fixture.status("run-prompt-death-ambiguity")["context"]["ambiguous_deliveries"],
-        json!([])
-    );
-    let resumed_after_restart = fixture.request(json!({
-        "id": "resume-after-submitted-resolution-replay",
-        "token": fixture.token,
-        "op": "resume",
-        "run_id": "run-prompt-death-ambiguity"
-    }));
-    assert_eq!(resumed_after_restart["ok"], true, "{resumed_after_restart}");
-    let input_before = calls_before_second_restart
-        .lines()
-        .filter(|line| line.starts_with("send-keys "))
-        .collect::<Vec<_>>();
-    let calls_after_second_restart = fixture.tmux_log_text();
-    let input_after = calls_after_second_restart
-        .lines()
-        .filter(|line| line.starts_with("send-keys "))
-        .collect::<Vec<_>>();
-    assert_eq!(input_after, input_before);
-    replayed.shutdown();
-}
-
-#[test]
 fn fixture_drop_stops_and_waits_capture_helpers_after_driver_crash() {
     let (root, identity) = {
         let fixture = DriverFixture::new("driver-fixture-capture-cleanup");
@@ -968,11 +794,15 @@ impl DriverFixture {
     }
 
     fn tmux_request(&self) -> Value {
+        self.tmux_request_with_agent_command("humanize-test-agent")
+    }
+
+    fn tmux_request_with_agent_command(&self, agent_command: &str) -> Value {
         json!({
             "enabled": true,
             "session": "host-a",
             "window": "flow-a",
-            "agent_command": "humanize-test-agent"
+            "agent_command": agent_command
         })
     }
 
@@ -1000,6 +830,7 @@ impl DriverFixture {
 
     fn socket_path(&self, run_id: &str) -> PathBuf {
         socket_path_for_run_root(&self.root.join("runtime"), &self.run_root(run_id))
+            .expect("driver socket path should resolve")
     }
 
     fn run_root(&self, run_id: &str) -> PathBuf {
@@ -1081,13 +912,16 @@ printf '%s\n' "$*" >> "$root/tmux.log"
 target=''
 previous=''
 last=''
+buffer=''
 for arg in "$@"; do
   if test "$previous" = '-t'; then target="$arg"; fi
+  if test "$previous" = '-b'; then buffer="$arg"; fi
   previous="$arg"
   last="$arg"
 done
 load_ready_environment() {{
-  eval "set -- $last"
+  command="$1"
+  eval "set -- $command"
   if test "$1" = 'env'; then shift; fi
   while test "$#" -gt 0; do
     case "$1" in
@@ -1095,6 +929,24 @@ load_ready_environment() {{
       *) break ;;
     esac
   done
+}}
+handle_input() {{
+  input="$1"
+  case "$input" in
+    *humanize-test-agent*|*codex*)
+      if test "$agent_ready" = 'yes'; then
+        load_ready_environment "$input"
+        pending="$root/hook-helper-${{target##*.}}-$$.pending"
+        done="${{pending%.pending}}.done"
+        : > "$pending"
+        (
+          printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
+            HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="${{target##*.}}" '{}' --agent-ready-hook --source codex_session_start
+          mv "$pending" "$done"
+        ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
+      fi
+      ;;
+  esac
 }}
 case "$1" in
   has-session)
@@ -1118,24 +970,28 @@ case "$1" in
     "$root/fake-pipe-capture" start "$root" "${{pane#%}}" "$last"
     ;;
   capture-pane)
-    printf 'final capture for %s\n' "$target"
-    ;;
-  send-keys)
-    case "$*" in
-      *humanize-test-agent*)
-        if test "$agent_ready" = 'yes'; then
-          load_ready_environment
-          pending="$root/hook-helper-${{target##*.}}-$$.pending"
-          done="${{pending%.pending}}.done"
-          : > "$pending"
-          (
-            printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
-              HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="${{target##*.}}" '{}' --agent-ready-hook --source codex_session_start
-            mv "$pending" "$done"
-          ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
-        fi
+    case "$HUMANIZE_TEST_CODEX_CAPTURE" in
+      case_variant)
+        printf 'OpenAI Codex (v0.144.4)\nmodel: test-model\ndirectory: /tmp\npermissions: test\nWORKING (0s - ESC TO INTERRUPT)\n'
+        ;;
+      missing_marker)
+        printf 'OpenAI Codex (v0.144.4)\nmodel: test-model\ndirectory: /tmp\npermissions: test\n'
+        ;;
+      *)
+        printf 'final capture for %s\n' "$target"
         ;;
     esac
+    ;;
+  set-buffer)
+    printf '%s' "$last" > "$root/tmux-buffer-$buffer"
+    ;;
+  paste-buffer)
+    input="$(cat "$root/tmux-buffer-$buffer")"
+    rm -f "$root/tmux-buffer-$buffer"
+    handle_input "$input"
+    ;;
+  send-keys)
+    handle_input "$last"
     ;;
   kill-pane)
     pane="${{target##*.}}"
@@ -1165,13 +1021,16 @@ printf '%s\n' "$*" >> "$root/tmux.log"
 target=''
 previous=''
 last=''
+buffer=''
 for arg in "$@"; do
   if test "$previous" = '-t'; then target="$arg"; fi
+  if test "$previous" = '-b'; then buffer="$arg"; fi
   previous="$arg"
   last="$arg"
 done
 load_ready_environment() {{
-  eval "set -- $last"
+  command="$1"
+  eval "set -- $command"
   if test "$1" = 'env'; then shift; fi
   while test "$#" -gt 0; do
     case "$1" in
@@ -1179,6 +1038,26 @@ load_ready_environment() {{
       *) break ;;
     esac
   done
+}}
+handle_input() {{
+  input="$1"
+  case "$input" in
+    *humanize-test-agent*)
+      : > "$root/agent-input-started"
+      load_ready_environment "$input"
+      pending="$root/hook-helper-${{target##*.}}-$$.pending"
+      done="${{pending%.pending}}.done"
+      : > "$pending"
+      (
+        printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
+          HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="${{target##*.}}" '{}' --agent-ready-hook --source codex_session_start
+        mv "$pending" "$done"
+      ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
+      ;;
+    *'Create the brief.'*)
+      : > "$root/prompt-input-started"
+      ;;
+  esac
 }}
 case "$1" in
   has-session)
@@ -1204,30 +1083,15 @@ case "$1" in
     printf 'final capture for %s\n' "$target"
     ;;
   set-buffer)
-    case "$last" in
-      *'Create the brief.'*)
-        : > "$root/prompt-input-started"
-        ;;
-    esac
+    printf '%s' "$last" > "$root/tmux-buffer-$buffer"
+    ;;
+  paste-buffer)
+    input="$(cat "$root/tmux-buffer-$buffer")"
+    rm -f "$root/tmux-buffer-$buffer"
+    handle_input "$input"
     ;;
   send-keys)
-    case "$*" in
-      *humanize-test-agent*)
-        : > "$root/agent-input-started"
-        load_ready_environment
-        pending="$root/hook-helper-${{target##*.}}-$$.pending"
-        done="${{pending%.pending}}.done"
-        : > "$pending"
-        (
-          printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
-            HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="${{target##*.}}" '{}' --agent-ready-hook --source codex_session_start
-          mv "$pending" "$done"
-        ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
-        ;;
-      *'Create the brief.'*)
-        : > "$root/prompt-input-started"
-        ;;
-    esac
+    handle_input "$last"
     if test "$last" = 'Enter' && test -f "$root/agent-input-started"; then
       rm -f "$root/agent-input-started"
       if test "$stage" = 'agent_enter'; then kill -KILL "$PPID"; fi
@@ -1323,13 +1187,16 @@ printf '%s\n' "$*" >> "$root/tmux.log"
 target=''
 previous=''
 last=''
+buffer=''
 for arg in "$@"; do
   if test "$previous" = '-t'; then target="$arg"; fi
+  if test "$previous" = '-b'; then buffer="$arg"; fi
   previous="$arg"
   last="$arg"
 done
 load_ready_environment() {{
-  eval "set -- $last"
+  command="$1"
+  eval "set -- $command"
   if test "$1" = 'env'; then shift; fi
   while test "$#" -gt 0; do
     case "$1" in
@@ -1337,6 +1204,25 @@ load_ready_environment() {{
       *) break ;;
     esac
   done
+}}
+handle_input() {{
+  input="$1"
+  case "$input" in
+    *humanize-test-agent*)
+      load_ready_environment "$input"
+      pending="$root/hook-helper-${{target##*.}}-$$.pending"
+      done="${{pending%.pending}}.done"
+      : > "$pending"
+      (
+        printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
+          HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="${{target##*.}}" '{}' --agent-ready-hook --source codex_session_start
+        mv "$pending" "$done"
+      ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
+      ;;
+    *'Inspect the manual node.'*)
+      : > '{}'
+      ;;
+  esac
 }}
 case "$1" in
   has-session)
@@ -1360,29 +1246,15 @@ case "$1" in
     printf 'final capture for %s\n' "$target"
     ;;
   set-buffer)
-    case "$last" in
-      *'Inspect the manual node.'*)
-        : > '{}'
-        ;;
-    esac
+    printf '%s' "$last" > "$root/tmux-buffer-$buffer"
+    ;;
+  paste-buffer)
+    input="$(cat "$root/tmux-buffer-$buffer")"
+    rm -f "$root/tmux-buffer-$buffer"
+    handle_input "$input"
     ;;
   send-keys)
-    case "$*" in
-      *humanize-test-agent*)
-        load_ready_environment
-        pending="$root/hook-helper-${{target##*.}}-$$.pending"
-        done="${{pending%.pending}}.done"
-        : > "$pending"
-        (
-          printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
-            HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="${{target##*.}}" '{}' --agent-ready-hook --source codex_session_start
-          mv "$pending" "$done"
-        ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
-        ;;
-      *'Inspect the manual node.'*)
-        : > '{}'
-        ;;
-    esac
+    handle_input "$last"
     if test "$last" = 'Enter' && test -f '{}'; then
       kill -KILL "$PPID"
     fi
@@ -1395,7 +1267,6 @@ esac
 exit 0
         "#,
             self.root.display(),
-            prompt_marker.display(),
             env!("CARGO_BIN_EXE_humanize-plugin-mcp"),
             prompt_marker.display(),
             prompt_marker.display()

@@ -6,7 +6,8 @@ use crate::input_ledger::{
 };
 
 use super::{
-    CommandRunner, TmuxActivationMetadata, TmuxAdapter, TmuxError, TmuxPane, sleep_if_needed,
+    CommandRunner, TmuxActivationMetadata, TmuxAdapter, TmuxError, TmuxPane,
+    inferred_harness_profile, sleep_if_needed,
 };
 
 struct MachineInputAttempt<'a> {
@@ -55,11 +56,14 @@ impl<R: CommandRunner> TmuxAdapter<R> {
     ) -> Result<TmuxInputTransaction, TmuxError> {
         self.send_input_transaction_with_options(
             metadata,
-            text,
-            false,
-            None,
-            submit_key_count,
-            &self.input_config,
+            InputTransactionRequest {
+                text,
+                clear_before_input: false,
+                projection: None,
+                submit_key_count,
+                acceptance: None,
+                input_config: &self.input_config,
+            },
         )
     }
 
@@ -86,11 +90,14 @@ impl<R: CommandRunner> TmuxAdapter<R> {
     ) -> Result<TmuxInputTransaction, TmuxError> {
         self.send_input_transaction_with_options(
             metadata,
-            text,
-            false,
-            Some(projection),
-            submit_key_count,
-            &self.input_config,
+            InputTransactionRequest {
+                text,
+                clear_before_input: false,
+                projection: Some(projection),
+                submit_key_count,
+                acceptance: None,
+                input_config: &self.input_config,
+            },
         )
     }
 
@@ -114,11 +121,38 @@ impl<R: CommandRunner> TmuxAdapter<R> {
     ) -> Result<TmuxInputTransaction, TmuxError> {
         self.send_input_transaction_with_options(
             metadata,
-            text,
-            true,
-            None,
-            submit_key_count,
-            &self.input_config,
+            InputTransactionRequest {
+                text,
+                clear_before_input: true,
+                projection: None,
+                submit_key_count,
+                acceptance: None,
+                input_config: &self.input_config,
+            },
+        )
+    }
+
+    pub(crate) fn send_clean_input_transaction_with_agent_acceptance(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        text: &str,
+        submit_key_count: usize,
+        agent_command: &str,
+        acceptance_timeout: Duration,
+    ) -> Result<TmuxInputTransaction, TmuxError> {
+        self.send_input_transaction_with_options(
+            metadata,
+            InputTransactionRequest {
+                text,
+                clear_before_input: true,
+                projection: None,
+                submit_key_count,
+                acceptance: Some(AgentSubmissionAcceptance {
+                    agent_command,
+                    timeout: acceptance_timeout,
+                }),
+                input_config: &self.input_config,
+            },
         )
     }
 
@@ -130,23 +164,30 @@ impl<R: CommandRunner> TmuxAdapter<R> {
     ) -> Result<TmuxInputTransaction, TmuxError> {
         self.send_input_transaction_with_options(
             metadata,
-            text,
-            false,
-            None,
-            input_config.submit_key_count,
-            input_config,
+            InputTransactionRequest {
+                text,
+                clear_before_input: false,
+                projection: None,
+                submit_key_count: input_config.submit_key_count,
+                acceptance: None,
+                input_config,
+            },
         )
     }
 
     fn send_input_transaction_with_options(
         &self,
         metadata: &TmuxActivationMetadata,
-        text: &str,
-        clear_before_input: bool,
-        projection: Option<&str>,
-        submit_key_count: usize,
-        input_config: &TmuxInputTransactionConfig,
+        request: InputTransactionRequest<'_>,
     ) -> Result<TmuxInputTransaction, TmuxError> {
+        let InputTransactionRequest {
+            text,
+            clear_before_input,
+            projection,
+            submit_key_count,
+            acceptance,
+            input_config,
+        } = request;
         self.validate_exact_pane(metadata)?;
         let submit_key_count = submit_key_count.max(1);
         let started_at_ms = input_config.clock.now_ms();
@@ -191,18 +232,18 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             self.record_failed_input(&attempt, input_config);
             return Err(err);
         }
-        let input_result = if requires_bracketed_paste(text) {
-            let buffer_name = attempt.transaction_id.replace(':', "-");
-            self.paste_keys_literal(&pane, text, &buffer_name)
-        } else {
-            self.send_keys_literal(&pane, text)
-        };
+        let buffer_name = attempt.transaction_id.replace(':', "-");
+        let input_result = self.paste_keys_literal(metadata, &pane, text, &buffer_name);
         if let Err(err) = input_result {
             self.record_failed_input(&attempt, input_config);
             return Err(err);
         }
         sleep_if_needed(input_config.prompt_to_submit_delay(text));
         for index in 0..submit_key_count {
+            if let Err(err) = self.validate_exact_pane(metadata) {
+                self.record_failed_input(&attempt, input_config);
+                return Err(err);
+            }
             if let Err(err) = self.send_key(&pane, "Enter") {
                 self.record_failed_input(&attempt, input_config);
                 return Err(err);
@@ -211,7 +252,6 @@ impl<R: CommandRunner> TmuxAdapter<R> {
                 sleep_if_needed(input_config.submit_key_delay);
             }
         }
-
         let submitted_at_ms = input_config.clock.now_ms();
         let submission = attempt.submission(submitted_at_ms);
         let record = match attempt.projection {
@@ -224,7 +264,26 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             .ledger
             .append(record.clone())
             .map_err(|err| TmuxError::input_ledger(&err.to_string()))?;
-        Ok(TmuxInputTransaction { record })
+        let mut submission_acceptance = None;
+        if let Some(acceptance) = acceptance
+            && let Some(profile) = inferred_harness_profile(acceptance.agent_command)
+            && self
+                .wait_for_pane_text_case_insensitive(
+                    metadata,
+                    profile.acceptance_pattern(),
+                    acceptance.timeout,
+                )
+                .is_ok()
+        {
+            submission_acceptance = Some(TmuxSubmissionAcceptance {
+                profile: profile.name(),
+                signal: "working_state",
+            });
+        }
+        Ok(TmuxInputTransaction {
+            record,
+            acceptance: submission_acceptance,
+        })
     }
 
     fn record_failed_input(
@@ -241,6 +300,20 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             None => MachineInputRecord::failed(attempt.submission(failed_at_ms)),
         });
     }
+}
+
+struct AgentSubmissionAcceptance<'a> {
+    agent_command: &'a str,
+    timeout: Duration,
+}
+
+struct InputTransactionRequest<'a> {
+    text: &'a str,
+    clear_before_input: bool,
+    projection: Option<&'a str>,
+    submit_key_count: usize,
+    acceptance: Option<AgentSubmissionAcceptance<'a>>,
+    input_config: &'a TmuxInputTransactionConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +399,7 @@ impl TmuxInputTransactionConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TmuxInputTransaction {
     record: MachineInputRecord,
+    acceptance: Option<TmuxSubmissionAcceptance>,
 }
 
 impl TmuxInputTransaction {
@@ -336,10 +410,26 @@ impl TmuxInputTransaction {
     pub fn record(&self) -> &MachineInputRecord {
         &self.record
     }
+
+    pub fn acceptance(&self) -> Option<&TmuxSubmissionAcceptance> {
+        self.acceptance.as_ref()
+    }
 }
 
-fn requires_bracketed_paste(text: &str) -> bool {
-    text.len() >= 512 || text.contains(['\r', '\n'])
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TmuxSubmissionAcceptance {
+    profile: &'static str,
+    signal: &'static str,
+}
+
+impl TmuxSubmissionAcceptance {
+    pub fn profile(&self) -> &'static str {
+        self.profile
+    }
+
+    pub fn signal(&self) -> &'static str {
+        self.signal
+    }
 }
 
 #[cfg(test)]

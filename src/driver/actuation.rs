@@ -315,7 +315,31 @@ impl RuntimeDriverService {
                     }
                 }
             } else {
-                readiness
+                match self.tmux_adapter.wait_for_inferred_agent_readiness(
+                    &metadata,
+                    &tmux.agent_command,
+                    std::time::Duration::from_millis(tmux.actuation.agent_ready_timeout_ms),
+                ) {
+                    Ok(Some(profile)) => {
+                        let mut readiness = readiness;
+                        readiness["tmux_marker"] = Value::String("observed".to_string());
+                        readiness["tmux_profile"] = Value::String(profile.to_string());
+                        readiness
+                    }
+                    Ok(None) => readiness,
+                    Err(err) => {
+                        actuation.warnings.push(json!({
+                            "activation_id": activation.activation_id,
+                            "pane_id": pane.pane_id,
+                            "allocation_generation": pane.allocation_generation,
+                            "status": "readiness_pending",
+                            "pause_required": false,
+                            "message": "inferred tmux input surface is pending",
+                            "error": err.to_string()
+                        }));
+                        continue;
+                    }
+                }
             };
             let delivery = self.start_input_delivery(
                 &activation.activation_id,
@@ -325,13 +349,21 @@ impl RuntimeDriverService {
             )?;
             match self
                 .tmux_adapter
-                .send_clean_input_transaction_with_submit_key_count(
+                .send_clean_input_transaction_with_agent_acceptance(
                     &metadata,
                     &prompt,
                     tmux.actuation.prompt_submit_key_count,
+                    &tmux.agent_command,
+                    std::time::Duration::from_millis(tmux.actuation.agent_ready_timeout_ms),
                 ) {
                 Ok(transaction) => {
                     let prompt_transaction_id = transaction.transaction_id().to_string();
+                    let acceptance = transaction.acceptance().map(|acceptance| {
+                        json!({
+                            "profile": acceptance.profile(),
+                            "signal": acceptance.signal()
+                        })
+                    });
                     self.record_machine_input(DELIVERY_ROLE_NODE_PROMPT, transaction.record())?;
                     self.finish_input_delivery(
                         &activation.activation_id,
@@ -340,7 +372,8 @@ impl RuntimeDriverService {
                         pane.allocation_generation,
                         json!({
                             "pane_id": pane.pane_id,
-                            "transaction_id": prompt_transaction_id
+                            "transaction_id": prompt_transaction_id,
+                            "acceptance": acceptance
                         }),
                     )?;
                     actuation.sent.push(json!({

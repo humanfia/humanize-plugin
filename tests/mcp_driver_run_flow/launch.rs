@@ -54,9 +54,9 @@ fn run_flow_launches_driver_pane_and_binds_locked_flow_through_ipc() {
     let calls = fs::read_to_string(root.join("tmux.log")).unwrap();
     assert!(calls.contains("new-session -d -P -F #{window_id}|#{pane_id} -s host-a -n flow-a"));
     assert!(calls.contains("set-buffer -b machine-input-"));
-    assert!(calls.contains("paste-buffer -p -d -b machine-input-"));
+    assert!(calls.contains("paste-buffer -p -r -d -b machine-input-"));
     assert!(calls.contains("humanize-plugin-driver"));
-    assert!(calls.contains("send-keys -t host-a:%7.%9 -l env HUMANIZE_PARTICIPANT_BINDING_FILE="));
+    assert!(calls.contains("-- env HUMANIZE_PARTICIPANT_BINDING_FILE="));
     assert!(calls.contains("humanize-test-agent"));
     assert!(calls.contains("send-keys -t host-a:%7.%9 C-u"));
     assert!(calls.contains("send-keys -t host-a:%7.%9 Enter"));

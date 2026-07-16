@@ -878,6 +878,7 @@ impl DriverFixture {
 
     fn socket_path(&self, run_id: &str) -> PathBuf {
         socket_path_for_run_root(&self.runtime_root, &self.run_root(run_id))
+            .expect("driver socket path should resolve")
     }
 
     fn run_root(&self, run_id: &str) -> PathBuf {

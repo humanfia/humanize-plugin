@@ -73,7 +73,7 @@ impl DriverClient {
 
         let runtime_root = runtime_root_for_run_root(run_root)?;
         validate_private_dir(&runtime_root, "driver runtime directory")?;
-        let expected_socket = socket_path_for_run_root(&runtime_root, run_root);
+        let expected_socket = socket_path_for_run_root(&runtime_root, run_root)?;
         validate_relative_identity(
             &metadata.socket_path,
             expected_socket
@@ -303,17 +303,20 @@ pub(crate) fn runtime_root_for_run_root(run_root: &Path) -> io::Result<PathBuf> 
     crate::state_path::private_runtime_root()
 }
 
-pub(crate) fn private_run_root_for_run_root(runtime_root: &Path, run_root: &Path) -> PathBuf {
-    crate::state_path::private_run_root(runtime_root, run_root)
+pub(crate) fn private_run_root_for_run_root(
+    runtime_root: &Path,
+    run_root: &Path,
+) -> io::Result<PathBuf> {
+    crate::private_state::private_run_root(runtime_root, run_root)
 }
 
-pub(crate) fn private_driver_dir(runtime_root: &Path, run_root: &Path) -> PathBuf {
-    private_run_root_for_run_root(runtime_root, run_root).join("driver")
+pub(crate) fn private_driver_dir(runtime_root: &Path, run_root: &Path) -> io::Result<PathBuf> {
+    Ok(private_run_root_for_run_root(runtime_root, run_root)?.join("driver"))
 }
 
 fn private_driver_dir_for_run_root(run_root: &Path) -> io::Result<PathBuf> {
     let runtime_root = runtime_root_for_run_root(run_root)?;
-    Ok(private_driver_dir(&runtime_root, run_root))
+    private_driver_dir(&runtime_root, run_root)
 }
 
 pub fn cleanup_stale_driver_ipc(run_root: &Path, run_id: &str) -> io::Result<()> {
@@ -321,10 +324,10 @@ pub fn cleanup_stale_driver_ipc(run_root: &Path, run_id: &str) -> io::Result<()>
         return Err(invalid_data("stale driver IPC run identity mismatch"));
     }
     let runtime_root = runtime_root_for_run_root(run_root)?;
-    let driver_dir = private_driver_dir(&runtime_root, run_root);
+    let driver_dir = private_driver_dir(&runtime_root, run_root)?;
     validate_private_dir(&driver_dir, "driver directory")?;
     validate_private_dir(&runtime_root, "driver runtime directory")?;
-    let socket_path = socket_path_for_run_root(&runtime_root, run_root);
+    let socket_path = socket_path_for_run_root(&runtime_root, run_root)?;
     match fs::symlink_metadata(&socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => {
             if metadata.uid() != unsafe { libc::geteuid() } {
@@ -370,7 +373,7 @@ pub fn cleanup_stale_driver_ipc(run_root: &Path, run_id: &str) -> io::Result<()>
 
 pub(crate) fn probe_driver_endpoint(run_root: &Path) -> io::Result<DriverEndpointState> {
     let runtime_root = runtime_root_for_run_root(run_root)?;
-    let socket_path = socket_path_for_run_root(&runtime_root, run_root);
+    let socket_path = socket_path_for_run_root(&runtime_root, run_root)?;
     match fs::symlink_metadata(&socket_path) {
         Ok(_) => {
             validate_private_dir(&runtime_root, "driver runtime directory")?;

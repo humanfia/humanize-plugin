@@ -11,6 +11,7 @@ use crate::flow::{self, FlowCheckMode, FlowExportFormat, FlowLock};
 use crate::pipe_sink::PipeSinkIdentity;
 
 mod authority;
+mod completion;
 pub(crate) mod durable_fs;
 mod fault;
 mod journal;
@@ -25,6 +26,7 @@ mod store_files;
 
 pub(crate) use authority::read_manifest_for_run_root;
 use authority::validate_manifest_layout;
+use completion::{activation_can_complete, refresh_completion};
 use fault::RunAssetFaultKind;
 pub use fault::{RunAssetFault, RunAssetFaultPoint};
 pub use model::{
@@ -181,7 +183,7 @@ impl RunAssetStore {
     ) -> Result<RunAssetManifest, RunAssetError> {
         let run_root = self.run_root(run_id)?;
         let manifest_path = self
-            .private_manifest_path(&run_root)
+            .private_manifest_path(&run_root)?
             .unwrap_or_else(|| run_root.join("manifest.json"));
         match fs::symlink_metadata(&manifest_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
@@ -493,7 +495,7 @@ impl RunAssetStore {
             RunAssetFaultPoint::StartActivationTranscript,
             &update.activation_id,
         )?;
-        let capture_root = self.activation_capture_root(manifest);
+        let capture_root = self.activation_capture_root(manifest)?;
         let activation_root = capture_root
             .join("activations")
             .join(storage_segment("act", &update.activation_id));
@@ -613,7 +615,7 @@ impl RunAssetStore {
             RunAssetFaultPoint::RegisterExpectedActivation,
             activation_id,
         )?;
-        let capture_root = self.activation_capture_root(manifest);
+        let capture_root = self.activation_capture_root(manifest)?;
         let activation_dir = capture_root
             .join("activations")
             .join(storage_segment("act", activation_id));
@@ -1305,7 +1307,7 @@ impl RunAssetStore {
 
     pub fn load_manifest(&self, run_id: &str) -> Result<RunAssetManifest, RunAssetError> {
         let run_root = self.run_root(run_id)?;
-        let manifest = if let Some(path) = self.private_manifest_path(&run_root) {
+        let manifest = if let Some(path) = self.private_manifest_path(&run_root)? {
             self.recover_private_manifest_publications(&run_root)?;
             let bytes = read_regular_private(&path)?.ok_or_else(|| {
                 RunAssetError::new(format!(
@@ -1322,7 +1324,7 @@ impl RunAssetStore {
             validate_manifest_layout(
                 &manifest,
                 &run_root,
-                &self.activation_capture_root_for_run_root(&run_root),
+                &self.activation_capture_root_for_run_root(&run_root)?,
                 Some(run_id),
             )?;
             manifest
@@ -1345,7 +1347,7 @@ impl RunAssetStore {
         self.validate_manifest_authority(manifest)?;
         manifest.updated_at_ms = self.now_ms();
         refresh_completion(manifest);
-        if let Some(path) = self.private_manifest_path(&manifest.root) {
+        if let Some(path) = self.private_manifest_path(&manifest.root)? {
             let private_run_root = self.private_run_root_for_run_root(&manifest.root)?;
             if !publication::pending_transactions(&private_run_root)?.is_empty() {
                 return Err(RunAssetError::publication(
@@ -1395,7 +1397,7 @@ impl RunAssetStore {
 
     fn write_manifest_create_new(&self, manifest: &RunAssetManifest) -> Result<(), RunAssetError> {
         self.validate_manifest_authority(manifest)?;
-        if let Some(path) = self.private_manifest_path(&manifest.root) {
+        if let Some(path) = self.private_manifest_path(&manifest.root)? {
             write_private_manifest_file(&path, manifest, true)?;
             return self.write_public_manifest_projection(manifest);
         }
@@ -1412,22 +1414,27 @@ impl RunAssetStore {
         write_manifest_file(manifest)
     }
 
-    fn private_manifest_path(&self, run_root: &Path) -> Option<PathBuf> {
-        self.private_runtime_root.as_ref().map(|runtime_root| {
-            crate::state_path::private_run_root(runtime_root, run_root)
-                .join("driver")
-                .join("run-assets.json")
-        })
+    fn private_manifest_path(&self, run_root: &Path) -> Result<Option<PathBuf>, RunAssetError> {
+        self.private_runtime_root
+            .as_ref()
+            .map(|runtime_root| {
+                crate::private_state::private_run_root(runtime_root, run_root)
+                    .map(|private_run_root| private_run_root.join("driver").join("run-assets.json"))
+                    .map_err(|err| RunAssetError::new(err.to_string()))
+            })
+            .transpose()
     }
 
     pub(crate) fn private_run_root_for_run_root(
         &self,
         run_root: &Path,
     ) -> Result<PathBuf, RunAssetError> {
-        self.private_runtime_root
+        let runtime_root = self
+            .private_runtime_root
             .as_ref()
-            .map(|runtime_root| crate::state_path::private_run_root(runtime_root, run_root))
-            .ok_or_else(|| RunAssetError::new("run asset store is not driver-owned"))
+            .ok_or_else(|| RunAssetError::new("run asset store is not driver-owned"))?;
+        crate::private_state::private_run_root(runtime_root, run_root)
+            .map_err(|err| RunAssetError::new(err.to_string()))
     }
 
     pub(crate) fn reconcile_private_manifest_transaction(
@@ -1442,7 +1449,7 @@ impl RunAssetStore {
             return Ok(());
         };
         self.validate_manifest_authority(manifest)?;
-        let path = self.private_manifest_path(&manifest.root).ok_or_else(|| {
+        let path = self.private_manifest_path(&manifest.root)?.ok_or_else(|| {
             RunAssetError::new("run asset publication requires a driver-owned store")
         })?;
         let current = read_regular_private(&path)?;
@@ -1520,17 +1527,23 @@ impl RunAssetStore {
         Ok(())
     }
 
-    pub(crate) fn activation_capture_root(&self, manifest: &RunAssetManifest) -> PathBuf {
+    pub(crate) fn activation_capture_root(
+        &self,
+        manifest: &RunAssetManifest,
+    ) -> Result<PathBuf, RunAssetError> {
         self.activation_capture_root_for_run_root(&manifest.root)
     }
 
-    fn activation_capture_root_for_run_root(&self, run_root: &Path) -> PathBuf {
-        self.private_runtime_root.as_ref().map_or_else(
-            || run_root.to_path_buf(),
-            |runtime_root| {
-                crate::state_path::private_run_root(runtime_root, run_root).join("captures")
-            },
-        )
+    fn activation_capture_root_for_run_root(
+        &self,
+        run_root: &Path,
+    ) -> Result<PathBuf, RunAssetError> {
+        let Some(runtime_root) = self.private_runtime_root.as_ref() else {
+            return Ok(run_root.to_path_buf());
+        };
+        crate::private_state::private_run_root(runtime_root, run_root)
+            .map(|private_run_root| private_run_root.join("captures"))
+            .map_err(|err| RunAssetError::new(err.to_string()))
     }
 
     fn validate_manifest_authority(
@@ -1541,7 +1554,7 @@ impl RunAssetStore {
         validate_manifest_layout(
             manifest,
             &expected_root,
-            &self.activation_capture_root_for_run_root(&expected_root),
+            &self.activation_capture_root_for_run_root(&expected_root)?,
             Some(&manifest.run_id),
         )?;
         if manifest.sink != self.selected_sink().name() {
@@ -1685,47 +1698,6 @@ pub(crate) fn truncate_private(path: &Path, len: u64) -> Result<(), RunAssetErro
 
 pub(crate) fn write_create_new_private(path: &Path, bytes: &[u8]) -> Result<(), RunAssetError> {
     durable_fs::write_create_new_private(path, bytes)
-}
-
-fn refresh_completion(manifest: &mut RunAssetManifest) {
-    let mut expected = Vec::new();
-    let mut complete = Vec::new();
-    let mut incomplete = Vec::new();
-    for (activation_id, activation) in &manifest.activations {
-        expected.push(activation_id.clone());
-        if activation_complete(activation) {
-            complete.push(activation_id.clone());
-        } else {
-            incomplete.push(activation_id.clone());
-        }
-    }
-    manifest.completion = RunAssetCompletion {
-        flow_complete: manifest.flow.complete,
-        expected_tmux_activations: expected,
-        complete_tmux_activations: complete,
-        incomplete_tmux_activations: incomplete.clone(),
-        complete: manifest.flow.complete
-            && incomplete.is_empty()
-            && manifest.preservation_errors.is_empty()
-            && !manifest.preservation_blocked,
-    };
-}
-
-fn activation_complete(activation: &RunAssetActivation) -> bool {
-    activation.pipe_acknowledged
-        && activation.capture_phase == "complete"
-        && activation.capture_complete
-        && activation.ended_at_ms.is_some()
-        && activation.termination_reason.is_some()
-        && activation.preservation_status == "complete"
-        && activation.resource_cleanup_status == "complete"
-        && activation.final_capture_path.exists()
-}
-
-fn activation_can_complete(activation: &RunAssetActivation) -> bool {
-    activation.pipe_acknowledged
-        && activation.capture_phase == "capturing"
-        && activation.preservation_status == "capturing"
 }
 
 fn relative_path_string(root: &Path, path: &Path) -> String {

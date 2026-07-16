@@ -1,9 +1,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -16,11 +15,9 @@ use humanize_plugin::adapters::lifecycle::{
 use humanize_plugin::adapters::tmux::{
     CommandOutput, CommandRunner, SystemCommandRunner, TmuxActivationMetadata,
     TmuxActivationRequest, TmuxAdapter, TmuxError, TmuxInputTransactionConfig, TmuxPane,
-    TmuxPaneIdentity, TmuxPaneMetadataMismatch, TmuxSession, TmuxWindow,
+    TmuxSession, TmuxWindow,
 };
-use humanize_plugin::input_ledger::{
-    MachineInputLedger, MachineInputRecord, MachineInputStatus, machine_input_payload_hash,
-};
+use humanize_plugin::input_ledger::{MachineInputLedger, MachineInputStatus};
 use humanize_plugin::pipe_sink::{PipeSinkIdentity, pipe_sink_identity};
 
 thread_local! {
@@ -28,6 +25,12 @@ thread_local! {
 }
 
 static TMUX_BIN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_tmux_bin_env() -> std::sync::MutexGuard<'static, ()> {
+    TMUX_BIN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Default)]
 struct RecordingRunner {
@@ -396,288 +399,6 @@ fn tmux_wait_for_pane_text_validates_identity_and_observes_readiness() {
 }
 
 #[test]
-fn tmux_send_transaction_validates_exact_pane_sends_literal_text_and_records_ledger() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
-        CommandOutput::success(""),
-        CommandOutput::success(""),
-        CommandOutput::success(""),
-    ]);
-    let ledger = MachineInputLedger::in_memory();
-    let adapter = TmuxAdapter::with_runner(runner.clone()).with_input_transaction_config(
-        TmuxInputTransactionConfig::deterministic(ledger.clone(), 1_000).with_submit_key_count(2),
-    );
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
-
-    let transaction = adapter
-        .send_input_transaction(&metadata, "inspect\r\nthe repo")
-        .unwrap();
-
-    let records = ledger.records();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].run_id, "run-a");
-    assert_eq!(records[0].activation_id, "activation-a");
-    assert_eq!(records[0].pane_id, "%8");
-    assert_eq!(records[0].started_at_ms, 1_000);
-    assert_eq!(records[0].submitted_at_ms, 1_000);
-    assert_eq!(records[0].normalized_text, "inspect\nthe repo");
-    assert_eq!(
-        records[0].payload_hash,
-        machine_input_payload_hash("inspect\r\nthe repo")
-    );
-    assert_ne!(
-        records[0].payload_hash,
-        machine_input_payload_hash(&records[0].normalized_text)
-    );
-    assert_eq!(records[0].submit_key_count, 2);
-    assert_eq!(records[0].transaction_id, transaction.transaction_id());
-    assert_eq!(records[0].status, MachineInputStatus::Started);
-    assert_eq!(records[1].transaction_id, transaction.transaction_id());
-    assert_eq!(records[1].status, MachineInputStatus::Submitted);
-    assert!(records[0].transaction_id.starts_with("machine-input:"));
-    let buffer_name = transaction.transaction_id().replace(':', "-");
-    assert_eq!(
-        runner.calls(),
-        argv(vec![
-            vec![
-                "tmux",
-                "display-message",
-                "-p",
-                "-t",
-                "host-a:%7.%8",
-                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
-            ],
-            vec![
-                "tmux",
-                "set-buffer",
-                "-b",
-                buffer_name.as_str(),
-                "--",
-                "inspect\r\nthe repo",
-            ],
-            vec![
-                "tmux",
-                "paste-buffer",
-                "-p",
-                "-d",
-                "-b",
-                buffer_name.as_str(),
-                "-t",
-                "host-a:%7.%8",
-            ],
-            vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
-            vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
-        ])
-    );
-}
-
-#[test]
-fn tmux_send_transaction_file_ledger_keeps_started_and_submitted_records() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
-        CommandOutput::success(""),
-        CommandOutput::success(""),
-    ]);
-    let root = test_temp_dir("machine-input-ledger-file-transaction");
-    fs::create_dir_all(&root).unwrap();
-    let ledger_path = root.join("machine-inputs.jsonl");
-    let ledger = MachineInputLedger::at_path(&ledger_path);
-    let adapter = TmuxAdapter::with_runner(runner)
-        .with_input_transaction_config(TmuxInputTransactionConfig::deterministic(ledger, 1_000));
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
-
-    let transaction = adapter
-        .send_input_transaction(&metadata, "inspect the repo")
-        .unwrap();
-
-    let records = fs::read_to_string(&ledger_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<MachineInputRecord>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].transaction_id, transaction.transaction_id());
-    assert_eq!(records[0].status, MachineInputStatus::Started);
-    assert_eq!(records[1].transaction_id, transaction.transaction_id());
-    assert_eq!(records[1].status, MachineInputStatus::Submitted);
-}
-
-#[test]
-fn tmux_send_transaction_records_failed_status_when_enter_send_fails() {
-    let runner = RecordingRunner::with_outputs(vec![
-        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
-        CommandOutput::success(""),
-        CommandOutput::failure("cannot send enter"),
-    ]);
-    let ledger = MachineInputLedger::in_memory();
-    let adapter = TmuxAdapter::with_runner(runner.clone()).with_input_transaction_config(
-        TmuxInputTransactionConfig::deterministic(ledger.clone(), 1_000),
-    );
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
-
-    let err = adapter
-        .send_input_transaction(&metadata, "inspect the repo")
-        .unwrap_err();
-
-    assert!(matches!(err, TmuxError::CommandFailed { .. }));
-    let records = ledger.records();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].status, MachineInputStatus::Started);
-    assert_eq!(records[1].status, MachineInputStatus::Failed);
-    assert_eq!(records[0].transaction_id, records[1].transaction_id);
-    assert_eq!(records[1].normalized_text, "inspect the repo");
-}
-
-#[test]
-fn system_tmux_adapter_uses_explicit_real_tmux_binary_and_ledgers_input() {
-    let _guard = TMUX_BIN_ENV_LOCK.lock().unwrap();
-    let root = test_temp_dir("tmux-adapter-real-bin");
-    fs::create_dir_all(&root).unwrap();
-    let fake_tmux = root.join("real-tmux");
-    let calls = root.join("tmux-calls.txt");
-    fs::write(
-        &fake_tmux,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = display-message ]; then printf 'host-a\\t%%7\\tflow-a\\t%%8\\n'; fi\n",
-            calls.display()
-        ),
-    )
-    .unwrap();
-    make_executable(&fake_tmux);
-    let prior = std::env::var_os("HUMANIZE_TMUX_BIN");
-    unsafe {
-        std::env::set_var("HUMANIZE_TMUX_BIN", &fake_tmux);
-    }
-
-    let ledger = MachineInputLedger::in_memory();
-    let adapter = TmuxAdapter::with_runner(SystemCommandRunner).with_input_transaction_config(
-        TmuxInputTransactionConfig::deterministic(ledger.clone(), 1_700_000_000_000)
-            .with_prompt_to_submit_delay(Duration::from_millis(0)),
-    );
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-real-bin", "flow-a", "%7", "root", "%8");
-
-    let transaction = adapter
-        .send_input_transaction(&metadata, "inspect the repo")
-        .unwrap();
-
-    restore_env("HUMANIZE_TMUX_BIN", prior);
-    assert_eq!(transaction.record().status, MachineInputStatus::Submitted);
-    let calls = fs::read_to_string(calls).unwrap();
-    assert!(calls.contains("send-keys -t host-a:%7.%8 -l inspect the repo"));
-    assert!(calls.contains("send-keys -t host-a:%7.%8 Enter"));
-    assert_eq!(ledger.records().len(), 2);
-    assert_eq!(ledger.records()[1].normalized_text, "inspect the repo");
-}
-
-#[test]
-fn tmux_send_transaction_does_not_send_when_initial_ledger_record_fails() {
-    let runner =
-        RecordingRunner::with_outputs(vec![CommandOutput::success("host-a\t%7\twindow-a\t%8\n")]);
-    let ledger_path = test_temp_dir("machine-input-ledger-directory");
-    fs::create_dir_all(&ledger_path).unwrap();
-    let ledger = MachineInputLedger::at_path(&ledger_path);
-    let adapter = TmuxAdapter::with_runner(runner.clone())
-        .with_input_transaction_config(TmuxInputTransactionConfig::deterministic(ledger, 1_000));
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
-
-    let err = adapter
-        .send_input_transaction(&metadata, "inspect the repo")
-        .unwrap_err();
-
-    assert!(matches!(err, TmuxError::InputLedger { .. }));
-    assert_eq!(
-        runner.calls(),
-        argv(vec![vec![
-            "tmux",
-            "display-message",
-            "-p",
-            "-t",
-            "host-a:%7.%8",
-            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
-        ]])
-    );
-    fs::remove_dir_all(&ledger_path).unwrap();
-}
-
-#[test]
-fn tmux_send_transaction_rejects_pane_metadata_mismatch_before_send() {
-    let runner =
-        RecordingRunner::with_outputs(vec![CommandOutput::success("host-b\t%7\twindow-a\t%8\n")]);
-    let ledger = MachineInputLedger::in_memory();
-    let adapter = TmuxAdapter::with_runner(runner.clone()).with_input_transaction_config(
-        TmuxInputTransactionConfig::deterministic(ledger.clone(), 1_000),
-    );
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
-
-    let err = adapter
-        .send_input_transaction(&metadata, "inspect the repo")
-        .unwrap_err();
-
-    assert_eq!(
-        err,
-        TmuxError::PaneMetadataMismatch(Box::new(TmuxPaneMetadataMismatch::new(
-            TmuxPaneIdentity::new("host-a", "%7", "window-a", "%8"),
-            TmuxPaneIdentity::new("host-b", "%7", "window-a", "%8"),
-        )))
-    );
-    assert_eq!(ledger.records(), Vec::new());
-    assert_eq!(
-        runner.calls(),
-        argv(vec![vec![
-            "tmux",
-            "display-message",
-            "-p",
-            "-t",
-            "host-a:%7.%8",
-            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
-        ]])
-    );
-}
-
-#[test]
-fn tmux_send_transaction_rejects_window_name_mismatch_before_send() {
-    let runner = RecordingRunner::with_outputs(vec![CommandOutput::success(
-        "host-a\t%7\tother-window\t%8\n",
-    )]);
-    let ledger = MachineInputLedger::in_memory();
-    let adapter = TmuxAdapter::with_runner(runner.clone()).with_input_transaction_config(
-        TmuxInputTransactionConfig::deterministic(ledger.clone(), 1_000),
-    );
-    let metadata =
-        TmuxActivationMetadata::new("host-a", "run-a", "window-a", "%7", "activation-a", "%8");
-
-    let err = adapter
-        .send_input_transaction(&metadata, "inspect the repo")
-        .unwrap_err();
-
-    assert_eq!(
-        err,
-        TmuxError::PaneMetadataMismatch(Box::new(TmuxPaneMetadataMismatch::new(
-            TmuxPaneIdentity::new("host-a", "%7", "window-a", "%8"),
-            TmuxPaneIdentity::new("host-a", "%7", "other-window", "%8"),
-        )))
-    );
-    assert_eq!(ledger.records(), Vec::new());
-    assert_eq!(
-        runner.calls(),
-        argv(vec![vec![
-            "tmux",
-            "display-message",
-            "-p",
-            "-t",
-            "host-a:%7.%8",
-            "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
-        ]])
-    );
-}
-
-#[test]
 fn tmux_creation_rejects_empty_session_name_before_runner_calls() {
     assert_creation_path_rejects_session_name("", "tmux session name must not be empty");
 }
@@ -938,7 +659,7 @@ fn tmux_adapter_rejects_pipe_completion_before_producer_eof() {
 #[cfg(all(unix, target_os = "linux"))]
 #[test]
 fn tmux_adapter_real_tmux_pipe_drains_before_completion() {
-    let _guard = TMUX_BIN_ENV_LOCK.lock().unwrap();
+    let _guard = lock_tmux_bin_env();
     let root = test_temp_dir("tmux-real-pipe-completion");
     let transcript_relative = "activations/root/transcript.pipe.log";
     let transcript_path = root.join(transcript_relative);
@@ -1244,10 +965,17 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
         CommandOutput::success("%8\n"),
         CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
         CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
         CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
         CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
+        CommandOutput::success(""),
+        CommandOutput::success("host-a\t%7\twindow-a\t%8\n"),
         CommandOutput::success(""),
         CommandOutput::success("ready\n"),
         CommandOutput::success(""),
@@ -1291,6 +1019,8 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
     assert_eq!(records[2].submit_key_count, 2);
     assert_eq!(records[2].status, MachineInputStatus::Started);
     assert_eq!(records[3].status, MachineInputStatus::Submitted);
+    let agent_buffer_name = records[0].transaction_id.replace(':', "-");
+    let prompt_buffer_name = records[2].transaction_id.replace(':', "-");
     assert_eq!(
         runner.calls(),
         argv(vec![
@@ -1327,11 +1057,38 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
             ],
             vec![
                 "tmux",
-                "send-keys",
+                "set-buffer",
+                "-b",
+                agent_buffer_name.as_str(),
+                "--",
+                "humanize-plugin-mcp --stdio",
+            ],
+            vec![
+                "tmux",
+                "display-message",
+                "-p",
                 "-t",
                 "host-a:%7.%8",
-                "-l",
-                "humanize-plugin-mcp --stdio",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
+            ],
+            vec![
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-r",
+                "-d",
+                "-b",
+                agent_buffer_name.as_str(),
+                "-t",
+                "host-a:%7.%8",
+            ],
+            vec![
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "host-a:%7.%8",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
             ],
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
             vec![
@@ -1344,13 +1101,48 @@ fn tmux_lifecycle_allocates_starts_prompts_observes_and_releases_satisfied_activ
             ],
             vec![
                 "tmux",
-                "send-keys",
-                "-t",
-                "host-a:%7.%8",
-                "-l",
+                "set-buffer",
+                "-b",
+                prompt_buffer_name.as_str(),
+                "--",
                 "inspect the repo",
             ],
+            vec![
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "host-a:%7.%8",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
+            ],
+            vec![
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-r",
+                "-d",
+                "-b",
+                prompt_buffer_name.as_str(),
+                "-t",
+                "host-a:%7.%8",
+            ],
+            vec![
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "host-a:%7.%8",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
+            ],
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
+            vec![
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "host-a:%7.%8",
+                "#{session_name}|#{window_id}|#{window_name}|#{pane_id}",
+            ],
             vec!["tmux", "send-keys", "-t", "host-a:%7.%8", "Enter"],
             vec!["tmux", "capture-pane", "-p", "-t", "host-a:%7.%8"],
             vec!["tmux", "kill-pane", "-t", "host-a:%7.%8"],
@@ -1509,23 +1301,3 @@ fn tmux_lifecycle_preserves_blocked_or_failed_activation_by_default() {
     );
     assert_eq!(runner.calls(), calls_after_allocation);
 }
-
-fn restore_env(name: &str, prior: Option<OsString>) {
-    unsafe {
-        match prior {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) {}

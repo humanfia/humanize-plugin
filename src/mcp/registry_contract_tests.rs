@@ -549,7 +549,8 @@ impl FakeDriverFixture {
         fs::create_dir_all(&driver_dir).expect("driver directory should be created");
         set_mode(&driver_dir, 0o700);
 
-        let socket_path = socket_path_for_run_root(&runtime_root, &run_root);
+        let socket_path = socket_path_for_run_root(&runtime_root, &run_root)
+            .expect("fake driver socket path should resolve");
         let listener = UnixListener::bind(&socket_path).expect("fake driver socket should bind");
         set_mode(&socket_path, 0o600);
         listener

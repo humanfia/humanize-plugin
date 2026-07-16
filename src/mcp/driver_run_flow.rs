@@ -378,6 +378,7 @@ impl<R: CommandRunner> McpServer<R> {
             &runtime_root_for_run_root(&run_root).map_err(ToolError::from_io)?,
             &run_root,
         )
+        .map_err(ToolError::from_io)?
         .join("ipc-token");
         let (client, driver) = match bootstrap_client {
             Some(client) => (client, None),
@@ -613,7 +614,9 @@ impl<R: CommandRunner> McpServer<R> {
         );
         let launch_input_config =
             TmuxInputTransactionConfig::runtime_with_ledger(MachineInputLedger::at_path(
-                private_driver_dir(&runtime_root, run_root).join("machine-inputs.jsonl"),
+                private_driver_dir(&runtime_root, run_root)
+                    .map_err(ToolError::from_io)?
+                    .join("machine-inputs.jsonl"),
             ));
         if let Err(err) = self.tmux_adapter.send_input_transaction_with_config(
             &metadata,
@@ -919,6 +922,7 @@ fn wait_for_driver_shutdown(run_root: &Path) -> Result<(), ToolError> {
         &runtime_root_for_run_root(run_root).map_err(ToolError::from_io)?,
         run_root,
     )
+    .map_err(ToolError::from_io)?
     .join("ipc.json");
     let started = Instant::now();
     loop {
@@ -1020,7 +1024,8 @@ fn cleanup_driver_ipc_artifacts(
     let driver_dir = private_driver_dir(
         &runtime_root_for_run_root(run_root).map_err(ToolError::from_io)?,
         run_root,
-    );
+    )
+    .map_err(ToolError::from_io)?;
     if !token_path.starts_with(&driver_dir) {
         return Err(ToolError::invalid(
             "driver IPC token path is outside driver directory",

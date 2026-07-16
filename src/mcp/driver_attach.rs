@@ -49,7 +49,8 @@ impl<R: CommandRunner> McpServer<R> {
         let driver_dir = private_driver_dir(
             &runtime_root_for_run_root(&run_root).map_err(driver_recovery_error)?,
             &run_root,
-        );
+        )
+        .map_err(driver_recovery_error)?;
         if !driver_dir.join("events.jsonl").exists() {
             return Ok(None);
         }

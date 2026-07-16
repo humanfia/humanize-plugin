@@ -116,7 +116,7 @@ fn private_run_root_for_public_run_root(run_root: &Path) -> io::Result<std::path
 
 fn private_driver_dir_for_public_run_root(run_root: &Path) -> io::Result<std::path::PathBuf> {
     let runtime_root = runtime_root_for_run_root(run_root)?;
-    Ok(private_driver_dir(&runtime_root, run_root))
+    private_driver_dir(&runtime_root, run_root)
 }
 
 fn validate_private_run_id(run_root: &Path, expected_run_id: &str) -> io::Result<()> {

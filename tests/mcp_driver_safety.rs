@@ -377,7 +377,7 @@ fn assert_safe_tmux_warning(warning: &Value, secret: &str) {
     let rendered = warning.to_string();
     assert!(!rendered.contains(secret), "{warning}");
     let error = warning["error"].as_str().unwrap();
-    assert!(error.contains("operation=send-keys"), "{error}");
+    assert!(error.contains("operation=set-buffer"), "{error}");
     assert!(error.contains("command_hash=sha256:"), "{error}");
     assert!(error.contains("command_length="), "{error}");
 }

@@ -236,7 +236,10 @@ impl RuntimeDriverService {
             }
         };
         let pane_handle = pane.tmux_pane(&activation.activation_id);
-        let capture_root = self.run_asset_store.activation_capture_root(&manifest);
+        let capture_root = self
+            .run_asset_store
+            .activation_capture_root(&manifest)
+            .map_err(DriverFailure::from_run_asset)?;
         let capture_request = PipeCaptureRequest {
             root: &capture_root,
             transcript_relative_path: &intent.transcript_relative_path,

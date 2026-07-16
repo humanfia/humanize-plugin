@@ -22,8 +22,12 @@ mod input_transaction;
 mod pane_creation;
 mod pane_presence;
 mod pipe_capture;
+#[cfg(test)]
+mod supervised_transport_tests;
 
-pub use input_transaction::{TmuxInputTransaction, TmuxInputTransactionConfig};
+pub use input_transaction::{
+    TmuxInputTransaction, TmuxInputTransactionConfig, TmuxSubmissionAcceptance,
+};
 pub(crate) use pane_presence::TmuxPanePresence;
 pub(crate) use pipe_capture::PipeCaptureRequest;
 use pipe_capture::{
@@ -176,6 +180,27 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         pattern: &str,
         timeout: Duration,
     ) -> Result<(), TmuxError> {
+        self.wait_for_pane_text_matching(metadata, timeout, |capture| capture.contains(pattern))
+    }
+
+    fn wait_for_pane_text_case_insensitive(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        pattern: &str,
+        timeout: Duration,
+    ) -> Result<(), TmuxError> {
+        let normalized_pattern = pattern.to_ascii_lowercase();
+        self.wait_for_pane_text_matching(metadata, timeout, |capture| {
+            capture.to_ascii_lowercase().contains(&normalized_pattern)
+        })
+    }
+
+    fn wait_for_pane_text_matching(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<(), TmuxError> {
         self.validate_exact_pane(metadata)?;
         let pane = TmuxPane::new_in_session(
             metadata.session_id(),
@@ -186,8 +211,40 @@ impl<R: CommandRunner> TmuxAdapter<R> {
         let started = Instant::now();
 
         loop {
-            if self.capture_pane(&pane)?.contains(pattern) {
+            if matches(&self.capture_pane(&pane)?) {
                 return Ok(());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(TmuxError::AgentReadinessTimeout {
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            sleep_if_needed(Duration::from_millis(100).min(timeout - elapsed));
+        }
+    }
+
+    pub(crate) fn wait_for_inferred_agent_readiness(
+        &self,
+        metadata: &TmuxActivationMetadata,
+        agent_command: &str,
+        timeout: Duration,
+    ) -> Result<Option<&'static str>, TmuxError> {
+        let Some(profile) = inferred_harness_profile(agent_command) else {
+            return Ok(None);
+        };
+        let pane = TmuxPane::new_in_session(
+            metadata.session_id(),
+            metadata.window_id(),
+            metadata.activation_id(),
+            metadata.pane_id(),
+        );
+        let started = Instant::now();
+
+        loop {
+            self.validate_exact_pane(metadata)?;
+            if profile.input_surface_ready(&self.capture_pane(&pane)?) {
+                return Ok(Some(profile.name()));
             }
             let elapsed = started.elapsed();
             if elapsed >= timeout {
@@ -380,6 +437,7 @@ impl<R: CommandRunner> TmuxAdapter<R> {
 
     fn paste_keys_literal(
         &self,
+        metadata: &TmuxActivationMetadata,
         pane: &TmuxPane,
         text: &str,
         buffer_name: &str,
@@ -390,11 +448,27 @@ impl<R: CommandRunner> TmuxAdapter<R> {
             ["tmux", "set-buffer", "-b", buffer_name, "--"],
             [text],
         ))?;
-        self.run_checked(argv(
-            ["tmux", "paste-buffer", "-p", "-d", "-b", buffer_name, "-t"],
-            [target.as_str()],
-        ))?;
-        Ok(())
+        let delivery = (|| {
+            self.validate_exact_pane(metadata)?;
+            self.run_checked(argv(
+                [
+                    "tmux",
+                    "paste-buffer",
+                    "-p",
+                    "-r",
+                    "-d",
+                    "-b",
+                    buffer_name,
+                    "-t",
+                ],
+                [target.as_str()],
+            ))?;
+            Ok(())
+        })();
+        if delivery.is_err() {
+            let _ = self.run_checked(argv(["tmux", "delete-buffer", "-b"], [buffer_name]));
+        }
+        delivery
     }
 
     pub fn send_key(&self, pane: &TmuxPane, key: &str) -> Result<(), TmuxError> {
@@ -1425,6 +1499,83 @@ fn hash_arguments(argv: &[String]) -> String {
         hasher.update(argument.as_bytes());
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn command_invokes(command: &str, executable: &str) -> bool {
+    command.split_ascii_whitespace().any(|token| {
+        token
+            .trim_matches(|character: char| {
+                matches!(character, '\'' | '"' | '(' | ')' | ';' | '&' | '|')
+            })
+            .rsplit('/')
+            .next()
+            == Some(executable)
+    })
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TmuxHarnessProfile {
+    Codex,
+    Claude,
+    Omp,
+}
+
+impl TmuxHarnessProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Omp => "omp",
+        }
+    }
+
+    fn input_surface_ready(self, capture: &str) -> bool {
+        let normalized = capture.to_ascii_lowercase();
+        match self {
+            Self::Codex => surface_contains(
+                &normalized,
+                "openai codex (v",
+                &["model:", "directory:", "permissions:"],
+            ),
+            Self::Claude => surface_contains(
+                &normalized,
+                "claude code v",
+                &["welcome back!", "bypass permissions on"],
+            ),
+            Self::Omp => surface_contains(
+                &normalized,
+                "omp v",
+                &["welcome back!", "# for prompt actions", "/ for commands"],
+            ),
+        }
+    }
+
+    fn acceptance_pattern(self) -> &'static str {
+        "esc to interrupt"
+    }
+}
+
+fn inferred_harness_profile(command: &str) -> Option<TmuxHarnessProfile> {
+    if command_invokes(command, "codex") {
+        Some(TmuxHarnessProfile::Codex)
+    } else if command_invokes(command, "claude") || command_invokes(command, "claude-code") {
+        Some(TmuxHarnessProfile::Claude)
+    } else if ["omp", "omh", "oh-my-pi", "oh-my-humanize"]
+        .into_iter()
+        .any(|executable| command_invokes(command, executable))
+    {
+        Some(TmuxHarnessProfile::Omp)
+    } else {
+        None
+    }
+}
+
+fn surface_contains(normalized: &str, heading: &str, markers: &[&str]) -> bool {
+    let Some(start) = normalized.rfind(heading) else {
+        return false;
+    };
+    let surface = &normalized[start..];
+    markers.iter().all(|marker| surface.contains(marker))
 }
 
 fn hash_text(value: &str) -> String {

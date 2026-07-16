@@ -115,6 +115,7 @@ impl DriverFixture {
 
     pub(super) fn socket_path(&self, run_id: &str) -> PathBuf {
         socket_path_for_run_root(&self.runtime_root, &self.run_root(run_id))
+            .expect("driver socket path should resolve")
     }
 
     pub(super) fn run_events_path(&self, run_id: &str) -> PathBuf {
@@ -181,14 +182,17 @@ agent_ready='{}'
 printf '%s\n' "$*" >> "$root/tmux.log"
 last=''
 target=''
+buffer=''
 previous=''
 for arg in "$@"; do
   if test "$previous" = '-t'; then target="$arg"; fi
+  if test "$previous" = '-b'; then buffer="$arg"; fi
   previous="$arg"
   last="$arg"
 done
 load_ready_environment() {{
-  eval "set -- $last"
+  command="$1"
+  eval "set -- $command"
   if test "$1" = 'env'; then shift; fi
   while test "$#" -gt 0; do
     case "$1" in
@@ -199,6 +203,28 @@ load_ready_environment() {{
       *) break ;;
     esac
   done
+}}
+handle_input() {{
+  input="$1"
+  case "$input" in
+    *humanize-test-agent*)
+      if test -n "$HUMANIZE_TEST_DRIVER_EVENT_FAULT_AFTER_AGENT"; then
+        : > "$HUMANIZE_TEST_DRIVER_EVENT_FAULT_AFTER_AGENT"
+      fi
+      if test "$agent_ready" = 'yes'; then
+        load_ready_environment "$input"
+        pane="${{target##*.}}"
+        pending="$root/hook-helper-${{pane#%}}-$$.pending"
+        done="${{pending%.pending}}.done"
+        : > "$pending"
+        (
+          printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
+            TMUX_PANE="$pane" '{}' --agent-ready-hook --source codex_session_start
+          mv "$pending" "$done"
+        ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
+      fi
+      ;;
+  esac
 }}
 case "$1" in
   list-panes)
@@ -226,26 +252,16 @@ case "$1" in
   capture-pane)
     printf 'final capture for %s\n' "$target"
     ;;
+  set-buffer)
+    printf '%s' "$last" > "$root/tmux-buffer-$buffer"
+    ;;
+  paste-buffer)
+    input="$(cat "$root/tmux-buffer-$buffer")"
+    rm -f "$root/tmux-buffer-$buffer"
+    handle_input "$input"
+    ;;
   send-keys)
-    case "$*" in
-      *humanize-test-agent*)
-        if test -n "$HUMANIZE_TEST_DRIVER_EVENT_FAULT_AFTER_AGENT"; then
-          : > "$HUMANIZE_TEST_DRIVER_EVENT_FAULT_AFTER_AGENT"
-        fi
-        if test "$agent_ready" = 'yes'; then
-          load_ready_environment
-          pane="${{target##*.}}"
-          pending="$root/hook-helper-${{pane#%}}-$$.pending"
-          done="${{pending%.pending}}.done"
-          : > "$pending"
-          (
-            printf '%s\n' '{{"hook_event_name":"SessionStart","session_id":"fake-native-session"}}' |
-              TMUX_PANE="$pane" '{}' --agent-ready-hook --source codex_session_start
-            mv "$pending" "$done"
-          ) </dev/null >> "$root/hook.out" 2>> "$root/hook.err" &
-        fi
-        ;;
-    esac
+    handle_input "$last"
     ;;
   kill-pane)
     pane="${{target##*.}}"

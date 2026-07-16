@@ -1048,7 +1048,7 @@ fn initial_participant_prompt_contains_only_task_outputs_resources_and_boundarie
     let log = fs::read_to_string(fixture.tmux_log()).unwrap();
     let prompt_start = log.find(" -- Create the brief.").unwrap() + 4;
     let prompt_tail = &log[prompt_start..];
-    let prompt_end = prompt_tail.find("\npaste-buffer -p -d -b ").unwrap();
+    let prompt_end = prompt_tail.find("\ndisplay-message -p -t ").unwrap();
     let prompt = &prompt_tail[..prompt_end];
     for required in [
         "Create the brief.",

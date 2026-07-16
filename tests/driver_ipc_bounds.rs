@@ -265,7 +265,9 @@ fn client_validates_run_token_parent_and_socket_identity() {
     fs::set_permissions(&runtime_root, permissions).unwrap();
     let error = DriverClient::from_run_root_for_run(&run_root, "run-identity").unwrap_err();
     assert!(
-        error.to_string().contains("runtime directory permissions"),
+        error
+            .to_string()
+            .contains("private runtime root permissions must be 700, found 755"),
         "{error}"
     );
 

@@ -111,7 +111,10 @@ fn driver_activate_node_allocates_and_actuates_missing_agent_pane() {
 
     let calls = fs::read_to_string(fixture.tmux_log()).unwrap();
     assert!(calls.contains("split-window -P -F #{pane_id} -t host-a:%7 -v"));
-    assert!(calls.contains("send-keys -t host-a:%7.%9 -l env HUMANIZE_PARTICIPANT_BINDING_FILE="));
+    assert!(calls.lines().any(|call| {
+        call.starts_with("set-buffer -b ")
+            && call.contains(" -- env HUMANIZE_PARTICIPANT_BINDING_FILE=")
+    }));
     assert!(!calls.contains("HUMANIZE_PARTICIPANT_CREDENTIAL="));
     assert!(calls.contains("humanize-test-agent"));
     assert!(calls.contains("send-keys -t host-a:%7.%9 C-u"));
@@ -164,12 +167,20 @@ fn driver_activate_node_allocates_and_actuates_missing_agent_pane() {
     assert_eq!(resumed["ok"], true, "{resumed}");
     let input_before = calls_before_restart
         .lines()
-        .filter(|line| line.starts_with("send-keys "))
+        .filter(|line| {
+            line.starts_with("set-buffer ")
+                || line.starts_with("paste-buffer ")
+                || line.starts_with("send-keys ")
+        })
         .collect::<Vec<_>>();
     let calls_after_restart = fs::read_to_string(fixture.tmux_log()).unwrap();
     let input_after = calls_after_restart
         .lines()
-        .filter(|line| line.starts_with("send-keys "))
+        .filter(|line| {
+            line.starts_with("set-buffer ")
+                || line.starts_with("paste-buffer ")
+                || line.starts_with("send-keys ")
+        })
         .collect::<Vec<_>>();
     assert_eq!(input_after, input_before);
     restarted.shutdown();

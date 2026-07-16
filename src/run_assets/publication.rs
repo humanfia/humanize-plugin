@@ -380,3 +380,55 @@ fn sync_parent(path: &Path) -> Result<(), RunAssetError> {
             ))
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{PUBLISHED_DIR, published_transactions};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn recovery_rejects_dangling_symlinked_publication_ledger() {
+        let root = test_root("dangling-ledger");
+        let private_run_root = root.join("private-run");
+        let driver_dir = private_run_root.join("driver");
+        fs::create_dir_all(&driver_dir).unwrap();
+        set_mode(&private_run_root, 0o700);
+        set_mode(&driver_dir, 0o700);
+        let outside = root.join("outside-ledger");
+        symlink(&outside, driver_dir.join(PUBLISHED_DIR)).unwrap();
+
+        let result = published_transactions(&private_run_root);
+
+        assert!(result.is_err(), "dangling ledger symlink was accepted");
+        assert!(
+            !outside.exists(),
+            "publication recovery created outside state"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join("humanize-plugin-publication-safety")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+}

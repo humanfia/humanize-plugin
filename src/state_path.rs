@@ -22,7 +22,15 @@ pub(crate) fn private_runtime_root() -> io::Result<PathBuf> {
     user_state_root().map(|root| root.join("runtime"))
 }
 
-pub(crate) fn private_run_root(runtime_root: &Path, public_run_root: &Path) -> PathBuf {
+pub(crate) fn private_run_root(runtime_root: &Path, public_run_root: &Path) -> io::Result<PathBuf> {
+    let public_run_root = resolved_path(public_run_root)?;
+    Ok(runtime_root.join(format!(
+        "r{:016x}",
+        stable_hash(&public_run_root.to_string_lossy())
+    )))
+}
+
+pub(crate) fn legacy_private_run_root(runtime_root: &Path, public_run_root: &Path) -> PathBuf {
     let public_run_root =
         lexical_absolute(public_run_root).unwrap_or_else(|_| public_run_root.to_path_buf());
     runtime_root.join(format!(
@@ -73,7 +81,7 @@ fn project_root(working_directory: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn resolved_path(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolved_path(path: &Path) -> io::Result<PathBuf> {
     let absolute = lexical_absolute(path)?;
     let mut existing = absolute.as_path();
     let mut suffix = Vec::<OsString>::new();

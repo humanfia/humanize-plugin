@@ -827,6 +827,7 @@ impl DriverFixture {
 
     fn socket_path(&self, run_id: &str) -> PathBuf {
         socket_path_for_run_root(&self.root.join("runtime"), &self.run_root(run_id))
+            .expect("driver socket path should resolve")
     }
 
     fn run_root(&self, run_id: &str) -> PathBuf {
@@ -877,14 +878,16 @@ root='{}'
 printf '%s\n' "$*" >> "$root/tmux.log"
 last=''
 target=''
+buffer=''
 previous=''
 for arg in "$@"; do
   if test "$previous" = '-t'; then target="$arg"; fi
+  if test "$previous" = '-b'; then buffer="$arg"; fi
   previous="$arg"
   last="$arg"
 done
 load_ready_environment() {{
-  eval "set -- $last"
+  eval "set -- $1"
   if test "$1" = 'env'; then shift; fi
   while test "$#" -gt 0; do
     case "$1" in
@@ -899,6 +902,26 @@ load_ready_environment() {{
 mark_pane_alive() {{
   pane="$1"
   : > "$root/pane-${{pane#%}}.alive"
+}}
+handle_input() {{
+  input="$1"
+  case "$input" in
+    *humanize-test-agent*)
+      if test ! -f "$root/ready.once"; then
+        : > "$root/ready.once"
+        load_ready_environment "$input"
+        pane="${{target##*.}}"
+        pending="$root/hook-helper-${{pane#%}}-$$.pending"
+        done="${{pending%.pending}}.done"
+        : > "$pending"
+        (
+          printf '{{"hook_event_name":"SessionStart","session_id":"fake-native-%s"}}\n' "${{pane#%}}" |
+            HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="$pane" '{}' --agent-ready-hook --source codex_session_start
+          mv "$pending" "$done"
+        ) </dev/null >/dev/null 2>/dev/null &
+      fi
+      ;;
+  esac
 }}
 case "$1" in
   has-session)
@@ -933,24 +956,16 @@ case "$1" in
   capture-pane)
     printf 'final capture for %s\n' "$target"
     ;;
+  set-buffer)
+    printf '%s' "$last" > "$root/tmux-buffer-$buffer"
+    ;;
+  paste-buffer)
+    input="$(cat "$root/tmux-buffer-$buffer")"
+    rm -f "$root/tmux-buffer-$buffer"
+    handle_input "$input"
+    ;;
   send-keys)
-    case "$*" in
-      *humanize-test-agent*)
-        if test ! -f "$root/ready.once"; then
-          : > "$root/ready.once"
-          load_ready_environment
-          pane="${{target##*.}}"
-          pending="$root/hook-helper-${{pane#%}}-$$.pending"
-          done="${{pending%.pending}}.done"
-          : > "$pending"
-          (
-            printf '{{"hook_event_name":"SessionStart","session_id":"fake-native-%s"}}\n' "${{pane#%}}" |
-              HUMANIZE_RUNS_DIR="$root/runs" TMUX_PANE="$pane" '{}' --agent-ready-hook --source codex_session_start
-            mv "$pending" "$done"
-          ) </dev/null >/dev/null 2>/dev/null &
-        fi
-        ;;
-    esac
+    handle_input "$last"
     ;;
   kill-pane)
     pane="${{target##*.}}"
