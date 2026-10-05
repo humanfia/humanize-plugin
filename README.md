@@ -1,5 +1,10 @@
 # humanize-plugin
 
+> [!WARNING]
+> **Archived.** This project is no longer maintained. It is superseded by
+> [humanfia/humanize](https://github.com/humanfia/humanize); see the
+> [Humanize documentation](https://docs.humanfia.ai/humanize/).
+
 Humanize turns terse local workflow requests into checked, reviewed, and
 runnable MCP flow packages.
 
@@ -59,3 +64,6 @@ Install the generated block in the client's hook config, then invoke Humanize
 with one of the prompts above. Rust 1.88 or newer is required.
 
 See `docs/architecture.md` for package, review, runtime, and repository design.
+
+Licensed under [Apache-2.0](LICENSE). `Cargo.toml` and the plugin manifests
+also offer MIT as an alternative (`MIT OR Apache-2.0`).
