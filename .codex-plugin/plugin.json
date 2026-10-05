@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/humanfia/humanize-plugin#readme",
   "repository": "https://github.com/humanfia/humanize-plugin",
-  "license": "MIT OR Apache-2.0",
+  "license": "Apache-2.0",
   "keywords": [
     "humanize",
     "workflow",

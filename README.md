@@ -65,5 +65,4 @@ with one of the prompts above. Rust 1.88 or newer is required.
 
 See `docs/architecture.md` for package, review, runtime, and repository design.
 
-Licensed under [Apache-2.0](LICENSE). `Cargo.toml` and the plugin manifests
-also offer MIT as an alternative (`MIT OR Apache-2.0`).
+Licensed under [Apache-2.0](LICENSE).
